@@ -1,0 +1,23 @@
+# Catch targets Linux only. Keep every text file LF in the repository and
+# on checkout so shell, Rust, QML, and JSON files cannot drift to CRLF.
+* text=auto eol=lf
+
+# Shipped x86_64 binaries are the release artifact: keep them byte-exact,
+# out of diffs and merges, and marked generated in review. bin/check-release
+# and the pre-push gate hash these files.
+bin/dist/** binary linguist-generated
+
+# Images are binary payloads.
+*.png binary
+
+# Generated or prose-only files: keep them out of language statistics and
+# let generated-file handling collapse them in review.
+Cargo.lock linguist-generated
+.github/** linguist-vendored
+docs/** linguist-documentation
+AGENTS.md linguist-documentation
+CLAUDE.md linguist-documentation
+
+# Byte-exact test fixtures (none on disk today) would be pinned here with
+# `-text`, e.g. `crates/catch/tests/fixtures/** -text`, so checkout never
+# rewrites fixture bytes.
