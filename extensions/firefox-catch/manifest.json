@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Catch",
+  "version": "0.1.17",
+  "description": "Send downloads to the native Catch download manager.",
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "contextMenus",
+    "downloads",
+    "nativeMessaging",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Catch this download",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "commands": {
+    "catch-download": {
+      "suggested_key": {
+        "default": "Alt+Shift+C"
+      },
+      "description": "Send the current page/file to Catch"
+    }
+  },
+  "background": {
+    "service_worker": "background-3.js"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxsGoTf/SJW1SSewks04pIHuBN17zArYCvFSDcKdOfvFX2pmiXp838kpogRDbrecvWcuCU13SNFBx94Z0EVoryrBb1htE7qOtbabbi0cnDKkqndM4/YVwPQT31tlqF0MiiAEiFXGfO+ai74eycVc3hfa/QGraVZnwCLtQVAmulMnuBu1kpCXG3i2USUZtjUY7U1rA0GoPuDgjq9DSfa/FrtjkNcotmG7+gg/ze2OYh65MMohtGAHpAmdIxeiLdqjrL6T53eshkuyleNfAQkx9jACbVLAayUBugmW4berJrIbF6wWQ/IaaWU+/K9D7KeUnmCVpGnFYUJwyTXSqx1X+yQIDAQAB",
+  "version_name": "dev"
+}

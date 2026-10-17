@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # rustfmt first: formatting drift is the cheapest failure to fix.
+      - name: Formatting
+        run: cargo fmt --check -p catch
+
+      # The kleeamp desktop rule, applied here: clippy with warnings denied
+      # before a task counts as done.
+      - name: Clippy
+        run: cargo clippy -p catch --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test -p catch
+
+      - name: Model logic
+        run: node tests/model.test.js
+
+      - name: Plugin contract
+        run: |
+          # manifest.json must stay at the git root with valid entry points.
+          python3 -c "import json; m = json.load(open('manifest.json')); assert m['schemaVersion'] == 1 and m['id'] and m['entryPoints']"

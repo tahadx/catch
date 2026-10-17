@@ -1,0 +1,13 @@
+#!/bin/bash
+# Rebuild the shipped backend from this tree and refresh bin/dist.
+# Run before committing any crates/ change: the shell service shells out to
+# `catch` on every state change, and a stale dist rewrites state in an old
+# schema (this caused real title-loss and duplicate bugs).
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+cargo build --release -p catch --bins
+mkdir -p bin/dist
+cp -f target/release/catch bin/dist/catch
+cp -f target/release/catch-host bin/dist/catch-host
+strip bin/dist/catch bin/dist/catch-host
+bin/dist/catch status | sed -n 's/^build: /catch dist built from /p'

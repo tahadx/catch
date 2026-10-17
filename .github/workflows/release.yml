@@ -1,0 +1,257 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing tag to rebuild, for example v0.2.0'
+        required: true
+
+permissions:
+  contents: write
+
+# One release per tag. A re-run replaces the assets and the notes of the same
+# release, so two runs for one tag must not overlap.
+concurrency:
+  group: release-${{ github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The changelog walks the full history between two tags.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The dispatch input is untrusted text, so it enters the shell through
+      # the environment, never through inline expansion.
+      - name: Resolve version
+        id: v
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          TAG="${DISPATCH_VERSION:-$GITHUB_REF_NAME}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9][0-9A-Za-z._-]*$'; then
+            echo "::error::Tag [$TAG] is not a release tag such as v1.2.3."
+            exit 1
+          fi
+          NAME="${TAG#v}"
+          case "$NAME" in
+            *-*) PRERELEASE=true ;;
+            *)   PRERELEASE=false ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      # A tag push always has its tag. A manual run rebuilds a tag that already
+      # exists, so refuse to invent a version from a branch.
+      - name: Check tag exists
+        env:
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "::error::Tag $TAG does not exist on origin. Push the tag first."
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+          fi
+
+      # The tag is the only version source. Stamp it into the manifest and
+      # the crate, then insist the tag already carried them: a plugin
+      # installed from git (omarchy plugin add) reads manifest.json, so a
+      # tag that disagrees would report the wrong version forever. Fix by
+      # running bin/stamp-version && bin/refresh-dist, committing, and
+      # moving the tag.
+      - name: Stamp version from the tag
+        env:
+          VERSION: ${{ steps.v.outputs.name }}
+        run: |
+          set -euo pipefail
+          BEFORE="$(md5sum manifest.json crates/catch/Cargo.toml)"
+          CATCH_VERSION="$VERSION" bin/stamp-version > /dev/null
+          AFTER="$(md5sum manifest.json crates/catch/Cargo.toml)"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not carry its own version."
+            echo "::error::manifest.json / crates/catch/Cargo.toml disagree with the tag."
+            git diff -- manifest.json crates/catch/Cargo.toml || true
+            echo "::error::Fix: bin/stamp-version && bin/refresh-dist && git commit -am 'Release $VERSION'"
+            exit 1
+          fi
+
+      - name: Build release binaries
+        run: cargo build --release -p catch
+
+      # Native binaries carry no signature to verify, so refuse to publish
+      # an empty or non-executable build instead of discovering it on a
+      # user's machine.
+      - name: Verify binaries
+        env:
+          VERSION: ${{ steps.v.outputs.name }}
+        run: |
+          set -euo pipefail
+          for bin in catch catch-host; do
+            f="target/release/$bin"
+            [ -x "$f" ] || { echo "::error::$f missing or not executable."; exit 1; }
+          done
+          strip target/release/catch target/release/catch-host || true
+          ./target/release/catch --version
+          # The binary must answer to the tag it was cut from.
+          GOT="$(./target/release/catch status | sed -n 's/^version: //p')"
+          if [ "$GOT" != "$VERSION" ]; then
+            echo "::error::binary reports version [$GOT], tag says [$VERSION]."
+            exit 1
+          fi
+          ls -la target/release/catch target/release/catch-host
+
+      - name: Stage artifacts
+        id: art
+        env:
+          NAME: ${{ steps.v.outputs.name }}
+        run: |
+          OUT="catch-$NAME-linux-x86_64"
+          HOST="catch-host-$NAME-linux-x86_64"
+          cp target/release/catch "$OUT"
+          cp target/release/catch-host "$HOST"
+          chmod +x "$OUT" "$HOST"
+          sha256sum "$OUT" "$HOST" > checksums.txt
+          echo "bin=$OUT" >> "$GITHUB_OUTPUT"
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 checksums.txt | head -1)" >> "$GITHUB_OUTPUT"
+
+      # The commit walk of the kleeamp release: every commit between the
+      # previous tag and this one, resolved to a GitHub account when the
+      # commit email belongs to one. Merge commits are skipped because the
+      # branch commits already carry the change and the author.
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.v.outputs.tag }}
+          NAME: ${{ steps.v.outputs.name }}
+          BIN: ${{ steps.art.outputs.bin }}
+          HOST: ${{ steps.art.outputs.host }}
+          SHA: ${{ steps.art.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$TAG" == *-* ]]; then
+            PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+          else
+            # A stable release covers the full beta-tested change set, so skip
+            # prerelease tags when it looks for the previous stable tag.
+            PREV_TAG=""
+            while IFS= read -r candidate; do
+              case "$candidate" in
+                v*-*) ;;
+                v*) PREV_TAG="$candidate"; break ;;
+              esac
+            done < <(git tag --merged "${TAG}^" --sort=-version:refname)
+          fi
+
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${TAG}"
+          else
+            RANGE="$TAG"
+          fi
+
+          # Highlights for humans come from the annotated tag body, so each
+          # release carries its own user-facing summary above the full commit
+          # list. Lightweight tags have no message and keep commits only.
+          # The checkout may hold the tag's commit without the tag object,
+          # so fetch the tag itself before asking for its type and message.
+          HIGHLIGHTS=""
+          git fetch origin "+refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
+          if git cat-file -t "$TAG" 2>/dev/null | grep -qx tag; then
+            HIGHLIGHTS=$(git for-each-ref "refs/tags/$TAG" --format='%(contents:body)' | sed '/^-----BEGIN PGP SIGNATURE-----$/,/^-----END PGP SIGNATURE-----$/d')
+          fi
+
+          CHANGELOG=""
+          CONTRIBUTORS=""
+          declare -A SEEN
+          while IFS=$'\x1f' read -r hash title author || [ -n "$hash" ]; do
+            [ -n "$hash" ] || continue
+            short="${hash:0:7}"
+            # .author is null when the commit email is not linked to an
+            # account; then the git name stands alone.
+            username=$(gh api "repos/${REPO}/commits/${hash}" --jq '.author.login // empty' 2>/dev/null || echo "")
+            if [ -n "$username" ]; then
+              who="$author ([@$username](https://github.com/$username))"
+            else
+              who="$author"
+            fi
+            key="${username:-$author}"
+            if [ -z "${SEEN[$key]:-}" ]; then
+              SEEN[$key]=1
+              CONTRIBUTORS="${CONTRIBUTORS}- $who"$'\n'
+            fi
+            CHANGELOG="${CHANGELOG}- $title by $who ([\`$short\`](https://github.com/${REPO}/commit/$hash))"$'\n'
+          done < <(git log "$RANGE" --no-merges --pretty=format:"%H%x1f%s%x1f%an")
+
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="No commits between ${PREV_TAG:-the first commit} and ${TAG}."$'\n'
+          fi
+
+          {
+            echo "## Contributors"
+            echo ""
+            printf '%s' "$CONTRIBUTORS"
+            echo ""
+            echo "## What's Changed"
+            echo ""
+            if [ -n "$HIGHLIGHTS" ]; then
+              printf '%s\n\n' "$HIGHLIGHTS"
+            fi
+            printf '%s' "$CHANGELOG"
+            echo ""
+            echo "## Linux binaries"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Version | \`$NAME\` |"
+            echo "| Binaries | \`$BIN\`, \`$HOST\` |"
+            echo "| SHA-256 | \`$SHA\` |"
+            echo ""
+            echo "Copy both files next to each other, make them executable,"
+            echo "and point your browser host manifests at them. The plugin's"
+            echo "\`bin/configure\` does the rest on first run."
+            if [ -n "$PREV_TAG" ]; then
+              echo ""
+              echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV_TAG}...${TAG}"
+            fi
+          } > notes.md
+
+          cat notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+          NAME: ${{ steps.v.outputs.name }}
+          PRERELEASE: ${{ steps.v.outputs.prerelease }}
+          BIN: ${{ steps.art.outputs.bin }}
+          HOST: ${{ steps.art.outputs.host }}
+        run: |
+          set -euo pipefail
+          TITLE="catch $NAME"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # A re-run of the same tag replaces the assets and the notes
+            # instead of failing on an existing release.
+            gh release edit "$TAG" --title "$TITLE" --notes-file notes.md --prerelease="$PRERELEASE"
+            gh release upload "$TAG" "$BIN" "$HOST" checksums.txt --clobber
+          else
+            CREATE_ARGS=()
+            if [ "$PRERELEASE" = "true" ]; then CREATE_ARGS+=(--prerelease); fi
+            gh release create "$TAG" "$BIN" "$HOST" checksums.txt \
+              --verify-tag \
+              --title "$TITLE" \
+              --notes-file notes.md \
+              "${CREATE_ARGS[@]}"
+          fi

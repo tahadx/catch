@@ -1,0 +1,34 @@
+#!/bin/bash
+# Self-configure a Catch install: link backend binaries and write browser
+# host manifests. Idempotent and quiet when everything is already in place.
+# Runs automatically from the shell plugin on startup; safe to run by hand.
+# (Browser extensions themselves cannot self-install — vendor rule — so
+# loading them stays a one-time manual step. See README.)
+set -euo pipefail
+
+PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+DIST="$PLUGIN_DIR/bin/dist"
+BIN_DIR="$HOME/.local/bin"
+
+need_setup=0
+[[ -x "$BIN_DIR/catch" ]] || need_setup=1
+[[ -x "$BIN_DIR/catch-host" ]] || need_setup=1
+[[ -f "$HOME/.config/chromium/NativeMessagingHosts/io.github.tahadx.catch.json" ]] || need_setup=1
+[[ -f "$HOME/.mozilla/native-messaging-hosts/io.github.tahadx.catch.json" ]] || need_setup=1
+
+if (( need_setup == 0 )); then
+  exit 0
+fi
+
+mkdir -p "$BIN_DIR"
+if [[ -x "$DIST/catch" && -x "$DIST/catch-host" ]]; then
+  ln -sf "$DIST/catch" "$BIN_DIR/catch"
+  ln -sf "$DIST/catch-host" "$BIN_DIR/catch-host"
+fi
+
+if [[ -x "$BIN_DIR/catch" ]]; then
+  "$BIN_DIR/catch" install-hosts >/dev/null
+  "$BIN_DIR/catch" install-extension >/dev/null || true
+fi
+
+echo "catch: configured backend + browser hosts"

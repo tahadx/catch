@@ -1,0 +1,55 @@
+#!/bin/bash
+# Write the version into every file that carries one, so the tag, the
+# plugin manifest, the crate and the built binary all say the same thing.
+#
+#   bin/stamp-version            # resolve from git (see bin/version)
+#   bin/stamp-version 0.1.0      # stamp one explicitly, for cutting a release
+#   CATCH_VERSION=0.1.0 bin/stamp-version   # same, for the release workflow
+#
+# A release passes the version explicitly, because the commit that carries
+# it has to be made *before* the tag exists: git cannot resolve the version
+# of a tag that has not been pushed yet. The release workflow re-stamps from
+# the tag and fails if it had to change anything, so a tag whose files
+# disagree can never ship a plugin that reports the wrong version.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+VERSION="${1:-${CATCH_VERSION:-}}"
+if [ -z "$VERSION" ]; then
+  VERSION="$(bin/version)"
+fi
+
+# The version lands inside JSON and TOML string literals and inside a shell
+# sed replacement, and cargo insists on semver, so only real semver is
+# accepted. That also refuses anything able to close a quote or break the
+# file.
+if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+  echo "stamp-version: [$VERSION] is not semver (want 1.2.3, 0.1.0+4, 0.0.0-dev)" >&2
+  exit 1
+fi
+
+# manifest.json is what Omarchy shows for the plugin.
+sed -i -E "s/(\"version\": \")[^\"]*(\")/\1$VERSION\2/" manifest.json
+
+# The crate version is what `catch --version` and `catch status` report.
+# Anchored at the start of the line so dependency versions (`clap = { version
+# = "4", .. }`) are never touched.
+sed -i -E "0,/^version = \"[^\"]*\"/s//version = \"$VERSION\"/" crates/catch/Cargo.toml
+
+# A sed that quietly matched nothing looks exactly like a file that was
+# already correct, which would let the release check pass on a version that
+# was never stamped. So verify both files actually carry it. Fixed-string
+# matching: a version like 0.1.0+4 is a regex, not a literal, and an ERE
+# would read "+" as a quantifier and reject the version it just wrote.
+if ! grep -qxF "version = \"$VERSION\"" crates/catch/Cargo.toml; then
+  echo "stamp-version: crates/catch/Cargo.toml does not carry [$VERSION]" >&2
+  exit 1
+fi
+if ! grep -qF "\"version\": \"$VERSION\"" manifest.json; then
+  echo "stamp-version: manifest.json does not carry [$VERSION]" >&2
+  exit 1
+fi
+
+echo "stamped version $VERSION"
+grep -m1 '"version"' manifest.json
+grep -m1 '^version = ' crates/catch/Cargo.toml

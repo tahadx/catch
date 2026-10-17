@@ -1,0 +1,15 @@
+#!/bin/bash
+# Render exact-size extension icons for every browser family from the
+# vector source (Firefox lint requires exact sizes; Chrome accepts any).
+# Usage: bin/render-icons  (needs rsvg-convert)
+set -euo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+for dir in extensions/chromium-catch extensions/firefox-catch; do
+  mkdir -p "$dir/icons"
+  for s in 16 48 128; do
+    rsvg-convert -w "$s" -h "$s" assets/icon.svg -o "$dir/icons/icon-$s.png"
+  done
+  rm -f "$dir/icon.png"
+done
+echo "icons rendered from assets/icon.svg"

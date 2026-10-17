@@ -1,0 +1,24 @@
+#!/bin/bash
+# Local pre-push gate: the same checks CI runs. Activate once per clone:
+#   git config core.hooksPath .githooks
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+echo "pre-push: fmt, clippy, tests, model js, manifest"
+cargo fmt --check -p catch
+cargo clippy -p catch --all-targets -- -D warnings
+cargo test -p catch --quiet
+node tests/model.test.js
+omarchy plugin validate .
+echo "pre-push: dist freshness"
+# The shell service runs `catch drain` on every state change; a stale dist
+# rewrites state in an old schema. Rebuilding here proves bin/dist matches
+# the pushed sources (same machine, same toolchain => same bytes).
+before=$(md5sum bin/dist/catch bin/dist/catch-host 2>/dev/null || echo missing)
+bin/refresh-dist
+after=$(md5sum bin/dist/catch bin/dist/catch-host)
+if [[ "$before" != "$after" ]]; then
+  echo "pre-push: bin/dist was stale and has been rebuilt — commit bin/dist and push again" >&2
+  echo "pre-push: (if crates/ has uncommitted changes, commit or stash them first)" >&2
+  exit 1
+fi
+echo "pre-push: all green"

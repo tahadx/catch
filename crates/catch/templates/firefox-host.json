@@ -1,0 +1,9 @@
+{
+  "name": "io.github.tahadx.catch",
+  "description": "Catch native download manager host",
+  "path": "__HOST_PATH__",
+  "type": "stdio",
+  "allowed_extensions": [
+    "catch@io.github.tahadx"
+  ]
+}

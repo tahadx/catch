@@ -1,0 +1,84 @@
+#!/bin/bash
+# Remove everything Catch installs outside its own plugin directory:
+# backend symlinks, browser host manifests, browser flags entries, and
+# the scheduler timer. Idempotent; safe to re-run.
+# Queue records and downloaded files are user data and stay untouched.
+# Usage: ./bin/uninstall
+set -euo pipefail
+
+HOST_NAME="io.github.tahadx.catch"
+
+echo "== Catch: removing installed pieces =="
+
+# 1. Scheduler timer (units we own, then reload).
+systemctl --user disable --now catch-schedule.timer 2>/dev/null || true
+rm -f "$HOME/.config/systemd/user/catch-schedule.timer" \
+  "$HOME/.config/systemd/user/catch-schedule.service"
+systemctl --user daemon-reload 2>/dev/null || true
+echo "  scheduler timer removed"
+
+# 2. Backend symlinks, only when they point at a catch tree.
+for bin in catch catch-host; do
+  link="$HOME/.local/bin/$bin"
+  if [[ -L $link ]] && [[ $(readlink "$link") == *catch* ]]; then
+    rm -f "$link"
+    echo "  unlinked $link"
+  fi
+done
+
+# 3. Native host manifests, both families.
+rm -f \
+  "$HOME"/.config/chromium/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/google-chrome/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/google-chrome-beta/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/google-chrome-unstable/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/BraveSoftware/Brave-Browser-Beta/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/BraveSoftware/Brave-Browser-Nightly/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/BraveSoftware/Brave-Origin/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/BraveSoftware/Brave-Origin-Beta/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/BraveSoftware/Brave-Origin-Nightly/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/microsoft-edge/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.config/microsoft-edge-dev/NativeMessagingHosts/$HOST_NAME.json \
+  "$HOME"/.mozilla/native-messaging-hosts/$HOST_NAME.json \
+  "$HOME"/.zen/native-messaging-hosts/$HOST_NAME.json \
+  "$HOME"/.librewolf/native-messaging-hosts/$HOST_NAME.json \
+  "$HOME"/.floorp/native-messaging-hosts/$HOST_NAME.json \
+  "$HOME"/.waterfox/native-messaging-hosts/$HOST_NAME.json
+echo "  host manifests removed"
+
+# 4. Our extension path out of every Chromium flags file. Omarchy's own
+# entries stay; a flag left with nothing on it is dropped.
+python3 - <<'EOF'
+import os
+config = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+changed = 0
+for name in ("chromium-flags.conf", "chrome-flags.conf", "brave-flags.conf",
+             "brave-origin-flags.conf", "microsoft-edge-flags.conf",
+             "microsoft-edge-dev-flags.conf"):
+    path = os.path.join(config, name)
+    if not os.path.isfile(path):
+        continue
+    with open(path) as f:
+        lines = f.read().splitlines()
+    out = []
+    for line in lines:
+        if not line.startswith("--load-extension="):
+            out.append(line)
+            continue
+        rest = [p for p in line.split("=", 1)[1].split(",")
+                if p and "tahadx.catch" not in p
+                and not p.endswith("extensions/chromium-catch")]
+        if rest:
+            out.append("--load-extension=" + ",".join(rest))
+            if len(rest) != len(line.split("=", 1)[1].split(",")):
+                changed += 1
+    if out != lines:
+        with open(path, "w") as f:
+            f.write("\n".join(out) + ("\n" if out else ""))
+        changed += 1
+print(f"  flags files cleaned")
+EOF
+
+echo "Done. Your queue and ~/Downloads/catch are untouched."
+echo "Finish with: omarchy plugin remove io.github.tahadx.catch"

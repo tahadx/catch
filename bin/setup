@@ -1,0 +1,34 @@
+#!/bin/bash
+# One-shot Catch setup for this machine: build backend, link binaries,
+# install native host manifests for every Chromium- and Firefox-family
+# browser, and print the manual extension steps (unpacked loads are what
+# persist across browser restarts).
+set -euo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+cargo build -p catch
+mkdir -p ~/.local/bin
+ln -sf "$PWD/target/debug/catch" ~/.local/bin/catch
+ln -sf "$PWD/target/debug/catch-host" ~/.local/bin/catch-host
+./bin/render-icons
+~/.local/bin/catch install-hosts
+~/.local/bin/catch install-extension || true
+
+cat <<'EOF'
+
+Chromium-family (once):
+  1. Open  chrome://extensions  (brave://extensions, edge://extensions)
+  2. Enable "Developer mode", "Load unpacked":
+     <repo>/extensions/chromium-catch
+  3. Pin Catch so the toolbar button is visible.
+  The id is pinned by the manifest key, so it matches the host already.
+
+Firefox-family (Firefox, Zen, Floorp, LibreWolf — once each):
+  1. Open  about:debugging#/runtime/this-firefox
+  2. "Load Temporary Add-on", pick any file in:
+     <repo>/extensions/firefox-catch
+  Note: temporary add-ons last until the browser closes; a permanent
+  install needs a signed build (release step, not dev).
+
+Then right-click any file link and use the Catch menu.
+EOF

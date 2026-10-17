@@ -1,0 +1,40 @@
+#!/bin/bash
+# The one place Catch's version is decided. The result is always valid
+# semver, because it is written into the crate manifest as well as the
+# plugin manifest, and cargo refuses anything else.
+#
+#   1. $CATCH_VERSION        - what a release build is told to call itself
+#   2. the git tag at HEAD   - a release: exactly the tag, without the "v"
+#   3. the nearest tag       - a dev build: "<tag>+<commits since>", so a
+#                              binary built from a working tree still says
+#                              which release it will become
+#   4. 0.0.0-dev             - no git, no tag (a tarball, a vendored copy)
+#
+# No "-dirty" marker here: this value is written into committed files and
+# into Cargo.lock, where churn on every uncommitted change would be noise.
+# An uncommitted tree already shows up in `catch status` as a dirty build.
+#
+# Tag, not a hand-edited field, is the source of truth: bin/stamp-version
+# writes this into every file that carries a version, and the release
+# workflow checks the committed files still agree with the tag.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+if [ -n "${CATCH_VERSION:-}" ]; then
+  printf '%s\n' "$CATCH_VERSION"
+  exit 0
+fi
+
+if tag=$(git describe --tags --exact-match 2>/dev/null); then
+  printf '%s\n' "${tag#v}"
+  exit 0
+fi
+
+nearest=$(git describe --tags --abbrev=0 2>/dev/null || true)
+if [ -n "$nearest" ]; then
+  ahead=$(git rev-list --count "$nearest"..HEAD 2>/dev/null || echo 0)
+  printf '%s+%s\n' "${nearest#v}" "$ahead"
+  exit 0
+fi
+
+printf '0.0.0-dev\n'
