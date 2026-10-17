@@ -47,6 +47,10 @@ jobs:
       - name: Model logic
         run: node tests/model.test.js
 
+      # Both agent guide names must carry the same instructions.
+      - name: Agent guide parity
+        run: cmp AGENTS.md CLAUDE.md
+
       # The Firefox and Chromium extension scripts are one source of truth.
       - name: Extension JavaScript
         run: |
