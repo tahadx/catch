@@ -47,19 +47,29 @@ echo "    about:debugging#/runtime/this-firefox -> Load Temporary Add-on"
 echo "    -> pick any file in $HERE/extensions/firefox-catch"
 
 echo "== Panel shortcut =="
-BINDINGS="$HOME/.config/hypr/bindings.lua"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+BINDINGS="$CONFIG_HOME/hypr/bindings.lua"
 BIND_LINE="o.bind(\"SUPER + D\", \"Catch downloads\", \"omarchy-shell shell toggle io.github.tahadx.catch '{}'\")"
-if [[ -f $BINDINGS ]] && grep -qxF "$BIND_LINE" "$BINDINGS"; then
+if [[ -f "$BINDINGS" ]] && grep -qxF -- "$BIND_LINE" "$BINDINGS"; then
   echo "  Super+D toggle already present."
 else
   if ask "Add the Super+D toggle shortcut to Hyprland bindings?"; then
-    cp "$BINDINGS" "$BINDINGS.bak.$(date +%s)"
+    mkdir -p -- "$(dirname -- "$BINDINGS")"
+    if [[ -f "$BINDINGS" ]]; then
+      cp -- "$BINDINGS" "$BINDINGS.bak.$(date +%s)"
+    fi
+    # Do not glue the new line onto an existing last line without a newline.
+    if [[ -s "$BINDINGS" && -n "$(tail -c 1 -- "$BINDINGS")" ]]; then
+      printf '\n' >>"$BINDINGS"
+    fi
     printf '\n%s\n' "$BIND_LINE" >>"$BINDINGS"
-    hyprctl reload >/dev/null 2>&1 || true
-    echo "  Added Super+D (backup beside bindings.lua). Press it to toggle Catch."
+    if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] && command -v hyprctl >/dev/null 2>&1; then
+      hyprctl reload >/dev/null 2>&1 || true
+    fi
+    echo "  Added Super+D (backup beside bindings.lua when it existed). Press it to toggle Catch."
   else
     echo "  Skipped. Add it yourself any time with one line in"
-    echo "  ~/.config/hypr/bindings.lua, then \`hyprctl reload\`:"
+    echo "  $BINDINGS, then \`hyprctl reload\`:"
     echo
     echo "    $BIND_LINE"
   fi

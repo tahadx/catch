@@ -201,9 +201,10 @@ on your machine; the second removes the plugin itself.
 ```
 
 That removes the scheduler timer, the `catch` and `catch-host` symlinks in
-`~/.local/bin`, every browser host manifest, and Catch's entry in the
-Chromium-family flags files — leaving Omarchy's own flags alone. It is
-idempotent, so running it twice is fine.
+`~/.local/bin`, Catch's `Super+D` binding (other bindings are left byte for
+byte), every browser host manifest, and Catch's entry in the Chromium-family
+flags files — leaving Omarchy's own flags alone. It is idempotent, so running
+it twice is fine.
 
 Already removed the plugin? Run it from a fresh clone instead:
 

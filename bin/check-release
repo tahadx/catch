@@ -1,0 +1,122 @@
+#!/bin/bash
+# Release consistency check: every version a user can observe must agree, and
+# the shipped binaries must be executable on this machine's CPU. Runs offline;
+# CI and .githooks/pre-push call it before anything is published.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+python3 - <<'PY'
+import json
+import os
+import platform
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+root = os.getcwd()
+problems: list[str] = []
+
+def fail(message: str) -> None:
+    problems.append(message)
+
+manifest_path = os.path.join(root, "manifest.json")
+try:
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+except Exception as exc:  # noqa: BLE001 - report every parse failure alike
+    print(f"check-release: manifest.json is not valid JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+version = str(manifest.get("version", ""))
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?", version):
+    fail(f"manifest.json version [{version}] is not semver")
+if not manifest.get("id"):
+    fail("manifest.json has no id")
+if manifest.get("schemaVersion") != 1:
+    fail("manifest.json schemaVersion must be 1")
+for name, rel in (manifest.get("entryPoints") or {}).items():
+    if not os.path.isfile(os.path.join(root, rel)):
+        fail(f"manifest entry point {name} -> {rel} is missing")
+
+crate_path = os.path.join(root, "crates/catch/Cargo.toml")
+try:
+    with open(crate_path, "rb") as f:
+        crate = tomllib.load(f)
+except Exception as exc:  # noqa: BLE001
+    print(f"check-release: cannot parse {crate_path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+crate_version = str(crate.get("package", {}).get("version", ""))
+if crate_version != version:
+    fail(f"crate version [{crate_version}] != manifest version [{version}]")
+
+machine = platform.machine()
+alias = {"amd64": "x86_64", "arm64": "aarch64", "armv7l": "arm"}
+machine = alias.get(machine, machine)
+elf_machine = {0x03: "i386", 0x28: "arm", 0x3E: "x86_64", 0xB7: "aarch64"}
+
+def check_binary(path: str) -> None:
+    if not os.path.isfile(path):
+        fail(f"missing shipped binary {path}")
+        return
+    if not os.access(path, os.X_OK):
+        fail(f"shipped binary {path} is not executable")
+        return
+    with open(path, "rb") as f:
+        header = f.read(20)
+    if header[:4] != b"\x7fELF":
+        fail(f"shipped binary {path} is not an ELF")
+        return
+    if header[4] != 2 or header[5] != 1:
+        fail(f"shipped binary {path} is not 64-bit little-endian")
+        return
+    arch = elf_machine.get(struct.unpack_from("<H", header, 18)[0], "unknown")
+    if arch != machine:
+        fail(f"shipped binary {path} targets {arch}, this machine is {machine}")
+
+catch = os.path.join(root, "bin/dist/catch")
+host = os.path.join(root, "bin/dist/catch-host")
+check_binary(catch)
+check_binary(host)
+
+if not problems and version:
+    # `--version` runs the same self-configure hook a real user gets, so give
+    # it a throwaway HOME: the check must not touch the caller's machine.
+    tmp = tempfile.mkdtemp(prefix="catch-check-release.")
+    env = dict(os.environ)
+    env.update(
+        {
+            "HOME": tmp,
+            "XDG_CONFIG_HOME": os.path.join(tmp, ".config"),
+            "XDG_STATE_HOME": os.path.join(tmp, ".state"),
+            "XDG_DOWNLOAD_DIR": os.path.join(tmp, "Downloads"),
+        }
+    )
+    try:
+        out = subprocess.run(
+            [catch, "--version"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        got = out.stdout.strip()
+        want = f"catch {version}"
+        if out.returncode != 0 or got != want:
+            fail(
+                f"bin/dist/catch reports [{got}] (exit {out.returncode}), "
+                f"expected [{want}]"
+            )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+if problems:
+    for problem in problems:
+        print(f"check-release: {problem}", file=sys.stderr)
+    sys.exit(1)
+print(f"check-release: ok ({version}, {machine})")
+PY

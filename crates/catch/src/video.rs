@@ -7,9 +7,33 @@ use tokio::io::AsyncBufReadExt;
 /// silent. A quiet line of output must not delay "stop".
 const STOP_POLL: Duration = Duration::from_millis(250);
 
+/// How long yt-dlp may produce no output at all before the run is treated
+/// as hung. yt-dlp has its own socket timeouts, but a wedged fragment
+/// downloader can sit silent for ever; the row must not stay "downloading"
+/// with no process behind it. Overridable for tests via
+/// CATCH_VIDEO_IDLE_SECS.
+fn idle_timeout() -> Duration {
+    if let Ok(raw) = std::env::var("CATCH_VIDEO_IDLE_SECS") {
+        if let Ok(n) = raw.trim().parse::<u64>() {
+            if (1..=7200).contains(&n) {
+                return Duration::from_secs(n);
+            }
+        }
+    }
+    Duration::from_secs(600)
+}
+
+/// Longest line accepted from a child process. yt-dlp progress lines are
+/// short; anything longer is noise (or a hostile site title) and must not be
+/// allowed to grow memory without bound.
+const MAX_LINE: usize = 8 * 1024;
+/// How much stderr is kept for error reporting (the last lines win).
+const STDERR_KEEP_LINES: usize = 8;
+const STDERR_MAX_BYTES: usize = 16 * 1024;
+
 use crate::state::{
-    clean_label, load_state, mark_error, resolve_download_dir, resolve_inside, unique_destination,
-    update_state, video_dir, Status,
+    clean_label, load_state, mark_error, resolve_download_dir, resolve_inside, sanitize_filename,
+    unique_destination, update_state, video_dir, Status,
 };
 
 /// yt-dlp's own naming: the video title plus the real extension.
@@ -57,15 +81,27 @@ pub async fn download_video(
     // Videos sort into the video folder when categories are on.
     let dir = video_dir(&base);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+
+    // Same cross-process transfer lock as a plain download: two yt-dlp runs
+    // for one entry would race over the same output template and part files.
+    let Some(_claim) = crate::state::claim_worker(id)? else {
+        anyhow::bail!("{id} is already being downloaded by another catch process");
+    };
     update_state(|state| {
         if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
             let own = std::process::id();
-            if d.status == Status::Downloading && crate::state::live_worker_holds(d.pid, own) {
+            if d.status == Status::Downloading
+                && crate::state::worker_holds(d.pid, id)
+                && d.pid != own
+            {
                 anyhow::bail!("{id} is already held by worker {}", d.pid);
             }
             d.status = Status::Downloading;
             d.error.clear();
             d.pid = own;
+            // See download.rs: the live transfer lock is the proof now; a
+            // dead worker must not hold a slot for CLAIM_GRACE.
+            d.claimed_at = 0;
         }
         Ok(())
     })?;
@@ -85,6 +121,11 @@ pub async fn download_video(
         run = second;
     }
     let dest = run.dest;
+    if !dest.is_file() {
+        let msg = "yt-dlp reported a file that is not on disk";
+        let _ = mark_error(id, msg);
+        anyhow::bail!("{msg}");
+    }
     let name = dest
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -93,6 +134,9 @@ pub async fn download_video(
         if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
             if d.status == Status::Downloading {
                 d.status = Status::Done;
+                d.claimed_at = 0;
+                d.pid = 0;
+                d.error.clear();
                 d.filename = clean_label(&name, &format!("video-{id}"));
                 if d.title.is_empty() {
                     // Metadata never arrived (exotic site, old yt-dlp):
@@ -118,20 +162,7 @@ pub async fn download_video(
         }
         // On disk whatever happened to the row, so remember the link: a
         // later catch must still be recognised once the queue is cleared.
-        if let Some(url) = state
-            .downloads
-            .iter()
-            .find(|d| d.id == id)
-            .map(|d| d.url.clone())
-        {
-            crate::state::record_saved(
-                state,
-                &url,
-                &base,
-                &dest,
-                crate::state::DownloadKind::Video,
-            );
-        }
+        crate::state::record_saved(state, &url, &base, &dest, crate::state::DownloadKind::Video);
         Ok(())
     })?;
     eprintln!("catch: done {id} -> {}", dest.display());
@@ -185,35 +216,129 @@ async fn fetch(
         // whose target name was verified free by unique_destination.
         cmd.args(["--force-overwrites"]);
     }
+    cmd.args([
+        // Title and size arrive from this same extraction, before any
+        // bytes move: the row shows the real title almost at once
+        // instead of the URL tail, with no second yt-dlp race.
+        "--print",
+        "before_dl:CATCH_META\t%(title)j\t%(filesize_approx)s",
+        "--paths",
+        dir.to_str().unwrap_or("."),
+        "-o",
+        template,
+        "--print",
+        "after_move:CATCH_FILE\t%(filepath)s",
+        "--",
+        url,
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    // Its own process group: FFmpeg runs as a child of yt-dlp, and a stop
+    // has to reach the whole group. Killing only yt-dlp used to leave the
+    // merge running.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     let mut child = cmd
-        .args([
-            // Title and size arrive from this same extraction, before any
-            // bytes move: the row shows the real title almost at once
-            // instead of the URL tail, with no second yt-dlp race.
-            "--print",
-            "before_dl:CATCH_META\t%(title)j\t%(filesize_approx)s",
-            "--paths",
-            dir.to_str().unwrap_or("."),
-            "-o",
-            template,
-            "--print",
-            "after_move:CATCH_FILE\t%(filepath)s",
-            "--",
-            url,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| "spawn yt-dlp (is it installed?)")?;
 
+    // Drain stderr *concurrently*. It used to be read only after the child
+    // exited, so a chatty yt-dlp (or FFmpeg's merge output) filled the 64 KiB
+    // pipe buffer and blocked for ever: the transfer deadlocked with the
+    // child waiting on a reader that was waiting on the child.
+    let stderr = child.stderr.take().context("capture yt-dlp stderr")?;
+    let stderr_task = tokio::spawn(drain_stderr(stderr));
     let stdout = child.stdout.take().context("capture yt-dlp stdout")?;
-    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let mut lines = LineReader::new(tokio::io::BufReader::new(stdout), MAX_LINE);
+
+    let read = read_run(id, dir, &mut lines).await;
+    let (outcome, filepath, title, saw_progress, last_err) = match read {
+        Ok(v) => v,
+        Err(e) => {
+            // Whatever went wrong while reading, the child must not be left
+            // running in the background.
+            stop_child(&mut child).await;
+            let _ = stderr_task.await;
+            return Err(e);
+        }
+    };
+
+    // Cancel/kill/close before waiting, so no subprocess survives an early
+    // return. A clean EOF needs no signal.
+    let status = match outcome {
+        RunOutcome::Eof => child.wait().await.context("wait yt-dlp")?,
+        _ => stop_child(&mut child)
+            .await
+            .context("wait yt-dlp after stop")?,
+    };
+    let stderr_tail = tokio::time::timeout(Duration::from_secs(2), stderr_task)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+
+    if matches!(outcome, RunOutcome::Stopped) {
+        // A pause is not a failure: yt-dlp keeps its partial files, and the
+        // row stays Paused so a later resume continues instead of showing an
+        // error. `fetch` documents Ok(None) for exactly this.
+        eprintln!("catch: {id} paused");
+        return Ok(None);
+    }
+    if let RunOutcome::Idle(limit) = outcome {
+        let msg = format!(
+            "yt-dlp produced no output for {}s; stopped it (resume to retry)",
+            limit.as_secs()
+        );
+        let _ = mark_error(id, &msg);
+        anyhow::bail!("{msg}");
+    }
+    if !status.success() || filepath.is_none() {
+        let msg = if !stderr_tail.is_empty() {
+            stderr_tail
+        } else if !last_err.is_empty() {
+            format!("yt-dlp exited {status}: {last_err}")
+        } else {
+            format!("yt-dlp exited {status} with no file")
+        };
+        let _ = mark_error(id, &msg);
+        anyhow::bail!("{msg}");
+    }
+    let dest = filepath.expect("checked above");
+    let name = dest.file_name().map(|s| s.to_string_lossy().into_owned());
+    let downloaded = was_downloaded(saw_progress, &before, name.as_deref());
+    Ok(Some(Run {
+        dest,
+        downloaded,
+        title,
+    }))
+}
+
+enum RunOutcome {
+    /// yt-dlp closed stdout on its own.
+    Eof,
+    /// A stop/pause order ended the run.
+    Stopped,
+    /// No output for longer than the idle timeout.
+    Idle(Duration),
+}
+
+/// Read stdout lines until EOF or an order arrives. Everything that is not a
+/// protocol line is stderr-worthy noise and capped.
+#[allow(clippy::type_complexity)]
+async fn read_run(
+    id: &str,
+    dir: &Path,
+    lines: &mut LineReader<impl tokio::io::AsyncBufRead + Unpin>,
+) -> Result<(RunOutcome, Option<PathBuf>, Option<String>, bool, String)> {
     let mut last_flush = Instant::now();
     let mut last_check = Instant::now();
+    let mut last_output = Instant::now();
     let mut filepath: Option<PathBuf> = None;
     let mut last_err = String::new();
     let mut title: Option<String> = None;
     let mut saw_progress = false;
+
     loop {
         // yt-dlp can sit silent for minutes while a stalled connection
         // times out, so the read is bounded: a tick sends us round the loop
@@ -242,19 +367,29 @@ async fn fetch(
                 })
                 .unwrap_or(Status::Cancelled);
             if order == Status::Paused {
-                terminate_child(&mut child).await;
                 eprintln!("catch: {id} paused; partial files kept for resume");
-                return Ok(None);
+                return Ok((RunOutcome::Stopped, filepath, title, saw_progress, last_err));
             } else if order != Status::Downloading {
-                terminate_child(&mut child).await;
                 eprintln!("catch: {id} stopped");
                 anyhow::bail!("{id} stopped");
             }
         }
-        // A tick carried no output: orders were re-read above, go wait again.
-        let Some(line) = line else {
+        if line.is_none() {
+            // A poll tick carried no output. Only a *silent child* trips the
+            // inactivity deadline; the loop above keeps checking orders.
+            if last_output.elapsed() >= idle_timeout() {
+                return Ok((
+                    RunOutcome::Idle(idle_timeout()),
+                    filepath,
+                    title,
+                    saw_progress,
+                    last_err,
+                ));
+            }
             continue;
-        };
+        }
+        let line = line.unwrap_or_default();
+        last_output = Instant::now();
         if let Some(rest) = line.strip_prefix("CATCH_PROG\t") {
             let mut parts = rest.split('\t');
             let bytes = parts.next().and_then(|s| s.parse::<u64>().ok());
@@ -315,47 +450,118 @@ async fn fetch(
                 filepath = Some(p);
             }
         } else if !line.trim().is_empty() {
-            last_err = line.trim().to_string();
-            if last_err.len() > 200 {
-                last_err.truncate(200);
+            last_err = crate::state::truncate_bytes(line.trim(), 200).to_string();
+        }
+    }
+    Ok((RunOutcome::Eof, filepath, title, saw_progress, last_err))
+}
+
+/// Stop a child and everything in its process group: SIGTERM first (yt-dlp
+/// finalizes its part files for resume), SIGKILL if it ignores us.
+async fn stop_child(child: &mut tokio::process::Child) -> Option<std::process::ExitStatus> {
+    if let Some(pid) = child.id() {
+        signal_group(pid, libc::SIGTERM);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = child.try_wait() {
+                return Some(status);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        signal_group(pid, libc::SIGKILL);
+    }
+    child.wait().await.ok()
+}
+
+/// Signal a process group (negative pid). Safe no-op when the group is gone.
+fn signal_group(pid: u32, signal: i32) {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return;
+    }
+    // SAFETY: kill(2) with a negative pid addresses the process group this
+    // child was placed in; no memory is touched and a vanished group is
+    // reported as ESRCH, which is ignored.
+    unsafe {
+        libc::kill(-(pid as i32), signal);
+    }
+}
+
+/// A line reader with a hard per-line cap. `BufReader::lines` grows without
+/// bound, so a child that prints a 1 GiB line (or a page title with no
+/// newline) could exhaust memory.
+struct LineReader<R> {
+    inner: R,
+    limit: usize,
+}
+
+impl<R: tokio::io::AsyncBufRead + Unpin> LineReader<R> {
+    fn new(inner: R, limit: usize) -> Self {
+        LineReader { inner, limit }
+    }
+
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut any = false;
+        loop {
+            let available = self.inner.fill_buf().await?;
+            if available.is_empty() {
+                return if any {
+                    Ok(Some(finish_line(&out)))
+                } else {
+                    Ok(None)
+                };
+            }
+            any = true;
+            let newline_at = available.iter().position(|&b| b == b'\n');
+            let content = match newline_at {
+                Some(i) => i,
+                None => available.len(),
+            };
+            let room = self.limit.saturating_sub(out.len());
+            let take = content.min(room);
+            out.extend_from_slice(&available[..take]);
+            let consumed = newline_at.map(|i| i + 1).unwrap_or(available.len());
+            self.inner.consume(consumed);
+            if newline_at.is_some() {
+                return Ok(Some(finish_line(&out)));
             }
         }
     }
-    let status = child.wait().await?;
-    let stderr = child.stderr.take();
-    let stderr_tail = if let Some(mut err) = stderr {
-        use tokio::io::AsyncReadExt;
-        let mut buf = String::new();
-        let _ = err.read_to_string(&mut buf).await;
-        buf.lines()
-            .last()
-            .unwrap_or("")
-            .chars()
-            .take(200)
-            .collect::<String>()
-    } else {
-        String::new()
-    };
+}
 
-    if !status.success() || filepath.is_none() {
-        let msg = if !stderr_tail.is_empty() {
-            stderr_tail
-        } else if !last_err.is_empty() {
-            last_err
-        } else {
-            format!("yt-dlp exited {status} with no file")
-        };
-        let _ = mark_error(id, &msg);
-        anyhow::bail!("{msg}");
+fn finish_line(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim_end_matches('\r')
+        .to_string()
+}
+
+/// Read a child's stderr to EOF, keeping only the last few lines (bounded).
+async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(stderr: R) -> String {
+    let mut lines = LineReader::new(tokio::io::BufReader::new(stderr), MAX_LINE);
+    let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut held: usize = 0;
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let line = crate::state::truncate_bytes(line.trim(), 4096).to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                held += line.len();
+                kept.push_back(line);
+                while kept.len() > STDERR_KEEP_LINES || held > STDERR_MAX_BYTES {
+                    if let Some(old) = kept.pop_front() {
+                        held = held.saturating_sub(old.len());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
     }
-    let dest = filepath.expect("checked above");
-    let name = dest.file_name().map(|s| s.to_string_lossy().into_owned());
-    let downloaded = was_downloaded(saw_progress, &before, name.as_deref());
-    Ok(Some(Run {
-        dest,
-        downloaded,
-        title,
-    }))
+    kept.into_iter().last().unwrap_or_default()
 }
 
 /// Did this run actually move bytes? A skipped target emits a progress line
@@ -390,6 +596,12 @@ fn free_copy_template(dir: &Path, run: &Run, fallback: &str) -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let stem = clean_label(run.title.as_deref().unwrap_or(&stem_of_skipped), fallback);
+    let stem = sanitize_filename(&stem);
+    let stem = if stem.is_empty() {
+        fallback.to_string()
+    } else {
+        stem
+    };
     let base = match &ext {
         Some(e) => format!("{stem}.{e}"),
         None => stem.clone(),
@@ -409,28 +621,6 @@ fn free_copy_template(dir: &Path, run: &Run, fallback: &str) -> String {
     // A percent sign opens a field reference in a yt-dlp template, so a
     // literal one ("100% Hits") has to be doubled.
     format!("{}.%(ext)s", stem.replace('%', "%%"))
-}
-
-/// Stop yt-dlp gently first (SIGTERM finalizes its part files for
-/// resume), then forcefully if it ignores us.
-async fn terminate_child(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
 }
 
 #[cfg(test)]
@@ -507,5 +697,52 @@ mod copy_name_tests {
             "raw-name (1).%(ext)s"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn long_unicode_titles_keep_the_extension() {
+        let dir = scratch();
+        let title = "汉".repeat(200);
+        let tpl = free_copy_template(&dir, &run_at(&dir, "x.webm", &title), "v");
+        assert!(tpl.ends_with(".%(ext)s"));
+        assert!(tpl.len() < 300, "template not capped: {}", tpl.len());
+        assert!(
+            tpl.char_indices().all(|(i, _)| tpl.is_char_boundary(i)),
+            "valid UTF-8"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod line_reader_tests {
+    use super::*;
+
+    fn reader(data: &'static str) -> LineReader<tokio::io::BufReader<&'static [u8]>> {
+        LineReader::new(tokio::io::BufReader::new(data.as_bytes()), 16)
+    }
+
+    #[tokio::test]
+    async fn reads_lines_and_stops_at_eof() {
+        let mut r = reader("one\ntwo\r\nthree");
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("one"));
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("two"));
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("three"));
+        assert_eq!(r.next_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn caps_runaway_lines_without_losing_the_next_line() {
+        let data: &'static str = "0123456789abcdefghijKL\nshort\n";
+        let mut r = reader(data);
+        let first = r.next_line().await.unwrap().unwrap();
+        assert_eq!(first.len(), 16, "line was not capped: {first:?}");
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("short"));
+    }
+
+    #[tokio::test]
+    async fn empty_input_is_eof_not_an_empty_line() {
+        let mut r = reader("");
+        assert_eq!(r.next_line().await.unwrap(), None);
     }
 }

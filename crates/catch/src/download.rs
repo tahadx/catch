@@ -4,50 +4,101 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::state::{
-    dir_for, load_state, mark_error, resolve_download_dir, unique_destination, update_state, Status,
+    dir_for, load_state, mark_error, resolve_download_dir, sanitize_filename, unique_destination,
+    update_state, worker_holds, Status,
 };
 
-/// Give up on a connection with no data this long, then reconnect.
+/// Give up on a connection with no body data this long, then reconnect.
 /// Overridable for tests via CATCH_STALL_SECS.
 fn stall_timeout() -> Duration {
     if let Ok(raw) = std::env::var("CATCH_STALL_SECS") {
         if let Ok(n) = raw.trim().parse::<u64>() {
-            if (1..=600).contains(&n) {
+            if (1..=3600).contains(&n) {
                 return Duration::from_secs(n);
             }
         }
     }
     Duration::from_secs(60)
 }
-/// Fresh connections attempted after a stall or mid-transfer failure
-/// before calling it failed.
-const MAX_RECONNECTS: u32 = 3;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling on connecting and on waiting for response headers. A server that
+/// accepts the connection and then says nothing must not hang a worker for
+/// ever: `connect_timeout` alone only covers the TCP handshake.
+fn response_timeout() -> Duration {
+    if let Ok(raw) = std::env::var("CATCH_RESPONSE_SECS") {
+        if let Ok(n) = raw.trim().parse::<u64>() {
+            if (1..=600).contains(&n) {
+                return Duration::from_secs(n);
+            }
+        }
+    }
+    Duration::from_secs(30)
+}
+
+/// Connection attempts per transfer, including the first. Overridable for
+/// tests (CATCH_MAX_ATTEMPTS=1 makes a transfer single-shot).
+fn max_attempts() -> u32 {
+    if let Ok(raw) = std::env::var("CATCH_MAX_ATTEMPTS") {
+        if let Ok(n) = raw.trim().parse::<u32>() {
+            if (1..=10).contains(&n) {
+                return n;
+            }
+        }
+    }
+    4
+}
+
 /// All promised bytes are in but the server won't hang up: wait this long
 /// for a clean EOF, then take the win.
 const COMPLETION_GRACE: Duration = Duration::from_secs(5);
+
 /// How often a live transfer re-reads stop orders even when no data is
 /// arriving. Without this a quiet or stalled connection only notices a
 /// pause/remove once the next chunk lands — or after the stall timeout,
 /// which is what made "stop" look like it did nothing.
 const STOP_POLL: Duration = Duration::from_millis(250);
+
+/// How often a busy transfer writes progress to the state file (and reads
+/// stop orders back). The whole file is parsed and rewritten for each flush,
+/// so this is the difference between a smooth bar and an I/O storm.
+const FLUSH_EVERY: Duration = Duration::from_millis(250);
+
 /// Ceiling on how often a busy transfer re-reads stop orders. Each read is a
 /// full parse of the state file, so doing it per chunk starved the download;
-/// this keeps the file out of the hot path while staying well under STOP_POLL,
-/// so a stop still lands within a tenth of a second of the click.
+/// this keeps the file out of the hot path while staying well under
+/// STOP_POLL, so a stop still lands within a tenth of a second of the click.
 const ORDER_POLL: Duration = Duration::from_millis(100);
 
+/// First retry delay; each further attempt doubles it.
+const BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// Ceiling for a computed backoff.
+const BACKOFF_MAX: Duration = Duration::from_secs(15);
+/// Ceiling for a server-provided Retry-After (a hostile or broken server
+/// must not park a worker for hours).
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Copy)]
 enum Directive {
     Keep,
     StandDown,
     Abort,
 }
 
+/// How one connection ended.
 enum StreamEnd {
+    /// The promised bytes arrived, or the body ended with no length promised.
     Finished,
-    Stalled,
+    /// The connection went quiet past its deadline, died mid-body, or the
+    /// body was shorter than announced. Worth a ranged reconnect.
+    Interrupted(String),
     StoodDown,
     Aborted,
+}
+
+/// A failure and whether it is worth another attempt.
+enum Verdict {
+    Retry(Duration),
+    Fatal(String),
 }
 
 /// True when the URL path ends with a file extension that is not itself
@@ -66,24 +117,138 @@ fn looks_like_file_url(url: &str) -> bool {
     }
 }
 
+/// "bytes 200-1000/67589" -> (200, 1000, Some(67589)). A malformed or
+/// unsatisfiable header returns None so the caller restarts from zero
+/// instead of trusting an offset it cannot verify.
+fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes")?.trim();
+    let (range, total) = rest.split_once('/')?;
+    let total = match total.trim() {
+        "*" => None,
+        t => Some(t.parse::<u64>().ok()?),
+    };
+    let (start, end) = range.trim().split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = end.trim().parse::<u64>().ok()?;
+    if end < start {
+        return None;
+    }
+    // A range that runs past the representation's own size is malformed,
+    // even though start and end look individually valid.
+    if total.is_some_and(|t| end >= t) {
+        return None;
+    }
+    Some((start, end, total))
+}
+
+/// A small, jittered exponential backoff. Jitter keeps a batch of workers
+/// from hammering a server that just came back in lockstep.
+fn backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    let base = BACKOFF_BASE.saturating_mul(1u32 << shift).min(BACKOFF_MAX);
+    // Deterministic-ish jitter from the clock: +/- 25 %, never zero.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let spread = (base.as_millis() as u64) / 2;
+    let jitter = if spread == 0 { 0 } else { nanos % spread };
+    let millis = (base.as_millis() as u64).saturating_sub(spread / 2) + jitter;
+    // Bias low: the first retry should be quick.
+    Duration::from_millis(millis.clamp(50, BACKOFF_MAX.as_millis() as u64))
+}
+
+/// A server-provided Retry-After (seconds form), clamped.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .to_string();
+    let secs = raw.parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs).min(RETRY_AFTER_MAX))
+}
+
+/// Classify an HTTP failure status. Temporary conditions retry; anything
+/// that means "this request will never work" does not — a 404 or a 403 must
+/// fail immediately instead of being attempted four times.
+fn status_verdict(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    attempt: u32,
+) -> Verdict {
+    match status.as_u16() {
+        408 | 425 | 429 | 500..=599 => {
+            let wait = retry_after(headers)
+                .unwrap_or_else(|| backoff(attempt))
+                .max(Duration::from_millis(50));
+            Verdict::Retry(wait)
+        }
+        _ => Verdict::Fatal(format!("server replied {status}")),
+    }
+}
+
+/// Classify a transport failure. Builder errors (a malformed URL) and
+/// redirect loops are permanent; connection, timeout, body and protocol
+/// failures are worth retrying.
+fn transport_verdict(e: &reqwest::Error, attempt: u32) -> Verdict {
+    if e.is_builder() {
+        return Verdict::Fatal(format!("bad request: {e}"));
+    }
+    if e.is_redirect() {
+        return Verdict::Fatal(format!("redirect loop: {e}"));
+    }
+    Verdict::Retry(backoff(attempt))
+}
+
 /// Read-only stop check (atomic renames make plain reads safe).
-fn check_directive(id: &str) -> Directive {
-    match load_state().ok().and_then(|s| {
-        s.downloads
-            .into_iter()
-            .find(|d| d.id == id)
-            .map(|d| d.status)
-    }) {
-        Some(Status::Downloading) => Directive::Keep,
-        Some(Status::Paused) => Directive::StandDown,
-        _ => Directive::Abort,
+///
+/// The state file is only re-parsed when it actually changed: a live
+/// transfer asks this every poll tick, and three transfers doing that for a
+/// big queue meant more parsing than downloading.
+struct DirectiveWatch {
+    stamp: Option<(std::time::SystemTime, u64)>,
+    directive: Option<Directive>,
+}
+
+impl DirectiveWatch {
+    fn new() -> Self {
+        DirectiveWatch {
+            stamp: None,
+            directive: None,
+        }
+    }
+
+    fn directive(&mut self, id: &str) -> Directive {
+        let stamp = std::fs::metadata(crate::state::state_path())
+            .ok()
+            .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+        if stamp.is_some() && stamp == self.stamp {
+            if let Some(d) = self.directive {
+                return d;
+            }
+        }
+        let directive = match load_state().ok().and_then(|s| {
+            s.downloads
+                .into_iter()
+                .find(|d| d.id == id)
+                .map(|d| d.status)
+        }) {
+            Some(Status::Downloading) => Directive::Keep,
+            Some(Status::Paused) => Directive::StandDown,
+            _ => Directive::Abort,
+        };
+        self.stamp = stamp;
+        self.directive = Some(directive);
+        directive
     }
 }
 
 /// Download one entry inline, streaming to an id-suffixed part file with
-/// resume. Dead connections are re-established automatically (up to three
-/// reconnects); stop orders are honored throughout. With `overwrite` (the
-/// explicit "replace" action) the saved file is refetched in place;
+/// resume. Interrupted connections are re-established with a bounded,
+/// jittered backoff; stop orders are honored throughout. With `overwrite`
+/// (the explicit "replace" action) the saved file is refetched in place;
 /// otherwise an existing file is never touched and the entry lands as
 /// another copy under the next free name.
 pub async fn download_entry(
@@ -104,10 +269,26 @@ pub async fn download_entry(
     }
 
     let url = entry.url.clone();
-    let recorded_name = entry.filename.clone();
+    let recorded_name = sanitize_filename(&entry.filename);
     let recorded_bytes = entry.bytes;
+    let recorded_etag = entry.etag.clone();
+    let recorded_modified = entry.last_modified.clone();
     let base = resolve_download_dir(dir_override);
     std::fs::create_dir_all(&base).with_context(|| format!("create {}", base.display()))?;
+
+    // One transfer per entry, enforced across processes: the row's pid is
+    // written by whoever reserved the slot, which is not proof that a worker
+    // is behind it. The lock is the proof, and it is released when this
+    // function returns (including on error).
+    let Some(_claim) = crate::state::claim_worker(id)? else {
+        anyhow::bail!("{id} is already being downloaded by another catch process");
+    };
+    // Secondary guard for the pre-claim world: a live worker for this id
+    // that outraced us (it holds the row but not yet the lock).
+    if entry.status == Status::Downloading && worker_holds(entry.pid, id) {
+        anyhow::bail!("{id} is already held by worker {}", entry.pid);
+    }
+
     // Category folder from the recorded name (server names re-resolve
     // per attempt below).
     let dir = dir_for(&base, &recorded_name);
@@ -132,25 +313,24 @@ pub async fn download_entry(
 
     update_state(|state| {
         if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
-            let own = std::process::id();
-            // A live holder (drain reservation or a running worker) wins;
-            // a second worker for one entry must never run. Drain-held
-            // reservations are claimable; only a live *worker* turns us away.
-            if d.status == Status::Downloading && crate::state::live_worker_holds(d.pid, own) {
-                anyhow::bail!("{id} is already held by worker {}", d.pid);
-            }
             d.status = Status::Downloading;
             d.error.clear();
             d.filename = dest_name.clone();
-            d.pid = own;
-            d.claimed_at = crate::state::now_secs();
+            d.pid = std::process::id();
+            // The drainer's reservation grace is over: a worker that has
+            // stamped itself is protected by its transfer lock while alive,
+            // so a dead pid can be requeued at once instead of waiting out
+            // CLAIM_GRACE.
+            d.claimed_at = 0;
         }
         Ok(())
     })?;
 
+    // One client for the whole transfer (connection pool, keep-alive). TLS
+    // verification is rustls' default: on.
     let client = reqwest::Client::builder()
         .user_agent("catch/0.1 (omarchy download manager)")
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(response_timeout())
         .tcp_keepalive(Duration::from_secs(30))
         .build()?;
 
@@ -159,18 +339,22 @@ pub async fn download_entry(
         bytes: std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0),
         total: 0,
         last_flush: Instant::now(),
-        last_pct: 101,
         last_error: String::new(),
+        etag: recorded_etag,
+        last_modified: recorded_modified,
+        resumable: true,
     };
-    let mut reconnects = 0u32;
+    let mut attempts = 0u32;
+    let mut restarts = 0u32;
+    let mut watch = DirectiveWatch::new();
 
     // Connection attempts: a fresh request (with Range from what we hold)
     // is what unsticks the dead connections users used to fix by hand.
     loop {
-        match check_directive(id) {
+        match watch.directive(id) {
             Directive::Keep => {}
             Directive::StandDown => {
-                eprintln!("catch: {id} paused at {} bytes", progress.bytes);
+                note_paused(id, &progress);
                 return Ok(part.clone());
             }
             Directive::Abort => {
@@ -180,42 +364,194 @@ pub async fn download_entry(
             }
         }
 
+        if attempts >= max_attempts() {
+            let msg = format!(
+                "gave up after {} attempts: {}",
+                attempts,
+                if progress.last_error.is_empty() {
+                    "connection lost"
+                } else {
+                    &progress.last_error
+                }
+            );
+            let _ = mark_error(id, &msg);
+            anyhow::bail!("{url}: {msg} (resume to retry)");
+        }
+        attempts += 1;
+
+        // Resume offset: bytes already on disk win over the recorded counter,
+        // and so they do on every attempt: the part file is the truth about
+        // what the server still owes us.
+        let on_disk = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        if on_disk != progress.bytes {
+            progress.bytes = on_disk;
+        }
+
         let mut req = client.get(&url);
-        if progress.bytes > 0 {
+        if progress.bytes > 0 && progress.resumable {
             req = req.header("Range", format!("bytes={}-", progress.bytes));
-        }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = mark_error(id, &format!("request failed: {e:#}"));
-                anyhow::bail!("GET {url}: {e:#}");
+            // If-Range makes the server answer 200 (whole file) instead of a
+            // 206 when the representation changed since we started: a resume
+            // must never splice two different files together.
+            if let Some(validator) = progress.if_range() {
+                req = req.header("If-Range", validator);
             }
-        };
-        let resumed = progress.bytes > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-        if progress.bytes > 0 && resp.status() == reqwest::StatusCode::OK {
-            // Server ignored Range: restart from zero rather than corrupting.
-            std::fs::remove_file(&part).ok();
-            progress.bytes = 0;
         }
-        if progress.bytes > 0 && resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        let sent = tokio::time::timeout(response_timeout(), req.send()).await;
+        let resp = match sent {
+            Err(_) => {
+                let why = format!(
+                    "no response headers within {}s",
+                    response_timeout().as_secs()
+                );
+                let wait = retry_or_fail(id, &url, &why, attempts, &mut progress)?;
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            Ok(Err(e)) => match transport_verdict(&e, attempts) {
+                Verdict::Fatal(why) => {
+                    let _ = mark_error(id, &why);
+                    anyhow::bail!("GET {url}: {why}");
+                }
+                Verdict::Retry(wait) => {
+                    let _ = note_retry(id, &format!("{e}"), attempts, wait, &mut progress);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            },
+            Ok(Ok(r)) => r,
+        };
+
+        let status = resp.status();
+        // A compressed body has no stable byte offsets to resume against.
+        // reqwest is built without decompression here, so this only fires
+        // when a server encodes anyway: fall back to whole-file transfers.
+        let encoded = resp
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| !v.eq_ignore_ascii_case("identity"))
+            .unwrap_or(false);
+        if encoded {
+            progress.resumable = false;
+            if progress.bytes > 0 {
+                // A ranged request is already in flight and its answer is
+                // about the encoded stream: start over from zero.
+                restart_from_zero(&part, &mut progress);
+                continue;
+            }
+        }
+
+        // A resumed answer must prove it starts exactly where we stopped.
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let header = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok());
+            let resp_etag = resp
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok());
+            let resp_modified = resp
+                .headers()
+                .get(reqwest::header::LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok());
+            match header.and_then(parse_content_range) {
+                Some((start, end, total)) if start == progress.bytes && end + 1 > start => {
+                    // A server is supposed to answer 200 to a stale
+                    // If-Range, but trust is not proof: if the response
+                    // itself carries different validators (or a different
+                    // total) than the representation we hold, appending the
+                    // tail would splice two files. Restart from zero.
+                    let etag_changed =
+                        !progress.etag.is_empty() && resp_etag.is_some_and(|e| e != progress.etag);
+                    let modified_changed = !progress.last_modified.is_empty()
+                        && resp_modified.is_some_and(|lm| lm != progress.last_modified);
+                    let size_changed =
+                        total.is_some() && progress.total > 0 && total != Some(progress.total);
+                    if progress.bytes > 0 && (etag_changed || modified_changed || size_changed) {
+                        eprintln!(
+                            "catch: {id} remote changed under a resumed transfer; restarting from zero"
+                        );
+                        restart_from_zero(&part, &mut progress);
+                        continue;
+                    }
+                    if let Some(total) = total {
+                        progress.total = total;
+                    } else {
+                        progress.total = progress.bytes + (end + 1 - start);
+                    }
+                }
+                _ => {
+                    let why = "malformed Content-Range on a resumed transfer";
+                    let wait = retry_or_fail(id, &url, why, attempts, &mut progress)?;
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            }
+        } else if status == reqwest::StatusCode::OK {
+            if progress.bytes > 0 {
+                // Server ignored Range (or If-Range changed): start over
+                // rather than appending a whole file to a partial one.
+                restart_from_zero(&part, &mut progress);
+            }
+        } else if progress.bytes > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
             // We asked past the end because we already hold everything —
-            // unless the part file is gone (orphan cleanup), in which case
-            // loop around and fetch from zero.
-            if part.exists() {
-                return finish_from_part(
+            // unless the remote representation changed under us, in which
+            // case the answer names a different total.
+            let remote_total = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().strip_prefix("bytes */"))
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let held = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+            let complete = match remote_total {
+                Some(total) => held == total,
+                None => progress.total > 0 && held >= progress.total,
+            };
+            if complete && part.exists() {
+                return finish(Finish {
                     id,
-                    &dir,
-                    &dest_name,
-                    &part,
-                    progress.bytes,
-                    progress.total,
+                    url: &url,
+                    dir: &dir,
+                    dest_name: &dest_name,
+                    part: &part,
+                    bytes: held,
+                    total: remote_total,
                     overwrite,
-                )
+                    base: &base,
+                })
                 .await;
             }
-            progress.bytes = 0;
+            if restarts >= 2 {
+                let msg = format!("server keeps refusing the resumed range ({status})");
+                let _ = mark_error(id, &msg);
+                anyhow::bail!("{url}: {msg}");
+            }
+            restarts += 1;
+            restart_from_zero(&part, &mut progress);
             continue;
+        } else if !status.is_success() {
+            match status_verdict(status, resp.headers(), attempts) {
+                Verdict::Fatal(why) => {
+                    let _ = mark_error(id, &why);
+                    anyhow::bail!("{url}: {why}");
+                }
+                Verdict::Retry(wait) => {
+                    let _ = note_retry(
+                        id,
+                        &format!("server replied {status}"),
+                        attempts,
+                        wait,
+                        &mut progress,
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            }
         }
+
         // A file link that answers HTML is a viewer/login wall, not the
         // file (this once saved release pages as APKs). Refuse loudly.
         let content_type = resp
@@ -228,6 +564,7 @@ pub async fn download_entry(
             let _ = mark_error(id, "server returned a page, not the file (login wall?)");
             anyhow::bail!("{url}: server returned a page, not the file");
         }
+
         // Adopt a server-advertised filename when ours is generic (query
         // URLs like /download?id=5). Only before any bytes are held, so a
         // resume never switches files mid-stream.
@@ -258,24 +595,20 @@ pub async fn download_entry(
                 }
             }
         }
-        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            let code = resp.status();
-            mark_error(id, &format!("server replied {code}"))?;
-            anyhow::bail!("server replied {code} for {url}");
+
+        let resumed = progress.bytes > 0;
+        if !resumed {
+            let announced = resp.content_length().unwrap_or(0);
+            progress.total = announced;
         }
-        let announced = resp.content_length().unwrap_or(0);
-        if announced > 0 {
-            progress.total = if resumed {
-                announced + progress.bytes
-            } else {
-                announced
-            };
-        }
+        progress.capture_validators(resp.headers());
         update_state(|state| {
             if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
                 d.total = progress.total;
                 d.bytes = progress.bytes;
                 d.filename = dest_name.clone();
+                d.etag = progress.etag.clone();
+                d.last_modified = progress.last_modified.clone();
             }
             Ok(())
         })?;
@@ -296,17 +629,28 @@ pub async fn download_entry(
         // buffered when the transfer ends is re-fetched rather than skipped.
         let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, &mut raw);
         let mut stream = resp.bytes_stream();
-        let end =
-            match stream_one_connection(id, &part, &mut file, &mut stream, &mut progress).await {
-                Ok(end) => end,
-                Err(e) => {
-                    // A BufWriter does not flush on drop. Put what is buffered on
-                    // disk before the error travels on, so the next run resumes
-                    // from where the state file says it does.
-                    let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
-                    return Err(e);
-                }
-            };
+        let end = match stream_one_connection(
+            id,
+            &part,
+            &mut file,
+            &mut stream,
+            &mut progress,
+            &mut watch,
+        )
+        .await
+        {
+            Ok(end) => end,
+            Err(e) => {
+                // A BufWriter does not flush on drop. Put what is buffered on
+                // disk before the error travels on, so the next run resumes
+                // from where the state file says it does.
+                let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
+                // A local write failure (disk full, read-only folder) will
+                // not fix itself: report it instead of hammering the server.
+                let _ = mark_error(id, &format!("{e:#}"));
+                return Err(e);
+            }
+        };
         tokio::io::AsyncWriteExt::shutdown(&mut file).await.ok();
         drop(file);
         drop(raw);
@@ -314,7 +658,7 @@ pub async fn download_entry(
             StreamEnd::Finished => break,
             StreamEnd::StoodDown => {
                 // Paused: the part file stays, resume continues via Range.
-                eprintln!("catch: {id} paused at {} bytes", progress.bytes);
+                note_paused(id, &progress);
                 return Ok(part.clone());
             }
             StreamEnd::Aborted => {
@@ -322,23 +666,17 @@ pub async fn download_entry(
                 eprintln!("catch: {id} stopped");
                 anyhow::bail!("{id} stopped");
             }
-            StreamEnd::Stalled => {
-                reconnects += 1;
-                if reconnects > MAX_RECONNECTS {
-                    let msg = if progress.last_error.is_empty() {
-                        "stalled: no data for 60s, three reconnects failed".to_string()
-                    } else {
-                        format!(
-                            "transfer failed after three reconnects: {}",
-                            progress.last_error
-                        )
-                    };
-                    let _ = mark_error(id, &msg);
-                    anyhow::bail!("{url}: {msg} (resume to retry)");
+            StreamEnd::Interrupted(why) => {
+                progress.last_error = why.clone();
+                if attempts >= max_attempts() {
+                    // The loop's own deadline check reports this on the next
+                    // pass; keep the part file for a manual resume.
+                    continue;
                 }
-                eprintln!(
-                    "catch: {id} interrupted, reconnecting ({reconnects}/{MAX_RECONNECTS}) …"
-                );
+                let wait = backoff(attempts);
+                note_retry(id, &why, attempts, wait, &mut progress)?;
+                tokio::time::sleep(wait).await;
+                continue;
             }
         }
     }
@@ -346,75 +684,67 @@ pub async fn download_entry(
     // Our bytes only ever lived in the id-suffixed part file, so an
     // existing dest belongs to someone else: never overwrite it silently.
     // Only an explicit replace may take that dest over.
-    let dest = if dest.exists() && !overwrite {
-        unique_destination(&dir, &dest_name)
-    } else {
-        dest
-    };
-    tokio::fs::rename(&part, &dest)
-        .await
-        .with_context(|| format!("move to {}", dest.display()))?;
-    update_state(|state| {
-        // A stop order may have landed with the final chunk: only take the
-        // win if nobody cancelled or removed us mid-flight.
-        if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
-            if d.status == Status::Downloading {
-                d.status = Status::Done;
-                d.bytes = progress.bytes;
-                if d.total == 0 {
-                    d.total = progress.bytes;
-                }
-            }
-        }
-        // The file is on disk whatever happened to the row above, so record
-        // it: a link caught again must still be recognised as a duplicate
-        // after the queue is cleared.
-        if let Some(url) = state
-            .downloads
-            .iter()
-            .find(|d| d.id == id)
-            .map(|d| d.url.clone())
-        {
-            crate::state::record_saved(state, &url, &base, &dest, crate::state::DownloadKind::File);
-        }
-        Ok(())
-    })?;
-    eprintln!("catch: done {} -> {}", id, dest.display());
-    crate::state::spawn_drain();
-    Ok(dest)
+    finish(Finish {
+        id,
+        url: &url,
+        dir: &dir,
+        dest_name: &dest_name,
+        part: &part,
+        bytes: progress.bytes,
+        total: Some(progress.total),
+        overwrite,
+        base: &base,
+    })
+    .await
 }
 
-/// Finalize from an already-complete part file (416/range-past-end case).
-async fn finish_from_part(
+/// Decision helper for an attempt that failed before any bytes were written:
+/// another attempt (with its delay) or a fatal error.
+fn retry_or_fail(
     id: &str,
-    dir: &std::path::Path,
-    dest_name: &str,
-    part: &std::path::Path,
-    bytes: u64,
-    total: u64,
-    overwrite: bool,
-) -> Result<PathBuf> {
-    let dest = dir.join(dest_name);
-    let dest = if dest.exists() && !overwrite {
-        unique_destination(dir, dest_name)
-    } else {
-        dest
-    };
-    tokio::fs::rename(part, &dest)
-        .await
-        .with_context(|| format!("move to {}", dest.display()))?;
-    let total = if total == 0 { bytes } else { total.max(bytes) };
+    url: &str,
+    why: &str,
+    attempts: u32,
+    progress: &mut Progress,
+) -> Result<Duration> {
+    if attempts >= max_attempts() {
+        let msg = format!("gave up after {attempts} attempts: {why}");
+        let _ = mark_error(id, &msg);
+        anyhow::bail!("{url}: {msg} (resume to retry)");
+    }
+    let wait = backoff(attempts);
+    let _ = note_retry(id, why, attempts, wait, progress);
+    Ok(wait)
+}
+
+/// Record the retry on the row (the panel shows `error` on the card) and in
+/// the log, and wait before the next attempt.
+fn note_retry(
+    id: &str,
+    why: &str,
+    attempts: u32,
+    wait: Duration,
+    progress: &mut Progress,
+) -> Result<()> {
+    progress.last_error = why.to_string();
+    let note = format!(
+        "attempt {attempts}/{} failed: {why}; retrying in {:.1}s",
+        max_attempts(),
+        wait.as_secs_f64()
+    );
+    eprintln!("catch: {id} {note}");
     update_state(|state| {
         if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
-            d.status = Status::Done;
-            d.bytes = bytes;
-            d.total = total;
+            if d.status == Status::Downloading {
+                d.error = note.clone();
+            }
         }
         Ok(())
-    })?;
-    eprintln!("catch: done {} -> {}", id, dest.display());
-    crate::state::spawn_drain();
-    Ok(dest)
+    })
+}
+
+fn note_paused(id: &str, progress: &Progress) {
+    eprintln!("catch: {id} paused at {} bytes", progress.bytes);
 }
 
 /// Live counters for one transfer, shared across reconnects.
@@ -422,8 +752,23 @@ struct Progress {
     bytes: u64,
     total: u64,
     last_flush: Instant,
-    last_pct: u64,
     last_error: String,
+    etag: String,
+    last_modified: String,
+    /// False when byte offsets cannot be trusted across connections
+    /// (a content-encoded body): never resume such a transfer.
+    resumable: bool,
+}
+
+/// Throw away the partial file and every resume validator: the server
+/// answered about a representation that is not the one already on disk (or
+/// ignored the request's Range), so appending would splice two files.
+fn restart_from_zero(part: &std::path::Path, progress: &mut Progress) {
+    let _ = std::fs::remove_file(part);
+    progress.bytes = 0;
+    progress.total = 0;
+    progress.etag.clear();
+    progress.last_modified.clear();
 }
 
 impl Progress {
@@ -436,16 +781,85 @@ impl Progress {
             .and_then(|v| v.checked_div(self.total))
             .unwrap_or(100)
     }
+
+    /// Remember the validators of this response, for `If-Range` on the next
+    /// reconnect of this same transfer.
+    fn capture_validators(&mut self, headers: &reqwest::header::HeaderMap) {
+        if let Some(etag) = headers
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+        {
+            self.etag = etag.to_string();
+        }
+        if let Some(lm) = headers
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+        {
+            self.last_modified = lm.to_string();
+        }
+    }
+
+    fn if_range(&self) -> Option<String> {
+        if !self.etag.is_empty() {
+            Some(self.etag.clone())
+        } else if !self.last_modified.is_empty() {
+            Some(self.last_modified.clone())
+        } else {
+            None
+        }
+    }
+}
+
+/// Write live counters to the row and translate its status into an order.
+/// One locked read-modify-write also makes this the stop-order check for a
+/// transfer that is busily moving bytes. `Ok(None)` means keep going.
+async fn flush_progress(id: &str, progress: &mut Progress) -> Result<Option<StreamEnd>> {
+    let mut directive = Directive::Keep;
+    update_state(|state| {
+        directive = match state.downloads.iter_mut().find(|d| d.id == id) {
+            Some(d) if d.status == Status::Downloading => {
+                d.bytes = progress.bytes;
+                d.total = progress.total;
+                Directive::Keep
+            }
+            Some(d) if d.status == Status::Paused => Directive::StandDown,
+            _ => Directive::Abort,
+        };
+        Ok(())
+    })
+    .unwrap_or(());
+    if progress.total > 0 {
+        eprintln!(
+            "catch: {} {}% ({}/{})",
+            id,
+            progress.percent(),
+            progress.bytes,
+            progress.total
+        );
+    } else {
+        eprintln!("catch: {} {} bytes", id, progress.bytes);
+    }
+    Ok(match directive {
+        Directive::Keep => None,
+        Directive::StandDown => Some(StreamEnd::StoodDown),
+        Directive::Abort => Some(StreamEnd::Aborted),
+    })
 }
 
 /// Read one connection until it ends. Honors stop orders on every flush,
 /// and on every poll tick even when the connection has gone quiet.
+///
+/// The idle deadline is a monotonic mark of the last byte that arrived, not
+/// a timer that is re-armed on each pass: re-arming the `select!` sleep on
+/// every poll tick meant the stall timeout never fired at all, and a
+/// connection that stopped sending hung a worker for ever.
 async fn stream_one_connection(
     id: &str,
     part: &std::path::Path,
     file: &mut tokio::io::BufWriter<&mut tokio::fs::File>,
     stream: &mut (impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin),
     progress: &mut Progress,
+    watch: &mut DirectiveWatch,
 ) -> Result<StreamEnd> {
     use tokio::io::AsyncWriteExt;
     // Reading the stop order loads and parses the whole state file: every
@@ -456,6 +870,7 @@ async fn stream_one_connection(
     // connection that has gone quiet still stops on time.
     let mut last_order_read = Instant::now();
     let mut order_due = true;
+    let mut last_data = Instant::now();
     loop {
         // Stop orders first: a transfer whose server has gone quiet is
         // exactly when someone reaches for "stop", and the row may be paused
@@ -463,96 +878,273 @@ async fn stream_one_connection(
         if order_due || last_order_read.elapsed() >= ORDER_POLL {
             order_due = false;
             last_order_read = Instant::now();
-            match check_directive(id) {
+            match watch.directive(id) {
                 Directive::Keep => {}
                 Directive::StandDown => return Ok(StreamEnd::StoodDown),
                 Directive::Abort => return Ok(StreamEnd::Aborted),
             }
         }
-        // Past the promised total with the server still talking: it may be
-        // over-delivering (keep reading) or never hanging up (take the win
-        // after a short grace instead of sitting at 100% forever).
+        // How long this connection may stay quiet, and the deadline it has
+        // already burned: `last_data` is only reset by real body bytes.
         let complete = progress.total > 0 && progress.bytes >= progress.total;
-        let wait = if complete {
+        let limit = if complete {
             COMPLETION_GRACE
         } else {
             stall_timeout()
         };
+        let idle = last_data.elapsed();
+        if idle >= limit {
+            return Ok(StreamEnd::Interrupted(if complete {
+                format!(
+                    "server did not close after {} bytes ({}s grace)",
+                    progress.bytes,
+                    limit.as_secs()
+                )
+            } else {
+                format!(
+                    "no data for {}s after {} bytes",
+                    idle.as_secs(),
+                    progress.bytes
+                )
+            }));
+        }
+        let wait = limit - idle;
         // Wait for data, but never longer than the poll interval: the tick
         // sends us back round the loop to re-read stop orders instead of
         // sitting in a read until the stall timeout fires.
         let next = tokio::select! {
             biased;
             chunk = stream.next() => Some(chunk),
-            () = tokio::time::sleep(STOP_POLL.min(wait)) => None,
+            () = tokio::time::sleep(wait.min(STOP_POLL)) => None,
         };
         let chunk = match next {
             // A poll tick: nothing to write, but this is the moment a quiet
             // connection must honour a stop order, so force the next read
-            // instead of waiting for a chunk that may never arrive.
+            // instead of waiting for a chunk that may never arrive. It is
+            // also the only chance to show progress for a body that arrives
+            // slower than FLUSH_EVERY: flushing only after a chunk left the
+            // bar at 0 B for minutes on a slow chunked stream.
             None => {
                 order_due = true;
+                if progress.last_flush.elapsed() >= FLUSH_EVERY {
+                    if let Some(end) = flush_progress(id, progress).await? {
+                        return Ok(end);
+                    }
+                }
                 continue;
             }
             Some(Some(Ok(c))) => c,
             Some(Some(Err(e))) => {
                 // Worth one reconnect like a stall: servers that cut a
                 // connection mid-body usually answer a ranged retry cleanly.
-                progress.last_error = format!("{e:#}");
-                return Ok(StreamEnd::Stalled);
+                return Ok(StreamEnd::Interrupted(format!("{e:#}")));
             }
-            Some(None) => return Ok(StreamEnd::Finished),
+            Some(None) => {
+                // Clean EOF. With a promised length this is only success
+                // when every promised byte arrived; a short body is a
+                // truncated transfer, not a finished file.
+                if progress.total > 0 && progress.bytes < progress.total {
+                    return Ok(StreamEnd::Interrupted(format!(
+                        "body ended at {} of {} bytes",
+                        progress.bytes, progress.total
+                    )));
+                }
+                return Ok(StreamEnd::Finished);
+            }
         };
         file.write_all(&chunk)
             .await
             .with_context(|| format!("write {}", part.display()))?;
         progress.bytes += chunk.len() as u64;
-        let pct = progress.percent();
-        if progress.last_flush.elapsed() >= Duration::from_millis(250) || pct != progress.last_pct {
-            progress.last_flush = Instant::now();
-            progress.last_pct = pct;
-            // Merge-only flush that also reads stop orders: another process
-            // may have paused, cancelled, or removed this entry (panel, CLI).
-            // A missing record counts as cancelled.
-            let mut directive = Directive::Keep;
-            update_state(|state| {
-                directive = match state.downloads.iter_mut().find(|d| d.id == id) {
-                    Some(d) if d.status == Status::Downloading => {
-                        d.bytes = progress.bytes;
-                        d.total = progress.total;
-                        Directive::Keep
-                    }
-                    Some(d) if d.status == Status::Paused => Directive::StandDown,
-                    _ => Directive::Abort,
-                };
-                Ok(())
-            })
-            .unwrap_or(());
-            match directive {
-                Directive::Keep => {
-                    if progress.total > 0 {
-                        eprintln!(
-                            "catch: {} {}% ({}/{})",
-                            id, pct, progress.bytes, progress.total
-                        );
-                    } else {
-                        eprintln!("catch: {} {} bytes", id, progress.bytes);
-                    }
-                }
-                Directive::StandDown => return Ok(StreamEnd::StoodDown),
-                Directive::Abort => return Ok(StreamEnd::Aborted),
+        if !chunk.is_empty() {
+            last_data = Instant::now();
+        }
+        // Time-based throttle only. A percentage gate meant a 10 GiB file
+        // updated once per 100 MiB, and a chunked response with no
+        // Content-Length never updated at all (its percent is constant).
+        if progress.last_flush.elapsed() >= FLUSH_EVERY {
+            if let Some(end) = flush_progress(id, progress).await? {
+                return Ok(end);
             }
         }
     }
 }
 
+/// Move a finished part file into place and record it, once, for every kind
+/// of transfer (plain, resumed, completed-by-416).
+///
+/// Every successful completion goes through here so the rules cannot drift:
+/// the bytes are validated against the promised total, an existing file is
+/// only replaced by an explicit `overwrite`, the row and the saved-file
+/// index are updated in one locked write, and a cancelled row is never
+/// reported as done.
+struct Finish<'a> {
+    id: &'a str,
+    url: &'a str,
+    dir: &'a std::path::Path,
+    dest_name: &'a str,
+    part: &'a std::path::Path,
+    bytes: u64,
+    total: Option<u64>,
+    overwrite: bool,
+    base: &'a std::path::Path,
+}
+
+async fn finish(f: Finish<'_>) -> Result<PathBuf> {
+    let Finish {
+        id,
+        url,
+        dir,
+        dest_name,
+        part,
+        bytes,
+        total,
+        overwrite,
+        base,
+    } = f;
+    let held = std::fs::metadata(part)
+        .map(|m| m.len())
+        .with_context(|| format!("stat {}", part.display()))?;
+    let total = total.map(|t| t.max(held)).unwrap_or(held);
+    if total > 0 && held < total {
+        // Never report success for a file that is short of its announced
+        // size: the bytes that are there stay in the part file for a resume.
+        let msg = format!("incomplete: {held} of {total} bytes");
+        let _ = mark_error(id, &msg);
+        anyhow::bail!("{msg}");
+    }
+    if held != bytes {
+        eprintln!("catch: {id} note: {bytes} streamed, {held} on disk");
+    }
+    let dest = dir.join(dest_name);
+    let dest = if dest.exists() && !overwrite {
+        unique_destination(dir, dest_name)
+    } else {
+        dest
+    };
+    tokio::fs::rename(part, &dest)
+        .await
+        .with_context(|| format!("move to {}", dest.display()))?;
+    let final_name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dest_name.to_string());
+    let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(held);
+    update_state(|state| {
+        // A stop order may have landed with the final chunk: only take the
+        // win if nobody cancelled or removed us mid-flight.
+        if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
+            if d.status == Status::Downloading {
+                d.status = Status::Done;
+                d.bytes = size;
+                d.total = size.max(total);
+                d.filename = final_name.clone();
+                d.error.clear();
+                d.pid = 0;
+                d.claimed_at = 0;
+            }
+        }
+        // The file is on disk whatever happened to the row above, so record
+        // it: a link caught again must still be recognised as a duplicate
+        // after the queue is cleared. This runs in the *same* locked write as
+        // the status change, and for every completion path — a transfer
+        // finished from an existing part file used to be omitted from the
+        // index entirely, so the next send of that link downloaded a
+        // silent second copy.
+        crate::state::record_saved(state, url, base, &dest, crate::state::DownloadKind::File);
+        Ok(())
+    })?;
+    eprintln!("catch: done {} -> {}", id, dest.display());
+    crate::state::spawn_drain();
+    Ok(dest)
+}
+
 #[cfg(test)]
-mod stop_order_tests {
+mod range_tests {
     use super::*;
 
-    /// The stall timeout is what made "stop" look broken: with stop orders
-    /// only read when a chunk arrived, a quiet connection kept downloading
-    /// for up to a minute (and across reconnects) after the row was gone.
+    #[test]
+    fn content_range_parses_well_formed_headers() {
+        assert_eq!(
+            parse_content_range("bytes 200-1000/67589"),
+            Some((200, 1000, Some(67589)))
+        );
+        assert_eq!(parse_content_range("bytes 0-0/1"), Some((0, 0, Some(1))));
+        assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, 9, None)));
+        assert_eq!(
+            parse_content_range("  bytes   10-19 / 100 "),
+            Some((10, 19, Some(100)))
+        );
+    }
+
+    #[test]
+    fn content_range_rejects_malformed_headers() {
+        // Anything unparsable must make the caller restart from zero rather
+        // than trust an offset it cannot verify.
+        for bad in [
+            "",
+            "bytes",
+            "bytes */100",
+            "bytes 100/200",
+            "bytes 100-",
+            "bytes -100/200",
+            "bytes x-y/200",
+            "items 1-2/3",
+            "bytes 20-10/200",
+            "bytes 0-199/100",
+            "bytes 5-10/10",
+        ] {
+            assert_eq!(parse_content_range(bad), None, "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn backoff_grows_and_is_bounded() {
+        let first = backoff(1);
+        assert!(first >= Duration::from_millis(50), "{first:?}");
+        assert!(first <= Duration::from_secs(1), "{first:?}");
+        for attempt in 1..=8 {
+            assert!(backoff(attempt) <= BACKOFF_MAX, "attempt {attempt}");
+        }
+    }
+
+    #[test]
+    fn permanent_statuses_do_not_retry() {
+        let empty = reqwest::header::HeaderMap::new();
+        for code in [400, 401, 403, 404, 410, 451] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert!(
+                matches!(status_verdict(status, &empty, 1), Verdict::Fatal(_)),
+                "{code} must not be retried"
+            );
+        }
+        for code in [408, 429, 500, 502, 503, 504] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert!(
+                matches!(status_verdict(status, &empty, 1), Verdict::Retry(_)),
+                "{code} must be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_is_honoured_and_clamped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        match status_verdict(reqwest::StatusCode::TOO_MANY_REQUESTS, &headers, 1) {
+            Verdict::Retry(wait) => assert_eq!(wait, Duration::from_secs(7)),
+            Verdict::Fatal(why) => panic!("429 must retry: {why}"),
+        }
+        headers.insert(reqwest::header::RETRY_AFTER, "99999".parse().unwrap());
+        match status_verdict(reqwest::StatusCode::SERVICE_UNAVAILABLE, &headers, 1) {
+            Verdict::Retry(wait) => assert_eq!(wait, RETRY_AFTER_MAX),
+            Verdict::Fatal(why) => panic!("503 must retry: {why}"),
+        }
+    }
+
+    /// The stall deadline is what made "stop" look broken *and* what made a
+    /// dead connection hang a worker for ever: the same `select!` that
+    /// re-read stop orders has to leave the idle deadline standing.
     #[test]
     fn poll_is_far_shorter_than_the_stall_timeout() {
         assert!(
@@ -563,6 +1155,7 @@ mod stop_order_tests {
             STOP_POLL >= Duration::from_millis(50),
             "but not spin the state file"
         );
+        assert!(COMPLETION_GRACE < stall_timeout());
     }
 
     /// Every status the panel can leave behind has to resolve to an order

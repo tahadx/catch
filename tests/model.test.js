@@ -10,7 +10,7 @@ const path = require("node:path")
 const src = fs
   .readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library\s*$/m, "")
-const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, statusLabel, kindLabel, rowMeta, itemWord, shortPath, expandHome }")()
+const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, statusLabel, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath }")()
 
 assert.strictEqual(Model.expandHome("~", "/home/you"), "/home/you")
 assert.strictEqual(Model.expandHome("~/Downloads/catch", "/home/you"), "/home/you/Downloads/catch")
@@ -33,6 +33,24 @@ assert.strictEqual(asked.asks.length, 1, "only a real, in-folder path is a quest
 assert.strictEqual(asked.asks[0].filename, "app.apk")
 assert.strictEqual(asked.asks[0].path, "programs/app.apk")
 assert.strictEqual(Model.empty().asks.length, 0)
+
+// Path checks are component-wise. A ".." *inside* a name is not traversal.
+for (const ok of ["programs/app.apk", "a..b/c.zip", "Notes..final.pdf", "dir/.hidden", "dir/..name"]) {
+  assert.strictEqual(Model.safeRelativePath(ok), true, "accepted " + ok)
+}
+for (const bad of ["", "/etc/passwd", "../outside.zip", "a/../../b", "a/..", "..", "a\\b.zip"]) {
+  assert.strictEqual(Model.safeRelativePath(bad), false, "rejected " + bad)
+}
+const traversal = Model.parse(JSON.stringify({
+  version: 1,
+  downloads: [],
+  asks: [
+    { url: "https://x.test/ok", path: "a..b/c.zip" },
+    { url: "https://x.test/up", path: "a/../../b" },
+  ],
+}))
+assert.strictEqual(traversal.asks.length, 1, "only the real path survives")
+assert.strictEqual(traversal.asks[0].path, "a..b/c.zip")
 
 function state(download) {
   return Model.parse(JSON.stringify({ version: 1, downloads: [download] }))
@@ -216,5 +234,23 @@ assert.strictEqual(Model.shortPath("/other/place", "/home/you"), "/other/place")
 assert.strictEqual(Model.shortPath("/home/youish/x", "/home/you"), "/home/youish/x", "a prefix that is not a path segment")
 assert.strictEqual(Model.shortPath("/home/you", "/home/you"), "/home/you")
 assert.strictEqual(Model.shortPath("", "/home/you"), "")
+
+// The drainer is woken by scheduling changes only, never by progress writes.
+const two = (status, bytes) => Model.parse(JSON.stringify({
+  version: 1,
+  downloads: [
+    { id: "a", url: "u", filename: "a", status: "downloading", bytes: bytes, total: 100, error: "" },
+    { id: "b", url: "v", filename: "b", status: status, bytes: 0, total: 0, error: "" },
+  ],
+}))
+const base = Model.scheduleSignature(two("queued", 1))
+assert.strictEqual(base, Model.scheduleSignature(two("queued", 99)), "progress is not a scheduling event")
+assert.strictEqual(Model.scheduleSignature(Model.parse(JSON.stringify({
+  version: 1,
+  downloads: [{ id: "a", url: "u", filename: "a", status: "downloading", bytes: 3, total: 100, error: "" }],
+}))), "a:downloading", "a finished row frees its slot")
+assert.notStrictEqual(base, Model.scheduleSignature(two("done", 1)), "a completion is a scheduling event")
+assert.strictEqual(Model.scheduleSignature(Model.empty()), "")
+assert.strictEqual(Model.scheduleSignature(null), "")
 
 console.log("model.test.js: ok")

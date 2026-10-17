@@ -61,6 +61,20 @@ function parse(text) {
   return { version: 1, downloads: out, saved: saved, asks: parseAsks(data) }
 }
 
+// A path recorded relative to the download folder. Checked component by
+// component: rejecting any ".." substring also rejected legitimate names
+// like "Notes..final.pdf" and "a..b/c.zip".
+function safeRelativePath(path) {
+  var p = String(path || "")
+  if (p === "") return false
+  if (p.charAt(0) === "/" || p.indexOf("\\") >= 0) return false
+  var parts = p.split("/")
+  for (var i = 0; i < parts.length; i++) {
+    if (parts[i] === "..") return false
+  }
+  return true
+}
+
 // Questions waiting on the panel: a link whose file is already in the
 // download folder, or one whose transfer is still running. Entries without
 // a url, or without a path and without being live, cannot be acted on.
@@ -78,8 +92,7 @@ function parseAsks(data) {
     // is not held to the path rules. Only a saved question is.
     var live = a.live === true || a.live === "true"
     if (!live) {
-      if (path === "") continue
-      if (path.indexOf("..") >= 0 || path.charAt(0) === "/" || path.indexOf("\\") >= 0) continue
+      if (!safeRelativePath(path)) continue
     }
     out.push({
       url: url,
@@ -270,6 +283,24 @@ function clipboardLink(text) {
   if (!found) return ""
   // Trailing punctuation picked up from prose, not part of the link.
   return found[0].replace(/[.,;:!?]+$/, "")
+}
+
+// Changes only when the *scheduling* shape of the queue changes: which rows
+// are queued or transferring, and in what state. Progress writes (bytes,
+// totals, titles, errors) leave this string alone, so the service does not
+// spawn a drainer for every flushed chunk.
+function scheduleSignature(state) {
+  var list = (state && state.downloads) || []
+  var parts = []
+  for (var i = 0; i < list.length; i++) {
+    var d = list[i]
+    if (!d) continue
+    var status = String(d.status || "")
+    if (status === "queued" || status === "downloading") {
+      parts.push(String(d.id || "") + ":" + status)
+    }
+  }
+  return parts.join("|")
 }
 
 function statusText(state) {

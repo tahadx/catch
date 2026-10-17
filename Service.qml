@@ -1,10 +1,14 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import "Model.js" as Model
 
 // Catch background service: watches the state file and wakes the queue
-// drainer (bounded by the maxParallel setting) whenever anything changes.
-// The queue itself is owned by the `catch` CLI; this item never writes it.
+// drainer (bounded by the maxParallel setting) when the *queue shape*
+// changes. Progress writes every few hundred milliseconds update bytes, but
+// they must not spawn a drainer each: that turned the background service
+// into a constant fork storm. The queue itself is owned by the `catch` CLI;
+// this item never writes it.
 Item {
   id: root
   visible: false
@@ -20,6 +24,13 @@ Item {
   // backend this panel drives.
   property string stateText: ""
 
+  // Last scheduling shape seen (queued/downloading rows). Only a change here
+  // needs a drainer; a byte counter moving does not.
+  property string lastSchedule: ""
+  // An event landed while a drainer was already running. Re-check once when
+  // it exits instead of losing the wake-up.
+  property bool drainPending: false
+
   // First-run bootstrap: the plugin id is stable, so the installed path is
   // deterministic. Links backend binaries and writes browser hosts, then
   // the watcher below drains. (Forks: update the id in this path.)
@@ -28,10 +39,31 @@ Item {
     configureProcess.running = true
   }
 
+  // Evaluate at most every 300 ms: a burst of state writes is coalesced,
+  // without the restarted-timer starvation that frequent progress flushes
+  // would cause.
+  function evaluate() {
+    var next = Model.scheduleSignature(Model.parse(root.stateText))
+    if (next === root.lastSchedule) return
+    root.lastSchedule = next
+    root.maybeDrain()
+  }
+
   function maybeDrain() {
-    if (drainProcess.running) return
+    if (drainProcess.running) {
+      root.drainPending = true
+      return
+    }
+    root.drainPending = false
     drainProcess.command = ["catch", "drain"]
     drainProcess.running = true
+  }
+
+  Timer {
+    id: evaluateTimer
+    interval: 300
+    repeat: false
+    onTriggered: root.evaluate()
   }
 
   FileView {
@@ -42,19 +74,30 @@ Item {
     onFileChanged: watcher.reload()
     onLoaded: {
       root.stateText = watcher.text()
-      root.maybeDrain()
+      if (!evaluateTimer.running) evaluateTimer.start()
     }
-    onLoadFailed: root.stateText = ""
+    onLoadFailed: {
+      root.stateText = ""
+      root.lastSchedule = ""
+    }
   }
 
   Process {
     id: configureProcess
     running: false
-    onExited: root.maybeDrain()
+    onExited: {
+      // Configuration may have (re)installed the binaries; take one look at
+      // the current queue. A state change after this arrives through
+      // FileView as usual.
+      root.evaluate()
+    }
   }
 
   Process {
     id: drainProcess
     running: false
+    onExited: {
+      if (root.drainPending) root.maybeDrain()
+    }
   }
 }

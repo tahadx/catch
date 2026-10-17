@@ -71,16 +71,39 @@ function ask(msg, cb) {
   const p = port();
   if (!p) {
     if (cb) cb(null);
-    return;
+    return false;
   }
   const req = nextReq++;
   if (cb) waiting.set(req, cb);
   try {
     p.postMessage(Object.assign({ req }, msg));
+    return true;
   } catch (e) {
     waiting.delete(req);
     if (cb) cb(null);
+    return false;
   }
+}
+
+// A page batch is handed over in one native message (chunked to stay well
+// under Chrome's 1 MiB host limit), not one process-round-trip per link.
+// The host accepts all of a chunk under a single state lock and wakes one
+// drainer, so a thousand-link page is cheap.
+const BATCH_LIMIT = 200;
+
+function markUnreachable() {
+  try {
+    chrome.action.setBadgeText({ text: "!" });
+    chrome.action.setBadgeBackgroundColor({ color: "#c0392b" });
+    chrome.action.setTitle({ title: "Catch is not reachable — links were not queued" });
+  } catch (e) {}
+}
+
+function clearUnreachable() {
+  try {
+    chrome.action.setBadgeText({ text: "" });
+    chrome.action.setTitle({ title: "Catch this download" });
+  } catch (e) {}
 }
 
 function send(msg) {
@@ -113,12 +136,24 @@ function copyUrl(url) {
 
 function sendAll(urls) {
   const seen = new Set();
+  let batch = [];
+  const flush = () => {
+    if (batch.length === 0) return;
+    const chunk = batch;
+    batch = [];
+    ask({ urls: chunk }, (reply) => {
+      if (!reply || !reply.ok) markUnreachable();
+      else clearUnreachable();
+    });
+  };
   for (const u of urls || []) {
     const clean = httpUrl(u);
     if (!clean || seen.has(clean)) continue;
     seen.add(clean);
-    sendUrl(clean);
+    batch.push(clean);
+    if (batch.length >= BATCH_LIMIT) flush();
   }
+  flush();
 }
 
 // Page scrapers run in the page, so srcset/currentSrc resolve to real URLs.
@@ -247,13 +282,29 @@ function intercept(item) {
 chrome.downloads.onCreated.addListener(intercept);
 
 // URLs the user explicitly asked the browser to take (bypass interception).
+// Bounded: without a cap every "Download with browser" click that never
+// reached intercept (different URL, browser restart, canceled download)
+// leaked a map entry for the life of the service worker.
 const browserBypass = new Map();
+const BYPASS_TTL = 30000;
+const BYPASS_MAX = 64;
 
 function bypassed(url) {
   const t = browserBypass.get(url);
   if (t === undefined) return false;
   browserBypass.delete(url);
-  return Date.now() - t < 30000;
+  return Date.now() - t < BYPASS_TTL;
+}
+
+function rememberBypass(url) {
+  const now = Date.now();
+  for (const [u, t] of browserBypass) {
+    if (now - t > BYPASS_TTL) browserBypass.delete(u);
+  }
+  browserBypass.set(url, now);
+  while (browserBypass.size > BYPASS_MAX) {
+    browserBypass.delete(browserBypass.keys().next().value);
+  }
 }
 
 // Worker restarts lose menus; onInstalled alone misses reloads.
@@ -315,7 +366,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     case "browser-download": {
       const burl = httpUrl(info.linkUrl);
       if (burl) {
-        browserBypass.set(burl, Date.now());
+        rememberBypass(burl);
         chrome.downloads.download({ url: burl }, () => {
           void chrome.runtime.lastError;
         });

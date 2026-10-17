@@ -3,12 +3,16 @@
 #   git config core.hooksPath .githooks
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
-echo "pre-push: fmt, clippy, tests, model js, manifest"
+echo "pre-push: fmt, clippy, tests, model js, installer, release, dist"
 cargo fmt --check -p catch
 cargo clippy -p catch --all-targets -- -D warnings
 cargo test -p catch --quiet
 node tests/model.test.js
-omarchy plugin validate .
+bash tests/install.test.sh
+bin/check-release
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy plugin validate .
+fi
 echo "pre-push: dist freshness"
 # The shell service runs `catch drain` on every state change; a stale dist
 # rewrites state in an old schema. Rebuilding here proves bin/dist matches

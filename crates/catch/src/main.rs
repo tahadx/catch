@@ -146,9 +146,11 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse first: `--version` and `--help` must not touch the user's home,
+    // and bin/configure itself asks the shipped binary for its version.
+    let cli = Cli::parse();
     // Checkout installs self-heal here: backend links + browser hosts.
     state::self_configure();
-    let cli = Cli::parse();
     match cli.command {
         Command::Add {
             url,
@@ -551,6 +553,8 @@ fn enqueue_kind(
             audio_only,
             title: String::new(),
             extra: serde_json::Map::new(),
+            etag: String::new(),
+            last_modified: String::new(),
         });
         Ok(())
     })
@@ -766,7 +770,7 @@ pub(crate) fn raise_ask(url: &str, title: &str) -> Result<Option<String>> {
             state::push_ask(s, ask);
             Ok(())
         })?;
-        notify_saved(&label, true);
+        notify_url_saved(&label, true);
         return Ok(Some(String::new()));
     }
     let Some(mut ask) = state::locate_saved(&state, &base, url) else {
@@ -785,7 +789,7 @@ pub(crate) fn raise_ask(url: &str, title: &str) -> Result<Option<String>> {
         state::push_ask(s, ask);
         Ok(())
     })?;
-    notify_saved(&label, false);
+    notify_url_saved(&label, false);
     Ok(Some(path))
 }
 
@@ -801,7 +805,7 @@ fn clear_one_ask(url: &str) -> Result<()> {
 /// A live transfer gets its own wording: nothing is on disk yet, and the
 /// panel may be closed when the question is raised, so this line is often the
 /// only sign that the question exists.
-fn notify_saved(label: &str, live: bool) {
+pub(crate) fn notify_url_saved(label: &str, live: bool) {
     let text = if live {
         format!("Already downloading — {label}")
     } else {
@@ -960,6 +964,8 @@ mod cli_tests {
             claimed_at: crate::state::now_secs(),
             sched_hold: false,
             audio_only: false,
+            etag: String::new(),
+            last_modified: String::new(),
             title: String::new(),
             extra: serde_json::Map::new(),
         };

@@ -6,6 +6,10 @@
 # loading them stays a one-time manual step. See README.)
 set -euo pipefail
 
+# We are the self-configure step. Children must not ask to self-configure
+# again: the links and host manifests do not exist until this script finishes.
+export CATCH_NO_SELF_CONFIGURE=1
+
 PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$PLUGIN_DIR/bin/dist"
 BIN_DIR="$HOME/.local/bin"
@@ -20,15 +24,31 @@ if (( need_setup == 0 )); then
   exit 0
 fi
 
-mkdir -p "$BIN_DIR"
-if [[ -x "$DIST/catch" && -x "$DIST/catch-host" ]]; then
-  ln -sf "$DIST/catch" "$BIN_DIR/catch"
-  ln -sf "$DIST/catch-host" "$BIN_DIR/catch-host"
+if [[ ! -x "$DIST/catch" || ! -x "$DIST/catch-host" ]]; then
+  echo "catch: backend missing or not executable in $DIST" >&2
+  echo "catch: run bin/refresh-dist (or reinstall the plugin)" >&2
+  exit 1
 fi
 
-if [[ -x "$BIN_DIR/catch" ]]; then
-  "$BIN_DIR/catch" install-hosts >/dev/null
-  "$BIN_DIR/catch" install-extension >/dev/null || true
+# Executing the shipped binary catches a package built for another CPU
+# (exec format error) before it is linked into the user's PATH.
+DIST_VERSION="$("$DIST/catch" --version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+MANIFEST_VERSION="$(sed -n 's/^[[:space:]]*"version": "\([^"]*\)".*/\1/p' "$PLUGIN_DIR/manifest.json" | head -n 1)"
+if [[ -z "$DIST_VERSION" ]]; then
+  echo "catch: cannot execute $DIST/catch on this machine" >&2
+  exit 1
 fi
+if [[ -n "$MANIFEST_VERSION" && "$DIST_VERSION" != "$MANIFEST_VERSION" ]]; then
+  echo "catch: shipped backend is $DIST_VERSION but the plugin is $MANIFEST_VERSION" >&2
+  echo "catch: reinstall the plugin or run bin/refresh-dist" >&2
+  exit 1
+fi
+
+mkdir -p -- "$BIN_DIR"
+ln -sfn -- "$DIST/catch" "$BIN_DIR/catch"
+ln -sfn -- "$DIST/catch-host" "$BIN_DIR/catch-host"
+
+"$BIN_DIR/catch" install-hosts >/dev/null
+"$BIN_DIR/catch" install-extension >/dev/null || true
 
 echo "catch: configured backend + browser hosts"

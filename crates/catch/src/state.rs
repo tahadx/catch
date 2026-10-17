@@ -60,10 +60,11 @@ pub struct Download {
     /// OS pid of the worker holding this entry (0 = none).
     #[serde(default)]
     pub pid: u32,
-    /// Unix seconds when this row was last claimed by a drainer or stamped
-    /// by its worker. Reaping respects a grace window around it so a
-    /// reservation whose worker has not started yet is not mistaken for an
-    /// orphan.
+    /// Unix seconds of the drainer's reservation. Reaping respects a grace
+    /// window around a *non-zero* value so a reservation whose worker has not
+    /// started yet is not mistaken for an orphan. A worker clears it once it
+    /// has stamped its own pid: from then on the transfer lock is the proof
+    /// of ownership and a dead worker can be requeued immediately.
     #[serde(default)]
     pub claimed_at: u64,
     /// Parked by the scheduler (not by the user): the scheduler may resume it.
@@ -75,6 +76,14 @@ pub struct Download {
     /// Display title (video title when known); filename stays on disk name.
     #[serde(default)]
     pub title: String,
+    /// HTTP validators seen for this representation. Sent back as `If-Range`
+    /// on a resume: a server whose file changed answers 200 (or a different
+    /// ETag) instead of a 206, which restarts the transfer from zero instead
+    /// of splicing two different files together.
+    #[serde(default)]
+    pub etag: String,
+    #[serde(default)]
+    pub last_modified: String,
     /// Fields written by other versions (older or newer) pass through
     /// untouched: a stale backend rewriting state must never strip a fresh
     /// writer's data — this exact clobber erased `title` on every drain.
@@ -320,10 +329,29 @@ pub fn load_state() -> Result<State> {
     if text.trim().is_empty() {
         return Ok(State::default());
     }
-    let mut state: State =
-        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    state.version = STATE_VERSION;
-    Ok(state)
+    match serde_json::from_str::<State>(&text) {
+        Ok(mut state) => {
+            state.version = STATE_VERSION;
+            Ok(state)
+        }
+        Err(e) => {
+            // A truncated or edited state file used to brick every command
+            // that touches the queue. Move the unreadable file aside (it is
+            // the user's only record of the queue, so keep it) and start
+            // clean: Catch heals itself and says so.
+            let quarantine = state_dir().join(format!("state.json.bad-{}", now_secs()));
+            let moved = std::fs::rename(&path, &quarantine).is_ok();
+            eprintln!(
+                "catch: state file unreadable ({e}); {}",
+                if moved {
+                    format!("kept it at {}", quarantine.display())
+                } else {
+                    "could not move it aside; starting from an empty queue".to_string()
+                }
+            );
+            Ok(State::default())
+        }
+    }
 }
 
 /// Atomic write beside the target, then rename. Never modifies user files.
@@ -339,11 +367,71 @@ pub fn save_state(state: &State) -> Result<()> {
 }
 
 pub fn new_id() -> String {
+    // Millisecond + pid keeps ids readable and roughly sortable; the counter
+    // makes them unique inside one process. A batch enqueue (a page with
+    // hundreds of links, a clipboard paste) adds many rows in the same
+    // millisecond, and two rows sharing an id share a part file: one worker's
+    // bytes landed in the other's transfer.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("{}-{}", millis, std::process::id() % 100000)
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = format!("{}-{}", millis, std::process::id() % 100000);
+    if seq == 0 {
+        // First id in this process keeps the historical shape.
+        base
+    } else {
+        format!("{base}-{seq}")
+    }
+}
+
+/// Cap a string at `max` bytes **without splitting a UTF-8 character**.
+/// `String::truncate` panics on a non-boundary offset, which is how a long
+/// CJK or emoji filename took the whole backend down mid-enqueue.
+pub fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// A filename that is safe to join onto the download directory, from an
+/// untrusted source (URL tail, Content-Disposition, browser hint).
+///
+/// Only the final path segment survives, control characters and NUL are
+/// dropped, leading dots are stripped (no `..`, no hidden files), and the
+/// result is capped at 128 bytes on a character boundary with the extension
+/// kept when there is room for it. Empty means "use the caller's fallback".
+pub fn sanitize_filename(raw: &str) -> String {
+    let flat = raw.replace('\\', "/");
+    let tail = flat.rsplit('/').next().unwrap_or("");
+    let cleaned: String = tail
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\0')
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.').trim();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return String::new();
+    }
+    // Keep the extension: dropping it would file the download in the wrong
+    // category folder and change how it opens.
+    if cleaned.len() > 128 {
+        let (stem, ext) = match cleaned.rfind('.') {
+            Some(i) if i > 0 && cleaned.len() - i <= 12 => (&cleaned[..i], &cleaned[i..]),
+            _ => (cleaned, ""),
+        };
+        let stem = truncate_bytes(stem, 128usize.saturating_sub(ext.len()));
+        let stem = stem.trim_end_matches(['.', ' ']);
+        let stem = if stem.is_empty() { "download" } else { stem };
+        return format!("{stem}{ext}");
+    }
+    cleaned.to_string()
 }
 
 /// Derive a safe filename from a URL. Falls back to `download-<id>`.
@@ -358,26 +446,12 @@ pub fn filename_for_url(url: &str, id: &str) -> String {
         .trim();
     // Percent-decode minimally: '+' and %XX for the common cases.
     let decoded = percent_decode(tail);
-    let mut name: String = decoded
-        .chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | '\0') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect::<String>()
-        .trim()
-        .trim_matches('.')
-        .to_string();
-    if name.is_empty() || name == "." || name == ".." {
-        name = format!("download-{}", id);
+    let name = sanitize_filename(&decoded);
+    if name.is_empty() {
+        format!("download-{}", id)
+    } else {
+        name
     }
-    if name.len() > 128 {
-        name.truncate(128);
-    }
-    name
 }
 
 fn percent_decode(s: &str) -> String {
@@ -621,16 +695,16 @@ pub fn resolve_inside(dir: &Path, candidate: &str) -> Option<PathBuf> {
 }
 
 /// Keep only what a person would read; drop control chars and leading dashes.
+/// Capped at 128 bytes on a character boundary (byte truncation used to panic
+/// on the first CJK title over the limit).
 pub fn clean_label(s: &str, fallback: &str) -> String {
     let mut out: String = s.chars().filter(|c| !c.is_control()).collect();
     out = out.trim().trim_matches('.').to_string();
-    if out.is_empty() || out.starts_with('-') || out.len() > 128 {
-        if out.len() > 128 {
-            out.truncate(128);
-        }
-        if out.is_empty() || out.starts_with('-') {
-            return fallback.to_string();
-        }
+    if out.len() > 128 {
+        out = truncate_bytes(&out, 128).to_string();
+    }
+    if out.is_empty() || out.starts_with('-') {
+        return fallback.to_string();
     }
     out
 }
@@ -672,6 +746,10 @@ pub fn mark_error(id: &str, msg: &str) -> Result<()> {
         if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
             d.status = Status::Error;
             d.error = msg.to_string();
+            // The worker is gone once it reports an error; leaving its pid
+            // behind made a dead transfer look live to the panel.
+            d.pid = 0;
+            d.claimed_at = 0;
         }
         Ok(())
     })
@@ -680,40 +758,103 @@ pub fn mark_error(id: &str, msg: &str) -> Result<()> {
 /// Run `f` under the state lock so concurrent processes (browser
 /// handoffs, workers, panel actions) never interleave load-modify-save
 /// cycles and lose entries. Stale locks (holder dead >2 min) are reclaimed.
+///
+/// The lock is released by a guard, not by the happy path: a panic inside
+/// `f` (a bad filename used to panic here) unwound straight past the
+/// remove, and every later command failed with "state is locked" for the
+/// full two minutes of staleness.
 pub fn with_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     let dir = state_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let lock = dir.join("state.lock");
-    take_state_lock(&lock)?;
-    let result = f();
-    let _ = std::fs::remove_dir(&lock);
-    result
+    let _held = take_state_lock(&lock)?;
+    f()
 }
 
-fn take_state_lock(lock: &std::path::Path) -> Result<()> {
-    match std::fs::create_dir(lock) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            let stale = std::fs::metadata(lock)
-                .and_then(|m| m.modified())
-                .map(|t| t.elapsed().map(|e| e.as_secs() > 120).unwrap_or(false))
-                .unwrap_or(false);
-            if stale {
-                let _ = std::fs::remove_dir(lock);
-                std::fs::create_dir(lock).with_context(|| "take state lock")?;
-                Ok(())
-            } else {
-                // Brief contention: wait for the holder instead of failing.
-                for _ in 0..100 {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    if std::fs::create_dir(lock).is_ok() {
-                        return Ok(());
-                    }
-                }
-                anyhow::bail!("state is locked by another catch process")
-            }
+/// Removes the lock directory when it goes out of scope, including on panic.
+struct LockGuard(std::path::PathBuf);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Unix pid from /proc. An empty cmdline is a zombie or kernel thread, an
+/// unreadable/missing file means the process is gone.
+fn pid_live(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    proc_argv(pid).is_some_and(|argv| !argv.is_empty())
+}
+
+/// Write the holder into a lock directory so a later process can tell a
+/// crashed holder from one that is merely slow.
+fn stamp_lock_owner(lock: &std::path::Path) {
+    let _ = std::fs::write(lock.join("owner"), format!("{}\n", std::process::id()));
+}
+
+/// A state lock is abandoned when its owner process is gone. The mtime is
+/// only a second opinion: a lock whose owner is alive is never stolen, and
+/// a lock with no owner file gets a short grace before it is treated as
+/// abandoned (it is created immediately before the pid is written).
+fn lock_abandoned(lock: &std::path::Path) -> bool {
+    let age = std::fs::metadata(lock)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .unwrap_or(Duration::ZERO);
+    if age < Duration::from_secs(2) {
+        return false;
+    }
+    let owner = std::fs::read_to_string(lock.join("owner"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    match owner {
+        Some(pid) => !pid_live(pid),
+        None => age > Duration::from_secs(30),
+    }
+}
+
+/// Reclaim a lock directory that was abandoned (a crash, a SIGKILL) instead
+/// of failing forever. `rename` makes the reclaim exclusive: two processes
+/// that both decide "stale" cannot both succeed, so one of them creates the
+/// fresh lock while the other loses the race and retries the normal way.
+fn reclaim_stale_lock(lock: &std::path::Path) -> bool {
+    let graveyard = lock.with_extension(format!("stale-{}", std::process::id()));
+    if std::fs::rename(lock, &graveyard).is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_dir_all(&graveyard);
+    std::fs::create_dir(lock).is_ok()
+}
+
+fn take_state_lock(lock: &std::path::Path) -> Result<LockGuard> {
+    if std::fs::create_dir(lock).is_ok() {
+        stamp_lock_owner(lock);
+        return Ok(LockGuard(lock.to_path_buf()));
+    }
+    if lock_abandoned(lock) && reclaim_stale_lock(lock) {
+        stamp_lock_owner(lock);
+        return Ok(LockGuard(lock.to_path_buf()));
+    }
+    // Brief contention: wait for the holder instead of failing.
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(50));
+        if std::fs::create_dir(lock).is_ok() {
+            stamp_lock_owner(lock);
+            return Ok(LockGuard(lock.to_path_buf()));
+        }
+        if lock_abandoned(lock) && reclaim_stale_lock(lock) {
+            stamp_lock_owner(lock);
+            return Ok(LockGuard(lock.to_path_buf()));
         }
     }
+    anyhow::bail!("state is locked by another catch process")
 }
 
 /// Load-modify-save under the state lock.
@@ -728,7 +869,18 @@ pub fn update_state(f: impl FnOnce(&mut State) -> Result<()>) -> Result<()> {
 /// lives at <plugin>/bin/dist/catch (the shipped layout), run the
 /// plugin's bin/configure so backend links and browser hosts exist.
 /// Best-effort and idempotent; never fails the caller.
+///
+/// The four things configure does are checked here first: spawning `bash`
+/// on every invocation (including every `catch drain` the panel fires) cost
+/// two processes per wake-up just to learn that nothing had changed.
 pub fn self_configure() {
+    // bin/configure invokes this binary (version check, install-hosts) while
+    // the links/hosts it is about to create are still missing. Without this
+    // guard each of those children would spawn configure again, recursively,
+    // until the process limit happened to break the chain.
+    if std::env::var_os("CATCH_NO_SELF_CONFIGURE").is_some() {
+        return;
+    }
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.canonicalize().ok())
@@ -743,6 +895,9 @@ pub fn self_configure() {
     if !script.is_file() {
         return;
     }
+    if !needs_configure() {
+        return;
+    }
     let _ = std::process::Command::new("bash")
         .arg(&script)
         .stdin(std::process::Stdio::null())
@@ -751,60 +906,118 @@ pub fn self_configure() {
         .status();
 }
 
+/// The same "is anything missing?" test bin/configure opens with.
+fn needs_configure() -> bool {
+    let home = home_dir();
+    let bin_dir = home.join(".local/bin");
+    let executable = |p: std::path::PathBuf| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    if !executable(bin_dir.join("catch")) || !executable(bin_dir.join("catch-host")) {
+        return true;
+    }
+    let host = format!("{}.json", "io.github.tahadx.catch");
+    !home
+        .join(".config/chromium/NativeMessagingHosts")
+        .join(&host)
+        .is_file()
+        || !home
+            .join(".mozilla/native-messaging-hosts")
+            .join(&host)
+            .is_file()
+}
+
+/// The drain marker names its holder, so a drainer killed between create and
+/// release can be replaced at once instead of blocking the queue for the old
+/// two-minute mtime window. A marker created but not yet stamped gets the same
+/// short grace as the state lock, because another process may be between
+/// `create_new` and the pid write.
+fn drain_marker_abandoned(marker: &std::path::Path) -> bool {
+    let age = std::fs::metadata(marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .unwrap_or(Duration::ZERO);
+    let owner = std::fs::read_to_string(marker)
+        .ok()
+        .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u32>().ok()));
+    match owner {
+        // A stamped, dead pid is conclusive at any age: the holder either
+        // finished (and its Drop failed) or was killed. The grace only
+        // protects the instant between create_new and the pid write.
+        Some(pid) => !pid_live(pid),
+        None => age > Duration::from_secs(30),
+    }
+}
+
+/// Take an abandoned marker out of the way. `rename` makes the reclaim
+/// exclusive, so two drainers that both see the same dead pid cannot both
+/// create a marker: the loser retries and sees the winner's live marker.
+fn reclaim_drain_marker(marker: &std::path::Path) -> bool {
+    let graveyard = marker.with_extension(format!("stale-{}", std::process::id()));
+    if std::fs::rename(marker, &graveyard).is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&graveyard);
+    true
+}
+
 /// True when this process may act as the single drainer, taking the marker.
-/// False when one is already running (or one died holding it and the marker
-/// has not gone stale yet).
+/// False when one is already running. A marker whose holder died is reclaimed
+/// immediately; the mtime is only a second opinion for an unstamped marker.
 pub fn claim_drain_slot() -> bool {
     let dir = state_dir();
     let _ = std::fs::create_dir_all(&dir);
     let marker = dir.join("drain.lock");
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)
-    {
-        Ok(_) => {
-            let _ = std::fs::write(&marker, format!("{}\n{}\n", std::process::id(), now_secs()));
-            true
-        }
-        Err(_) => {
-            let stale = std::fs::metadata(&marker)
-                .and_then(|m| m.modified())
-                .map(|t| t.elapsed().map(|e| e.as_secs() > 120).unwrap_or(false))
-                .unwrap_or(false);
-            if !stale {
-                return false;
-            }
-            let _ = std::fs::remove_file(&marker);
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&marker)
-                .is_ok()
-        }
+    let take = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .is_ok()
+    };
+    if take() {
+        let _ = std::fs::write(&marker, format!("{}\n{}\n", std::process::id(), now_secs()));
+        return true;
     }
+    if !drain_marker_abandoned(&marker) || !reclaim_drain_marker(&marker) {
+        return false;
+    }
+    if take() {
+        let _ = std::fs::write(&marker, format!("{}\n{}\n", std::process::id(), now_secs()));
+        return true;
+    }
+    false
 }
 
-/// True when some drainer already holds the marker (and it is not stale).
+/// True when some live drainer already holds the marker. An abandoned one is
+/// cleared so a later spawn can take it.
 pub fn drain_marker_held() -> bool {
     let marker = state_dir().join("drain.lock");
     if !marker.exists() {
         return false;
     }
-    let stale = std::fs::metadata(&marker)
-        .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|e| e.as_secs() > 120).unwrap_or(false))
-        .unwrap_or(false);
-    if stale {
-        let _ = std::fs::remove_file(&marker);
+    if drain_marker_abandoned(&marker) {
+        let _ = reclaim_drain_marker(&marker);
         return false;
     }
     true
 }
 
-/// Release the drain marker when a drainer finishes.
+/// Release the drain marker when a drainer finishes. Only our own marker is
+/// removed: a drainer that somehow lost its slot must not delete its
+/// successor's marker on the way out.
 pub fn release_drain_slot() {
-    let _ = std::fs::remove_file(state_dir().join("drain.lock"));
+    let marker = state_dir().join("drain.lock");
+    let owner = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u32>().ok()));
+    if owner == Some(std::process::id()) {
+        let _ = std::fs::remove_file(marker);
+    }
 }
 
 /// Fire-and-forget: wake the queue drainer so queued entries start when a
@@ -834,27 +1047,206 @@ pub fn spawn_drain() {
         .spawn();
 }
 
-/// True while the pid names a living catch worker (`download`/`video`).
-/// Drains (`catch drain`) also hold entries briefly while spawning; those
-/// are claimable, only a live *worker* makes a newcomer stand down.
-pub fn live_worker_holds(pid: u32, own: u32) -> bool {
-    if pid == 0 || pid == own {
-        return false;
+/// The argv of a live process. `None` when the process is gone, is a zombie,
+/// or is not readable — none of which is a worker holding a row.
+///
+/// `/proc/PID/cmdline` is NUL-separated, so matching it against
+/// space-separated strings can never succeed on the first argument and can
+/// match by accident on any later one ("catch download" split across argv[0]
+/// and argv[1]). Parse the arguments instead of searching the raw bytes.
+fn proc_argv(pid: u32) -> Option<Vec<String>> {
+    if pid == 0 {
+        return None;
     }
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    let text = String::from_utf8_lossy(&cmdline);
-    text.contains("catch download") || text.contains("catch video")
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if raw.is_empty() {
+        // Kernel thread, or a zombie whose parent has not reaped it yet.
+        return None;
+    }
+    let argv = parse_cmdline(&raw);
+    if argv.is_empty() {
+        None
+    } else {
+        Some(argv)
+    }
 }
 
-/// True while the pid names any living catch process. Guards against both
-/// dead holders and pid reuse (Linux-only; Catch targets Arch).
-pub fn worker_alive(pid: u32) -> bool {
-    if pid == 0 {
+/// Split `/proc/PID/cmdline` bytes into arguments. NUL separates arguments;
+/// trailing NULs produce no empty argument.
+fn parse_cmdline(raw: &[u8]) -> Vec<String> {
+    raw.split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// True when `argv` is a catch transfer worker (not a drain, not the panel's
+/// short-lived `catch pause`/`catch remove`, and not an unrelated process
+/// that happens to have "catch" somewhere in its command line).
+fn is_transfer_worker(argv: &[String]) -> bool {
+    let prog = argv.first().map(String::as_str).unwrap_or("");
+    let base = prog.rsplit('/').next().unwrap_or(prog);
+    if base != "catch" && base != "catch-host" {
         return false;
     }
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    let text = String::from_utf8_lossy(&cmdline);
-    text.contains("catch")
+    matches!(argv.get(1).map(String::as_str), Some("download" | "video"))
+        && argv.get(2).is_some_and(|id| !id.is_empty())
+}
+
+/// True when `pid` is a live transfer worker *for this entry*: a `catch
+/// download <id>` / `catch video <id>` (or the browser host running it).
+/// PID reuse by any other process — including another catch worker — counts
+/// as gone, so a row can never be held by an unrelated process for good.
+pub fn worker_holds(pid: u32, id: &str) -> bool {
+    let Some(argv) = proc_argv(pid) else {
+        return false;
+    };
+    is_transfer_worker(&argv) && argv.get(2).map(String::as_str) == Some(id)
+}
+
+/// True when `pid` is a live catch process (any subcommand): the binary's own
+/// basename is checked, so a recycled pid belonging to anything else — even
+/// something with "catch" in its arguments — never counts as a holder.
+fn holder_process_alive(pid: u32) -> bool {
+    let Some(argv) = proc_argv(pid) else {
+        return false;
+    };
+    let prog = argv.first().map(String::as_str).unwrap_or("");
+    let base = prog.rsplit('/').next().unwrap_or(prog);
+    base == "catch" || base == "catch-host"
+}
+
+/// The pid of the worker holding `id`'s transfer lock, if any and still alive.
+fn live_claim_holder(id: &str) -> Option<u32> {
+    let path = state_dir().join("workers").join(format!("{id}.lock"));
+    let pid: u32 = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())?;
+    if pid == std::process::id() || !holder_process_alive(pid) {
+        return None;
+    }
+    Some(pid)
+}
+
+/// True when some live worker process is transferring this entry, whichever
+/// command started it (`download`, `video`, or a blocking `add`/`copy`/
+/// `replace`). This is the authority for "do not start a second transfer":
+/// the queue row's pid is only a hint written before the worker existed.
+pub fn entry_claimed(id: &str) -> bool {
+    live_claim_holder(id).is_some()
+}
+
+/// True while the pid names any live catch transfer worker. Kept for
+/// diagnostics from tests once an id is not known.
+#[allow(dead_code)]
+fn worker_alive(pid: u32) -> bool {
+    proc_argv(pid)
+        .map(|argv| is_transfer_worker(&argv))
+        .unwrap_or(false)
+}
+
+/// Exclusive ownership of one entry's `.part` file.
+///
+/// The row's `pid` column is only a hint: it is written by the drainer
+/// before the worker exists, and a worker that is slow to start leaves a
+/// window in which a second `catch download <id>` would happily open the
+/// same part file and interleave writes. This is a real cross-process lock
+/// beside the part file, freed on drop.
+pub struct WorkerClaim {
+    path: std::path::PathBuf,
+    id: String,
+}
+
+/// Transfers held by *this* process. A lock file naming our pid is only a
+/// duplicate when this set still holds the id; otherwise the pid was reused
+/// by a new catch process after its predecessor died.
+fn held_claims() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+impl Drop for WorkerClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Ok(mut held) = held_claims().lock() {
+            held.remove(&self.id);
+        }
+    }
+}
+
+/// Take the transfer lock for `id`. `Ok(None)` means a live worker for this
+/// id already holds it; the caller must not start a second transfer.
+///
+/// The lock records the holder's pid. A lock whose holder is gone (crash,
+/// SIGKILL, power loss) or is not a worker for this entry (PID reuse) is
+/// reclaimed. Reclaim goes through a rename so two rivals cannot both win.
+pub fn claim_worker(id: &str) -> Result<Option<WorkerClaim>> {
+    let dir = state_dir().join("workers");
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!("{id}.lock"));
+    let own = std::process::id();
+    static TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..3 {
+        // Write the pid to a private temp file and hard-link it into place:
+        // the lock appears atomically with its holder already recorded, so a
+        // rival can never observe an empty lock and steal it mid-write.
+        let tmp = dir.join(format!(
+            ".{id}.lock.tmp-{own}-{}",
+            TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&tmp, format!("{own}\n"))
+            .with_context(|| format!("write {}", tmp.display()))?;
+        let linked = std::fs::hard_link(&tmp, &path);
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => {
+                if let Ok(mut held) = held_claims().lock() {
+                    held.insert(id.to_string());
+                }
+                return Ok(Some(WorkerClaim {
+                    path,
+                    id: id.to_string(),
+                }));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let holder: u32 = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0);
+                if holder == own {
+                    let held = held_claims()
+                        .lock()
+                        .map(|h| h.contains(id))
+                        .unwrap_or(false);
+                    if held {
+                        return Ok(None);
+                    }
+                    // Our pid, but no transfer in this process holds it: a
+                    // new process inherited a recycled pid. Reclaim.
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if holder_process_alive(holder) {
+                    // Any live catch process on that lock owns the transfer:
+                    // `catch add`, `catch copy` and `catch replace` download
+                    // inline, and stealing from them corrupts the part file.
+                    return Ok(None);
+                }
+                // Dead holder: reclaim through a rename so two rivals cannot
+                // both believe they won.
+                let graveyard = path.with_extension(format!("stale-{own}"));
+                if std::fs::rename(&path, &graveyard).is_err() {
+                    // Someone else reclaimed it first; try again from the top.
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                let _ = std::fs::remove_file(&graveyard);
+            }
+            Err(e) => return Err(e).with_context(|| format!("lock {}", path.display())),
+        }
+    }
+    anyhow::bail!("could not take the transfer lock for {id}")
 }
 
 /// How long a freshly claimed entry is left alone before a missing worker
@@ -881,14 +1273,19 @@ pub fn now_secs() -> u64 {
 /// A row claimed within `CLAIM_GRACE` is left alone even when its pid is
 /// gone: that is a drain reservation whose worker has not started yet, and
 /// treating it as an orphan is what produced thousands of forked processes.
+/// A row whose transfer lock is held by a live process is likewise left
+/// alone, whichever command started that transfer.
 pub fn reap_orphans(state: &mut State) -> usize {
     let now = now_secs();
     let mut freed = 0;
     for d in state.downloads.iter_mut() {
-        if d.status != Status::Downloading || worker_alive(d.pid) {
+        if d.status != Status::Downloading || worker_holds(d.pid, &d.id) {
             continue;
         }
         if d.claimed_at != 0 && now.saturating_sub(d.claimed_at) < CLAIM_GRACE.as_secs() {
+            continue;
+        }
+        if entry_claimed(&d.id) {
             continue;
         }
         d.status = Status::Queued;
@@ -985,6 +1382,8 @@ mod tests {
             claimed_at: 0,
             sched_hold: false,
             audio_only: false,
+            etag: String::new(),
+            last_modified: String::new(),
             title: String::new(),
             extra: serde_json::Map::new(),
         }
@@ -1011,36 +1410,68 @@ mod tests {
 
     /// The other half of the invariant: a Downloading row whose worker is
     /// gone has to come back as Queued, or a dead transfer would hold a slot
-    /// forever. Uses this test process's pid for the live case.
+    /// forever. A live *catch worker* is covered by the parser tests below
+    /// and by the end-to-end claim tests; here a vanished pid and an
+    /// unrelated live process (init) both count as gone.
     #[test]
     fn a_downloading_row_without_a_live_worker_is_requeued() {
         let mut state = State {
             version: 1,
             downloads: vec![
-                row("live", Status::Downloading, std::process::id()),
                 // pid 1 is init: alive, but never a catch worker, so it is
                 // treated as gone rather than trusted.
+                row("init", Status::Downloading, 1),
                 row("dead", Status::Downloading, 0),
+                // A large pid that cannot exist on a normal system.
+                row("vanished", Status::Downloading, u32::MAX - 1),
             ],
             saved: Default::default(),
             asks: Vec::new(),
             extra: serde_json::Map::new(),
         };
         let freed = reap_orphans(&mut state);
-        let live = state.downloads.iter().find(|d| d.id == "live").unwrap();
-        let dead = state.downloads.iter().find(|d| d.id == "dead").unwrap();
+        assert!(state.downloads.iter().all(|d| d.status == Status::Queued));
+        assert!(state.downloads.iter().all(|d| d.pid == 0));
+        assert_eq!(freed, 3);
+    }
+
+    /// `/proc/PID/cmdline` uses NUL separators. An earlier substring check
+    /// over the raw bytes could match "catch download" split across
+    /// arguments, or miss the first argument entirely.
+    #[test]
+    fn cmdline_arguments_are_split_on_nul() {
         assert_eq!(
-            live.status,
-            Status::Downloading,
-            "a live worker holds its row"
+            parse_cmdline(b"/usr/bin/catch\0download\0abc-123\0"),
+            vec!["/usr/bin/catch", "download", "abc-123"]
         );
-        assert_eq!(
-            dead.status,
-            Status::Queued,
-            "a dead holder gives its slot back"
-        );
-        assert_eq!(dead.pid, 0);
-        assert_eq!(freed, 1);
+        assert!(parse_cmdline(b"").is_empty());
+        assert!(parse_cmdline(b"\0\0").is_empty());
+    }
+
+    #[test]
+    fn only_the_matching_worker_command_holds_a_row() {
+        let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The two real worker spellings, with or without a path.
+        assert!(is_transfer_worker(&argv(&["catch", "download", "id"])));
+        assert!(is_transfer_worker(&argv(&["catch", "video", "id"])));
+        assert!(is_transfer_worker(&argv(&[
+            "/home/u/.local/bin/catch-host",
+            "download",
+            "id"
+        ])));
+        // Another subcommand, a different entry, a truncated argv.
+        assert!(!is_transfer_worker(&argv(&["catch", "add", "id"])));
+        assert!(!is_transfer_worker(&argv(&["catch", "drain"])));
+        assert!(!is_transfer_worker(&argv(&["catch", "download"])));
+        // A shell whose *arguments* mention catch is not a worker.
+        assert!(!is_transfer_worker(&argv(&[
+            "bash",
+            "-c",
+            "catch download id"
+        ])));
+        // A different program named catch (or a renamed one) is still
+        // accepted only by basename, which is the documented identity.
+        assert!(!is_transfer_worker(&argv(&["catcher", "download", "id"])));
     }
 
     /// The fork bomb: a drainer reserves a row, spawns the worker, and exits.
@@ -1264,6 +1695,8 @@ mod dedup_tests {
             claimed_at: 0,
             sched_hold: false,
             audio_only: false,
+            etag: String::new(),
+            last_modified: String::new(),
             title: String::new(),
             extra: serde_json::Map::new(),
         }
@@ -1476,6 +1909,8 @@ mod saved_tests {
             claimed_at: 0,
             sched_hold: false,
             audio_only: false,
+            etag: String::new(),
+            last_modified: String::new(),
             title: "App".into(),
             extra: serde_json::Map::new(),
         });

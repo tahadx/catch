@@ -23,9 +23,18 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            shellcheck qt6-declarative-dev-tools
+
       # rustfmt first: formatting drift is the cheapest failure to fix.
       - name: Formatting
         run: cargo fmt --check -p catch
+
+      - name: Check
+        run: cargo check -p catch --all-targets
 
       # The kleeamp desktop rule, applied here: clippy with warnings denied
       # before a task counts as done.
@@ -38,7 +47,48 @@ jobs:
       - name: Model logic
         run: node tests/model.test.js
 
+      # The Firefox and Chromium extension scripts are one source of truth.
+      - name: Extension JavaScript
+        run: |
+          node --check extensions/chromium-catch/background-3.js
+          node --check extensions/firefox-catch/background-3.js
+          cmp extensions/chromium-catch/background-3.js \
+            extensions/firefox-catch/background-3.js
+
+      - name: Shell lint
+        run: |
+          shellcheck -x \
+            install.sh \
+            bin/configure bin/uninstall bin/refresh-dist bin/version \
+            bin/stamp-version bin/setup bin/check-release \
+            tests/install.test.sh
+
+      - name: Installer and uninstaller reruns
+        run: bash tests/install.test.sh
+
+      - name: QML syntax
+        run: |
+          lint="$(command -v qmllint || true)"
+          if [ -z "$lint" ] && [ -x /usr/lib/qt6/bin/qmllint ]; then
+            lint=/usr/lib/qt6/bin/qmllint
+          fi
+          if [ -z "$lint" ]; then
+            echo "qmllint not available; skipping QML syntax check"
+            exit 0
+          fi
+          "$lint" --max-warnings 9999 Service.qml Panel.qml
+
+      # Plugin version, crate version and the shipped binaries must agree,
+      # and the binaries must target this runner's CPU.
+      - name: Release consistency
+        run: bin/check-release
+
       - name: Plugin contract
         run: |
           # manifest.json must stay at the git root with valid entry points.
           python3 -c "import json; m = json.load(open('manifest.json')); assert m['schemaVersion'] == 1 and m['id'] and m['entryPoints']"
+
+      - name: Dependency audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

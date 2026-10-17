@@ -7,6 +7,9 @@
 set -euo pipefail
 
 HOST_NAME="io.github.tahadx.catch"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+BINDINGS="$CONFIG_HOME/hypr/bindings.lua"
+BIND_LINE="o.bind(\"SUPER + D\", \"Catch downloads\", \"omarchy-shell shell toggle io.github.tahadx.catch '{}'\")"
 
 echo "== Catch: removing installed pieces =="
 
@@ -17,16 +20,38 @@ rm -f "$HOME/.config/systemd/user/catch-schedule.timer" \
 systemctl --user daemon-reload 2>/dev/null || true
 echo "  scheduler timer removed"
 
-# 2. Backend symlinks, only when they point at a catch tree.
+# 2. Backend symlinks, only when they point at a catch tree. Checking the
+# shape of the target, not just the word "catch", keeps an unrelated link
+# such as ~/bin/my-catch-helper from being deleted.
 for bin in catch catch-host; do
   link="$HOME/.local/bin/$bin"
-  if [[ -L $link ]] && [[ $(readlink "$link") == *catch* ]]; then
-    rm -f "$link"
-    echo "  unlinked $link"
+  if [[ -L "$link" ]]; then
+    target="$(readlink -- "$link")"
+    case "$target" in
+      */bin/dist/"$bin"|*/target/debug/"$bin"|*/target/release/"$bin")
+        rm -f -- "$link"
+        echo "  unlinked $link"
+        ;;
+    esac
   fi
 done
 
-# 3. Native host manifests, both families.
+# 3. Our Super+D line, preserving every other binding byte for byte.
+if [[ -f "$BINDINGS" ]] && grep -qxF -- "$BIND_LINE" "$BINDINGS"; then
+  python3 - "$BINDINGS" "$BIND_LINE" <<'PY'
+import sys
+path, line = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    lines = f.readlines()
+kept = [l for l in lines if l.rstrip("\n") != line]
+if len(kept) != len(lines):
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(kept)
+PY
+  echo "  removed Super+D bindings entry"
+fi
+
+# 4. Native host manifests, both families.
 rm -f \
   "$HOME"/.config/chromium/NativeMessagingHosts/$HOST_NAME.json \
   "$HOME"/.config/google-chrome/NativeMessagingHosts/$HOST_NAME.json \
@@ -47,7 +72,7 @@ rm -f \
   "$HOME"/.waterfox/native-messaging-hosts/$HOST_NAME.json
 echo "  host manifests removed"
 
-# 4. Our extension path out of every Chromium flags file. Omarchy's own
+# 5. Our extension path out of every Chromium flags file. Omarchy's own
 # entries stay; a flag left with nothing on it is dropped.
 python3 - <<'EOF'
 import os
