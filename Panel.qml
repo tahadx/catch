@@ -741,7 +741,7 @@ Panel {
         focus: true
         // Escape dismisses; a press elsewhere is handled by `hit` above so
         // the trigger can tell a dismissing press from an opening one.
-        closePolicy: Popup.CloseOnEscape
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
         background: BorderSurface {
           color: Commons.Color.popups.background
