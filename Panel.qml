@@ -1366,7 +1366,10 @@ Panel {
         if (m) root.toggleMark(m.id)
       }
       onReturnRequested: {
-        // Enter opens the finished file.
+        // Enter opens the finished file, but only when not typing in the
+        // input: a Return there submits the link instead.
+        if (root.typing() || root.showingSettings) return
+        root.hold()
         var m = root.queue.downloads[root.cursorIndex]
         if (m && m.status === "done") root.openFile(m.id)
       }
