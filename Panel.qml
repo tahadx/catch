@@ -1109,9 +1109,10 @@ Panel {
     return Math.max(Number(d.bytes) || 0, root.peakBytes[d.id] || 0)
   }
 
+  // Bare rate for a live row ("1.2 MB/s"), or "" before the first sample.
+  // liveHead() places it on the row's meta line.
   function speedFor(id) {
-    var s = root.speeds[id]
-    return s ? " · " + s : ""
+    return root.speeds[id] || ""
   }
 
   // True while the scheduler is holding this queued row out of hours.
@@ -1148,7 +1149,8 @@ Panel {
   }
 
   // Estimated time remaining for a downloading row, derived from the
-  // smoothed speed. Returns "" when unknown.
+  // smoothed speed. Bare fragment ("8s left") or "" when unknown;
+  // liveHead() places it on the row's meta line.
   function etaFor(id) {
     var d = null
     for (var i = 0; i < root.queue.downloads.length; i++) {
@@ -1168,9 +1170,24 @@ Panel {
       secs = (total - bytes) / rate
     }
     if (!isFinite(secs) || secs < 0) return ""
-    if (secs < 60) return " · " + Math.ceil(secs) + "s left"
-    if (secs < 3600) return " · " + Math.floor(secs / 60) + "m " + Math.floor(secs % 60) + "s left"
-    return " · " + Math.floor(secs / 3600) + "h " + Math.floor((secs % 3600) / 60) + "m left"
+    if (secs < 60) return Math.ceil(secs) + "s left"
+    if (secs < 3600) return Math.floor(secs / 60) + "m " + Math.floor(secs % 60) + "s left"
+    return Math.floor(secs / 3600) + "h " + Math.floor((secs % 3600) / 60) + "m left"
+  }
+
+  // Leading block of a row's meta line while its transfer is live: the rate
+  // and the time left, the two numbers a running download is watched by.
+  // They used to trail the line, where the panel's fixed width elided them
+  // first, so a live row never showed its speed. Leading them costs no
+  // width (same fields, same separators) and the static tail still elides.
+  function liveHead(d) {
+    if (!d || d.status !== "downloading") return ""
+    var parts = []
+    var rate = root.speedFor(d.id)
+    if (rate !== "") parts.push(rate)
+    var eta = root.etaFor(d.id)
+    if (eta !== "") parts.push(eta)
+    return parts.length > 0 ? parts.join(" · ") + " · " : ""
   }
 
   FileView {
@@ -1846,14 +1863,35 @@ Panel {
                             elide: Text.ElideMiddle
                           }
 
-                          Text {
+                          // Meta line: a live transfer leads with its rate
+                          // and time left, in the accent; the static tail
+                          // (kind, bytes, segments, percent) follows in the
+                          // dim ink and takes the elide — same fields, same
+                          // separators, so the fixed panel width is intact.
+                          Row {
                             width: parent.width
-                            textFormat: Text.PlainText
-                            text: Model.rowMeta(card.entry) + (function(){ var s = root.segmentsFor(card.entry.id); return (s && Number(s.total) > 1) ? " · " + (Number(s.done)||0) + "/" + s.total + " seg" : "" })() + (card._busy && root.percentFor(card.entry) > 0 ? " · " + root.percentFor(card.entry) + "%" : "") + root.speedFor(card.entry.id) + root.etaFor(card.entry.id)
-                            color: root.dim
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.body
-                            elide: Text.ElideRight
+                            spacing: 0
+
+                            Text {
+                              id: cardLive
+                              textFormat: Text.PlainText
+                              text: root.liveHead(card.entry)
+                              color: root.accent
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.body
+                              width: Math.min(implicitWidth, parent.width)
+                              elide: Text.ElideRight
+                            }
+
+                            Text {
+                              width: Math.max(0, parent.width - cardLive.width)
+                              textFormat: Text.PlainText
+                              text: Model.rowMeta(card.entry) + (function(){ var s = root.segmentsFor(card.entry.id); return (s && Number(s.total) > 1) ? " · " + (Number(s.done)||0) + "/" + s.total + " seg" : "" })() + (card._busy && root.percentFor(card.entry) > 0 ? " · " + root.percentFor(card.entry) + "%" : "")
+                              color: root.dim
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.body
+                              elide: Text.ElideRight
+                            }
                           }
                         }
 
