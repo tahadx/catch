@@ -313,6 +313,8 @@ def main() -> int:
         help="per-connection throttle; 0 = unthrottled loopback",
     )
     parser.add_argument("--levels", default="1,2,3,5,10")
+    parser.add_argument("--segments", default="4",
+                        help="comma list of CATCH_SEGMENTS values to compare (1 disables)")
     parser.add_argument("--timeout", type=float, default=180.0, help="seconds per level")
     parser.add_argument("--json", default="", help="also write the raw results here")
     args = parser.parse_args()
@@ -371,25 +373,31 @@ def main() -> int:
         f"bench: {binary} | {args.size_mib} MiB/file | "
         f"{args.rate_mib} MiB/s per connection | levels {levels}"
     )
+    seg_values = [int(x.strip()) for x in args.segments.split(",") if x.strip()]
     results = []
     try:
-        for level in levels:
-            result = run_level(args, binary, env, server, level, downloads, state_path)
-            results.append(result)
-            print(
-                "  c={concurrency:>2} wall={wall_seconds:>6.2f}s "
-                "agg={aggregate_mib_per_second:>7.2f} MiB/s "
-                "per-file={per_file_mib_per_second:>6.2f} MiB/s "
-                "req={http_requests} retries={retries} "
-                "catch-cpu={catch_cpu_seconds:>6.2f}s "
-                "rss={peak_catch_rss_mib:>5.1f} MiB "
-                "p50={p50:.2f}s p95={p95:.2f}s status-max={status_max:.1f}ms".format(
-                    **result,
-                    p50=result["file_latency_seconds"]["p50"],
-                    p95=result["file_latency_seconds"]["p95"],
-                    status_max=result["status_latency_millis"]["max"],
+        for seg in seg_values:
+            run_env = dict(env)
+            run_env["CATCH_SEGMENTS"] = str(seg)
+            print(f"bench: segments={seg}")
+            for level in levels:
+                result = run_level(args, binary, run_env, server, level, downloads, state_path)
+                result["segments"] = seg
+                results.append(result)
+                print(
+                    "  seg={segments} c={concurrency:>2} wall={wall_seconds:>6.2f}s "
+                    "agg={aggregate_mib_per_second:>7.2f} MiB/s "
+                    "per-file={per_file_mib_per_second:>6.2f} MiB/s "
+                    "req={http_requests} retries={retries} "
+                    "catch-cpu={catch_cpu_seconds:>6.2f}s "
+                    "rss={peak_catch_rss_mib:>5.1f} MiB "
+                    "p50={p50:.2f}s p95={p95:.2f}s status-max={status_max:.1f}ms".format(
+                        **result,
+                        p50=result["file_latency_seconds"]["p50"],
+                        p95=result["file_latency_seconds"]["p95"],
+                        status_max=result["status_latency_millis"]["max"],
+                    )
                 )
-            )
     finally:
         server.shutdown()
         server.server_close()

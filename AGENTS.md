@@ -8,6 +8,7 @@ Catch is an Omarchy shell plugin plus a Rust download backend. The queue, the by
 | --- | --- |
 | `crates/catch/src/main.rs` | CLI commands, add/catch handoff, worker entry points |
 | `crates/catch/src/download.rs` | HTTP engine: deadlines, retry/resume, Range and validators, finalize |
+| `crates/catch/src/segment.rs` | Segmented downloads: probe, range math, manifest, positioned writes, resume |
 | `crates/catch/src/video.rs` | yt-dlp worker, bounded output capture, process-group stop |
 | `crates/catch/src/state.rs` | JSON state, locks and claims, filenames, saved index, drain marker |
 | `crates/catch/src/native_host.rs` | Chrome/Firefox native messaging loop and batching |

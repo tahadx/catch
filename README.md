@@ -166,8 +166,64 @@ stay in that browser.
   deliberately.
 
 Downloads land in `~/Downloads/catch`. In the panel, the gear icon or `s`
-opens settings: the download folder, and how many transfers run at once
-(1–10).
+opens settings: the download folder, how many transfers run at once (1–10),
+and how many byte-range segments each large download uses (1 disables
+segmented downloading).
+
+## Segmented downloads
+
+Catch can download a single large file through several parallel HTTP
+requests, each fetching a distinct byte range, when the server supports it.
+This is automatic and never changes the final file: the bytes are written
+into their assigned positions of one `.part` file and verified before the
+file is renamed into place.
+
+Eligibility (all must hold):
+
+- The file is at least 32 MiB (override with `CATCH_SEGMENT_MIN_BYTES`).
+- The server answers a real `Range: bytes=0-1023` probe with `206 Partial
+  Content`, a valid `Content-Range` carrying the total length, and the
+  expected byte count.
+- The response uses identity content encoding (no transparent compression
+  that would invalidate byte offsets).
+- The server exposes an `ETag` or `Last-Modified` validator, so a changed
+  representation can be detected instead of being spliced into the file.
+- There is enough connection budget left: Catch divides a global budget
+  (`CATCH_MAX_CONNECTIONS`, default 8) across the active transfers, so
+  three transfers never open 24 connections. Each transfer is capped by
+  the segments setting (1–8, default 4) and by a minimum useful segment
+  size of 8 MiB (`CATCH_SEGMENT_MIN_PIECE`).
+
+When any of these fails, Catch uses its ordinary sequential downloader for
+that file. A server that ignores `Range` and answers `200 OK`, returns a
+mismatched `Content-Range`, changes validators between requests, or
+rejects a range (HTTP 416) makes the segmented attempt fall back to a
+fresh sequential download from byte zero — bytes from two different
+representations are never mixed.
+
+Resumption is segment-aware. A sidecar file named `<file>.<id>.part.meta`
+next to the `.part` file records which ranges are durably committed (a
+range is committed only after its bytes are written and synchronized).
+After an interruption or a restart, completed ranges are reused and only
+the missing ones are fetched again. An existing `.part` file from an older
+Catch version, or one with a missing or corrupt manifest, is never
+reinterpreted as a set of segments: both files are discarded and the
+transfer starts over. Removing a download deletes both files.
+
+Diagnostics: while a segmented download is running, the row shows `done/total
+seg`. The manifest is ordinary JSON and can be inspected with
+`cat ~/Downloads/catch/<file>.<id>.part.meta`. A failed segment is named in
+the worker's error message and in the row's error field; the partial data
+stays on disk for a manual retry.
+
+Environment overrides (all optional):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CATCH_SEGMENTS` | 4 (or the panel setting) | Segments per eligible file (1 disables) |
+| `CATCH_SEGMENT_MIN_BYTES` | 33554432 | Smallest file eligible for segmentation |
+| `CATCH_SEGMENT_MIN_PIECE` | 8388608 | Smallest useful segment size |
+| `CATCH_MAX_CONNECTIONS` | 8 | Global connection budget across transfers |
 
 ## Requirements
 
