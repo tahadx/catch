@@ -1373,11 +1373,26 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
     if held != bytes {
         eprintln!("catch: {id} note: {bytes} streamed, {held} on disk");
     }
-    let dest = dir.join(dest_name);
-    let dest = if dest.exists() && !overwrite {
-        unique_destination(dir, dest_name)
+    // Atomically allocate the final path so two workers finishing at the
+    // same time cannot both rename to the same destination (which would
+    // silently overwrite). The reservation file is replaced by the rename.
+    let dest = if overwrite {
+        dir.join(dest_name)
     } else {
-        dest
+        crate::state::with_lock(|| {
+            let mut candidate = dir.join(dest_name);
+            loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
+                    Ok(_) => break,
+                    Err(_) => candidate = unique_destination(dir, dest_name),
+                }
+            }
+            Ok(candidate)
+        })?
     };
     // Intent record for recoverable finalization: written before the rename.
     let intent_path = PathBuf::from(format!("{}.finalizing", part.display()));
@@ -1386,9 +1401,13 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
         serde_json::json!({"dest": dest.display().to_string(), "url": url}).to_string(),
     );
 
-    tokio::fs::rename(part, &dest)
-        .await
-        .with_context(|| format!("move to {}", dest.display()))?;
+    if let Err(e) = tokio::fs::rename(part, &dest).await {
+        // Remove the reservation file we created so it does not linger.
+        if !overwrite {
+            let _ = std::fs::remove_file(&dest);
+        }
+        return Err(e).with_context(|| format!("move to {}", dest.display()));
+    }
     let final_name = dest
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())

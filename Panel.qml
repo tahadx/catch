@@ -194,7 +194,9 @@ Panel {
     var url = root.conflictUrl
     root.ignoringAsk = url
     root.closeConflict()
-    root.runCatch(["copy", url], "Could not save another copy.")
+    // Enqueue a fresh, independent download (nonblocking) instead of the
+    // blocking `copy` command, so the panel stays responsive.
+    root.runCatch(["enqueue", url, "--again"], "Could not save another copy.")
   }
 
   // The question is answered without a transfer: open, or cancel.

@@ -48,6 +48,11 @@ enum Command {
         /// Best-audio stream instead of the full video (with --video).
         #[arg(long)]
         audio: bool,
+        /// Force a new, independent download even if the URL is already
+        /// downloading. Used by "Download again anyway"; clears any pending
+        /// duplicate question for this URL.
+        #[arg(long)]
+        again: bool,
     },
     /// Download one queued entry by id (blocking).
     Download {
@@ -170,14 +175,21 @@ async fn main() -> Result<()> {
                 catch_now(&url, dir.as_deref(), video, audio, true).await?;
             }
         }
-        Command::Enqueue { url, video, audio } => {
-            // The same duplicate rule `add` applies: a link whose file is
-            // already saved becomes a question for the panel instead of a
-            // quiet second copy. Without this the panel's add path saved
-            // duplicates without ever asking.
-            if raise_ask(&url, "")?.is_some() {
-                println!("already downloading or saved; open Catch to choose");
-                return Ok(());
+        Command::Enqueue { url, video, audio, again } => {
+            // `--again` forces a fresh, independent download (used by
+            // "Download again anyway"): it clears any pending duplicate
+            // question and never reuses the active row.
+            if again {
+                clear_one_ask(&url)?;
+            } else {
+                // The same duplicate rule `add` applies: a link whose file is
+                // already saved becomes a question for the panel instead of a
+                // quiet second copy. Without this the panel's add path saved
+                // duplicates without ever asking.
+                if raise_ask(&url, "")?.is_some() {
+                    println!("already downloading or saved; open Catch to choose");
+                    return Ok(());
+                }
             }
             // catch_now up to the point where it would block: same row, same
             // rules, but the transfer is left to the drainer so the caller's
@@ -202,7 +214,7 @@ async fn main() -> Result<()> {
                 },
                 audio,
                 false,
-                true,
+                !again,
             )?;
             state::spawn_drain();
             if fresh {
