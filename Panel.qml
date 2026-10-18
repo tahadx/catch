@@ -403,7 +403,7 @@ Panel {
         // loadedContent (not the keyCatcher id: content-scoped ids are
         // invisible out here) — belt and suspenders next to the shell's
         // own focus prime.
-        var content = panel.loadedContent
+        var content = keyCatcher
         // A question parks focus on its Open button. Stealing it back here
         // would leave Enter on the queue catcher.
         if (root.conflict === null && root.opened && content) content.forceActiveFocus()
@@ -451,7 +451,7 @@ Panel {
   // (e.g. auto-opened while you type elsewhere) gets focused instead of
   // closed, so Super+D is always "take me to Catch".
   function togglePanel() {
-    var content = panel.loadedContent
+    var content = keyCatcher
     var focused = content ? content.activeFocus : false
     if (root.opened && focused) root.close()
     else if (root.opened) {
@@ -700,7 +700,7 @@ Panel {
         text: "›"
         rotation: dd.open ? 90 : 0
         Behavior on rotation {
-          NumberAnimation { duration: Style.duration(120); easing.type: Easing.OutCubic }
+          NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
         }
         color: dd.foreground
         font.family: root.fontFamily
@@ -1145,7 +1145,7 @@ Panel {
   // Short leash on row activation right after the conflict dialog closes:
   // long enough to swallow the dismissing Enter, short enough that the
   // next deliberate press works.
-  ShellIpc {
+  IpcHandler {
     target: root.ipcTarget
     function open(): void { root.open() }
     function close(): void { root.close() }
@@ -1236,11 +1236,11 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: panel.loadedContent
+    focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(480))
-    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(560))
+    contentHeight: panel.fittedContentHeight(keyCatcher.implicitHeight, Style.space(560))
 
-    content: PanelKeyCatcher {
+    PanelKeyCatcher {
       id: keyCatcher
       implicitHeight: column.implicitHeight
       anchors.fill: parent
@@ -1665,7 +1665,7 @@ Panel {
                     readonly property bool isCursor: root.cursorIndex === index
                     readonly property bool isMarked: root.isMarked(did)
                     readonly property bool isOpen: root.expandedRow === did
-                    readonly property bool _hot: isCursor || cardHover.hovered
+                    readonly property bool _hot: isCursor || cardHover.containsMouse
                     readonly property bool _busy: status === "downloading" || status === "queued"
 
                     implicitHeight: cardBody.implicitHeight + Style.spacing.xl * 2
@@ -1682,7 +1682,7 @@ Panel {
                           : Style.normalFillFor(root.foreground, root.accent)))
                     borderSpec: Border.controlSpec(isCursor || isMarked ? "selected" : (_hot ? "hover-cursor" : "normal"), root.foreground, root.accent)
 
-                    Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+                    Behavior on color { ColorAnimation { duration: 120 } }
 
                     // Declared before the body so it sits underneath: it catches
                     // row clicks and hover, while the buttons inside the body keep
@@ -1999,7 +1999,7 @@ Panel {
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.title
                       Behavior on rotation {
-                        NumberAnimation { duration: Style.duration(120); easing.type: Easing.OutCubic }
+                        NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
                       }
                     }
                   }
