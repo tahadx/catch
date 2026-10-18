@@ -1584,3 +1584,67 @@ fn a_wrong_checksum_removes_the_bytes_and_reports_it() {
         "wrong bytes are removed, not resumed"
     );
 }
+
+#[test]
+fn connection_budget_is_enforced_across_workers() {
+    let sb = Sandbox::new("conn-budget");
+    // Three transfers share a global budget of two. Each held request lasts
+    // 400 ms, so the third worker can only leave after one of the first two
+    // has finished — its request must arrive visibly later.
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&arrivals);
+    let server = Server::start(move |_req, _n| {
+        seen.lock().unwrap().push(Instant::now());
+        let mut reply = Reply::new(200);
+        // The bytes arrive immediately, the terminal chunk 400 ms later, so
+        // the connection (and its permit) is held for that long.
+        reply.body = Body::Chunked(vec![(vec![7u8; 4096], Duration::from_millis(400))]);
+        reply
+    });
+
+    let mut cmds = Vec::new();
+    for name in ["one.bin", "two.bin", "three.bin"] {
+        let url = server.url(name);
+        let mut cmd = sb.cmd();
+        cmd.env("CATCH_MAX_CONNECTIONS", "2")
+            .env("CATCH_SEGMENTS", "1")
+            .args(["add", &url, "--dir", &dir(&sb)]);
+        cmds.push(cmd);
+    }
+    let outs: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = cmds
+            .into_iter()
+            .map(|cmd| s.spawn(move || run(cmd, Duration::from_secs(30))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("add thread"))
+            .collect()
+    });
+    for out in &outs {
+        assert!(
+            out.status.success(),
+            "add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for name in ["one.bin", "two.bin", "three.bin"] {
+        assert_eq!(
+            std::fs::read(sb.base().join(name)).unwrap().len(),
+            4096,
+            "{name} must be written completely"
+        );
+    }
+
+    let arrivals = arrivals.lock().unwrap();
+    assert_eq!(
+        arrivals.len(),
+        3,
+        "one request per transfer with segments=1 (no probes): {arrivals:?}"
+    );
+    let spread = arrivals[2] - arrivals[0];
+    assert!(
+        spread >= Duration::from_millis(300),
+        "the third worker must wait for a free permit, arrived after {spread:?}"
+    );
+}
