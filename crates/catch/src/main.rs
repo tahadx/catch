@@ -3,6 +3,7 @@ mod drain;
 mod install;
 mod native_host;
 mod schedule;
+mod segment;
 mod state;
 mod video;
 
@@ -889,6 +890,8 @@ fn remove_one(id: &str, delete_file: bool) -> Result<()> {
         Ok(())
     })?;
     std::fs::remove_file(&part).ok();
+    // Drop any segmented-download sidecar too.
+    let _ = std::fs::remove_file(format!("{}.meta", part.display()));
     if delete_file {
         // The file may predate categories or the setting may have flipped:
         // try the category dir first, then the flat base.

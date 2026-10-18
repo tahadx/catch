@@ -1339,6 +1339,49 @@ fn find_widget_max(v: &serde_json::Value) -> Option<usize> {
     None
 }
 
+/// Segmented-download setting from the widget (1 disables segmentation).
+/// Env CATCH_SEGMENTS overrides. Valid values: 1, 2, 4, 8.
+pub fn segments_setting() -> usize {
+    if let Ok(raw) = std::env::var("CATCH_SEGMENTS") {
+        if let Ok(n) = raw.trim().parse::<usize>() {
+            if [1, 2, 4, 8].contains(&n) {
+                return n;
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let shell = std::path::PathBuf::from(home).join(".config/omarchy/shell.json");
+        if let Ok(text) = std::fs::read_to_string(&shell) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(n) = find_widget_segments(&v) {
+                    return n;
+                }
+            }
+        }
+    }
+    4
+}
+
+fn find_widget_segments(v: &serde_json::Value) -> Option<usize> {
+    let layout = v.get("bar")?.get("layout")?;
+    for section in ["left", "center", "right"] {
+        let entries = match layout.get(section).and_then(|s| s.as_array()) {
+            Some(e) => e,
+            None => continue,
+        };
+        for e in entries {
+            if e.get("id")?.as_str()? != "io.github.tahadx.catch" {
+                continue;
+            }
+            let n = e.get("segments")?.as_u64()? as usize;
+            if [1, 2, 4, 8].contains(&n) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 /// Pick a non-colliding destination inside `dir` for `filename`.
 pub fn unique_destination(dir: &Path, filename: &str) -> PathBuf {
     let candidate = dir.join(filename);

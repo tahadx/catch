@@ -3,6 +3,7 @@ use futures_util::StreamExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::segment;
 use crate::state::{
     dir_for, load_state, mark_error, resolve_download_dir, sanitize_filename, unique_destination,
     update_state, worker_holds, Status,
@@ -10,7 +11,7 @@ use crate::state::{
 
 /// Give up on a connection with no body data this long, then reconnect.
 /// Overridable for tests via CATCH_STALL_SECS.
-fn stall_timeout() -> Duration {
+pub(crate) fn stall_timeout() -> Duration {
     if let Ok(raw) = std::env::var("CATCH_STALL_SECS") {
         if let Ok(n) = raw.trim().parse::<u64>() {
             if (1..=3600).contains(&n) {
@@ -24,7 +25,7 @@ fn stall_timeout() -> Duration {
 /// Ceiling on connecting and on waiting for response headers. A server that
 /// accepts the connection and then says nothing must not hang a worker for
 /// ever: `connect_timeout` alone only covers the TCP handshake.
-fn response_timeout() -> Duration {
+pub(crate) fn response_timeout() -> Duration {
     if let Ok(raw) = std::env::var("CATCH_RESPONSE_SECS") {
         if let Ok(n) = raw.trim().parse::<u64>() {
             if (1..=600).contains(&n) {
@@ -37,7 +38,7 @@ fn response_timeout() -> Duration {
 
 /// Connection attempts per transfer, including the first. Overridable for
 /// tests (CATCH_MAX_ATTEMPTS=1 makes a transfer single-shot).
-fn max_attempts() -> u32 {
+pub(crate) fn max_attempts() -> u32 {
     if let Ok(raw) = std::env::var("CATCH_MAX_ATTEMPTS") {
         if let Ok(n) = raw.trim().parse::<u32>() {
             if (1..=10).contains(&n) {
@@ -56,12 +57,12 @@ const COMPLETION_GRACE: Duration = Duration::from_secs(5);
 /// arriving. Without this a quiet or stalled connection only notices a
 /// pause/remove once the next chunk lands — or after the stall timeout,
 /// which is what made "stop" look like it did nothing.
-const STOP_POLL: Duration = Duration::from_millis(250);
+pub(crate) const STOP_POLL: Duration = Duration::from_millis(250);
 
 /// How often a busy transfer writes progress to the state file (and reads
 /// stop orders back). The whole file is parsed and rewritten for each flush,
 /// so this is the difference between a smooth bar and an I/O storm.
-const FLUSH_EVERY: Duration = Duration::from_millis(250);
+pub(crate) const FLUSH_EVERY: Duration = Duration::from_millis(250);
 
 /// Ceiling on how often a busy transfer re-reads stop orders. Each read is a
 /// full parse of the state file, so doing it per chunk starved the download;
@@ -96,7 +97,7 @@ enum StreamEnd {
 }
 
 /// A failure and whether it is worth another attempt.
-enum Verdict {
+pub(crate) enum Verdict {
     Retry(Duration),
     Fatal(String),
 }
@@ -120,7 +121,7 @@ fn looks_like_file_url(url: &str) -> bool {
 /// "bytes 200-1000/67589" -> (200, 1000, Some(67589)). A malformed or
 /// unsatisfiable header returns None so the caller restarts from zero
 /// instead of trusting an offset it cannot verify.
-fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+pub(crate) fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     let rest = value.trim().strip_prefix("bytes")?.trim();
     let (range, total) = rest.split_once('/')?;
     let total = match total.trim() {
@@ -143,7 +144,7 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
 
 /// A small, jittered exponential backoff. Jitter keeps a batch of workers
 /// from hammering a server that just came back in lockstep.
-fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(6);
     let base = BACKOFF_BASE.saturating_mul(1u32 << shift).min(BACKOFF_MAX);
     // Deterministic-ish jitter from the clock: +/- 25 %, never zero.
@@ -173,7 +174,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 /// Classify an HTTP failure status. Temporary conditions retry; anything
 /// that means "this request will never work" does not — a 404 or a 403 must
 /// fail immediately instead of being attempted four times.
-fn status_verdict(
+pub(crate) fn status_verdict(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
     attempt: u32,
@@ -192,7 +193,7 @@ fn status_verdict(
 /// Classify a transport failure. Builder errors (a malformed URL) and
 /// redirect loops are permanent; connection, timeout, body and protocol
 /// failures are worth retrying.
-fn transport_verdict(e: &reqwest::Error, attempt: u32) -> Verdict {
+pub(crate) fn transport_verdict(e: &reqwest::Error, attempt: u32) -> Verdict {
     if e.is_builder() {
         return Verdict::Fatal(format!("bad request: {e}"));
     }
@@ -348,6 +349,70 @@ pub async fn download_entry(
     let mut restarts = 0u32;
     let mut watch = DirectiveWatch::new();
 
+    // Segmented resume: if a sidecar manifest exists and is valid, run the
+    // segmented downloader instead of the sequential path.
+    let mut probe_pending = progress.bytes == 0;
+    if let Some(manifest) = segment::load_manifest(&part, &url)? {
+        let active = load_state()
+            .map(|s| {
+                s.downloads
+                    .iter()
+                    .filter(|d| d.status == Status::Downloading)
+                    .count()
+            })
+            .unwrap_or(1);
+        let share = segment::segment_share(active);
+        let outcome = segment::run_segmented(
+            id,
+            &url,
+            &client,
+            &part,
+            manifest.total,
+            progress.etag.clone(),
+            progress.last_modified.clone(),
+            manifest,
+            share,
+        )
+        .await;
+        match outcome? {
+            segment::SegmentedResult::Complete { manifest } => {
+                segment::remove_manifest(&part);
+                return finish(Finish {
+                    id,
+                    url: &url,
+                    dir: &dir,
+                    dest_name: &dest_name,
+                    part: &part,
+                    bytes: manifest.total,
+                    total: Some(manifest.total),
+                    overwrite,
+                    base: &base,
+                })
+                .await;
+            }
+            segment::SegmentedResult::Paused => {
+                note_paused(id, &progress);
+                return Ok(part.clone());
+            }
+            segment::SegmentedResult::Stopped => {
+                std::fs::remove_file(&part).ok();
+                segment::remove_manifest(&part);
+                eprintln!("catch: {id} stopped");
+                anyhow::bail!("{id} stopped");
+            }
+            segment::SegmentedResult::Fallback(reason) => {
+                eprintln!("catch: {id} segmented download fell back to sequential: {reason}");
+                segment::remove_manifest(&part);
+                let _ = std::fs::remove_file(&part);
+                progress.bytes = 0;
+                progress.total = 0;
+                progress.etag.clear();
+                progress.last_modified.clear();
+                probe_pending = false;
+            }
+        }
+    }
+
     // Connection attempts: a fresh request (with Range from what we hold)
     // is what unsticks the dead connections users used to fix by hand.
     loop {
@@ -359,6 +424,7 @@ pub async fn download_entry(
             }
             Directive::Abort => {
                 std::fs::remove_file(&part).ok();
+                segment::remove_manifest(&part);
                 eprintln!("catch: {id} stopped");
                 anyhow::bail!("{id} stopped");
             }
@@ -387,6 +453,7 @@ pub async fn download_entry(
             progress.bytes = on_disk;
         }
 
+        let was_probe = probe_pending && progress.bytes == 0;
         let mut req = client.get(&url);
         if progress.bytes > 0 && progress.resumable {
             req = req.header("Range", format!("bytes={}-", progress.bytes));
@@ -396,6 +463,10 @@ pub async fn download_entry(
             if let Some(validator) = progress.if_range() {
                 req = req.header("If-Range", validator);
             }
+        } else if was_probe {
+            req = req
+                .header("Range", "bytes=0-1023")
+                .header("Accept-Encoding", "identity");
         }
         let sent = tokio::time::timeout(response_timeout(), req.send()).await;
         let resp = match sent {
@@ -423,6 +494,13 @@ pub async fn download_entry(
         };
 
         let status = resp.status();
+        // A probe that hits 416 means the representation is empty or the
+        // server disliked the range: retry without a probe range.
+        if was_probe && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            probe_pending = false;
+            drop(resp);
+            continue;
+        }
         // A compressed body has no stable byte offsets to resume against.
         // reqwest is built without decompression here, so this only fires
         // when a server encodes anyway: fall back to whole-file transfers.
@@ -552,6 +630,13 @@ pub async fn download_entry(
             }
         }
 
+        // Capture validators as soon as the response is in, so a probe can
+        // decide on segmentation from them.
+        progress.capture_validators(resp.headers());
+        if was_probe {
+            probe_pending = false;
+        }
+
         // A file link that answers HTML is a viewer/login wall, not the
         // file (this once saved release pages as APKs). Refuse loudly.
         let content_type = resp
@@ -596,12 +681,125 @@ pub async fn download_entry(
             }
         }
 
+        // Segmented downloading: a probe that came back as a valid 206 with a
+        // usable length, validators and enough connection budget. Anything
+        // else falls through to the sequential path below.
+        if was_probe && status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let total = progress.total;
+            let active = load_state()
+                .map(|s| {
+                    s.downloads
+                        .iter()
+                        .filter(|d| d.status == Status::Downloading)
+                        .count()
+                })
+                .unwrap_or(1);
+            let share = segment::segment_share(active);
+            if segment::eligible(total, share) {
+                // Preallocate the part file and write the manifest.
+                let n = segment::segment_count(total, share);
+                let boundaries = segment::segment_ranges(total, n);
+                let manifest = segment::SegmentManifest {
+                    version: segment::MANIFEST_VERSION,
+                    url: url.clone(),
+                    total,
+                    etag: progress.etag.clone(),
+                    last_modified: progress.last_modified.clone(),
+                    segments: boundaries,
+                    created_at: crate::state::now_secs(),
+                    updated_at: crate::state::now_secs(),
+                };
+                if let Err(e) = (|| -> Result<()> {
+                    let pf = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&part)?;
+                    pf.set_len(total)?;
+                    Ok(())
+                })() {
+                    eprintln!("catch: {id} cannot preallocate part: {e:#}");
+                } else {
+                    if segment::save_manifest_atomic(&part, &manifest).is_ok() {
+                        update_state(|state| {
+                            if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
+                                d.total = total;
+                                d.etag = progress.etag.clone();
+                                d.last_modified = progress.last_modified.clone();
+                                d.filename = dest_name.clone();
+                            }
+                            Ok(())
+                        })?;
+                        let outcome = segment::run_segmented(
+                            id,
+                            &url,
+                            &client,
+                            &part,
+                            total,
+                            progress.etag.clone(),
+                            progress.last_modified.clone(),
+                            manifest,
+                            share,
+                        )
+                        .await;
+                        match outcome? {
+                            segment::SegmentedResult::Complete { manifest } => {
+                                segment::remove_manifest(&part);
+                                return finish(Finish {
+                                    id,
+                                    url: &url,
+                                    dir: &dir,
+                                    dest_name: &dest_name,
+                                    part: &part,
+                                    bytes: manifest.total,
+                                    total: Some(manifest.total),
+                                    overwrite,
+                                    base: &base,
+                                })
+                                .await;
+                            }
+                            segment::SegmentedResult::Paused => {
+                                note_paused(id, &progress);
+                                return Ok(part.clone());
+                            }
+                            segment::SegmentedResult::Stopped => {
+                                std::fs::remove_file(&part).ok();
+                                segment::remove_manifest(&part);
+                                eprintln!("catch: {id} stopped");
+                                anyhow::bail!("{id} stopped");
+                            }
+                            segment::SegmentedResult::Fallback(reason) => {
+                                eprintln!(
+                                    "catch: {id} segmented download fell back to sequential: {reason}"
+                                );
+                                segment::remove_manifest(&part);
+                                let _ = std::fs::remove_file(&part);
+                                progress.bytes = 0;
+                                progress.total = 0;
+                                progress.etag.clear();
+                                progress.last_modified.clear();
+                                probe_pending = false;
+                                drop(resp);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Small file or squeezed budget: drop the probe and run the
+                // ordinary sequential path from scratch.
+                probe_pending = false;
+                progress.bytes = 0;
+                drop(resp);
+                continue;
+            }
+        }
+
         let resumed = progress.bytes > 0;
         if !resumed {
             let announced = resp.content_length().unwrap_or(0);
             progress.total = announced;
         }
-        progress.capture_validators(resp.headers());
         update_state(|state| {
             if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
                 d.total = progress.total;
@@ -663,6 +861,7 @@ pub async fn download_entry(
             }
             StreamEnd::Aborted => {
                 std::fs::remove_file(&part).ok();
+                segment::remove_manifest(&part);
                 eprintln!("catch: {id} stopped");
                 anyhow::bail!("{id} stopped");
             }
@@ -978,7 +1177,7 @@ async fn stream_one_connection(
 /// only replaced by an explicit `overwrite`, the row and the saved-file
 /// index are updated in one locked write, and a cancelled row is never
 /// reported as done.
-struct Finish<'a> {
+pub(crate) struct Finish<'a> {
     id: &'a str,
     url: &'a str,
     dir: &'a std::path::Path,
@@ -990,7 +1189,7 @@ struct Finish<'a> {
     base: &'a std::path::Path,
 }
 
-async fn finish(f: Finish<'_>) -> Result<PathBuf> {
+pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
     let Finish {
         id,
         url,
