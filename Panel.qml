@@ -708,13 +708,15 @@ Panel {
         anchors.fill: parent
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
-        // What the popup looked like when the press landed. A press outside
-        // closes it, so if the state no longer matches, this press was the
-        // one that dismissed it — do nothing, or it would spring back open.
+        // What the popup looked like when the press landed. Close it on the
+        // press itself so an outside click can never reopen it on release.
         property bool wasOpen: false
-        onPressed: wasOpen = drop.opened
+        onPressed: {
+          wasOpen = drop.opened
+          if (wasOpen) drop.close()
+        }
         onClicked: {
-          if (!root.dropdownClickToggles(wasOpen, drop.opened)) return
+          if (wasOpen) return
           dd.toggle()
         }
       }
