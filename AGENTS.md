@@ -8,7 +8,9 @@ Catch is an Omarchy shell plugin plus a Rust download backend. The queue, the by
 | --- | --- |
 | `crates/catch/src/main.rs` | CLI commands, add/catch handoff, worker entry points |
 | `crates/catch/src/download.rs` | HTTP engine: deadlines, retry/resume, Range and validators, finalize |
-| `crates/catch/src/segment.rs` | Segmented downloads: probe, range math, manifest, positioned writes, resume |
+| `crates/catch/src/segment.rs` | Segmented downloads: probe, range math, manifest, positioned writes, resume, adaptive splitting |
+| `crates/catch/src/conns.rs` | Cross-process connection budget and per-host limits (`connections.json`) |
+| `crates/catch/src/throttle.rs` | Per-worker token bucket for the global bandwidth cap |
 | `crates/catch/src/video.rs` | yt-dlp worker, bounded output capture, process-group stop |
 | `crates/catch/src/state.rs` | JSON state, locks and claims, filenames, saved index, drain marker |
 | `crates/catch/src/native_host.rs` | Chrome/Firefox native messaging loop and batching |
@@ -67,6 +69,8 @@ Working in one area but needing behavior from another loads that area's skills t
 - Preserve documented duplicate/replace semantics, the saved index, and download-directory rules unless a change is deliberate and documented.
 - State writes stay atomic, cross-process, and forward-compatible: unknown JSON keys pass through, malformed state is quarantined, and old fields keep loading.
 - Download correctness comes before throughput: monotonic deadlines, bounded retries, no retry of permanent errors, strict `Content-Range`/`206`/`416`/`If-Range` handling, and no splicing different representations.
+- Stop, pause, and remove stay distinct: stop/pause keep the partial file and its manifest so the bytes can be resumed; only `remove` deletes partial data. A worker is never allowed to delete a `.part` file on abort, and a preallocated part with a missing, corrupt, or mismatched manifest is quarantined, never treated as complete data.
+- A pinned `--sha256` is verified before the final file is published; a mismatch removes the bad bytes and fails the row. `refresh` may only reuse partial data when the replacement URL proves to be the same representation (equal length plus matching validators); anything else refuses without `--force`.
 - Browser hints, URL tails, and `Content-Disposition` names are untrusted. Sanitize to one path segment and truncate on a UTF-8 boundary.
 - Native host diagnostics never go to stdout, acknowledgements wait for acceptance, and one download must not acquire two workers.
 - After any `crates/` change, run `bin/refresh-dist` and commit both shipped binaries. Never hand-edit `bin/dist`.
