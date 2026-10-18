@@ -708,15 +708,12 @@ Panel {
         anchors.fill: parent
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
-        // What the popup looked like when the press landed. Close it on the
-        // press itself so an outside click can never reopen it on release.
-        property bool wasOpen: false
-        onPressed: {
-          wasOpen = drop.opened
-          if (wasOpen) drop.close()
-        }
+        // A press that closes an open popup must not reopen it on release.
+        property bool justClosed: false
+        onOpened: justClosed = false
+        onClosed: justClosed = true
         onClicked: {
-          if (wasOpen) return
+          if (justClosed) { justClosed = false; return }
           dd.toggle()
         }
       }
