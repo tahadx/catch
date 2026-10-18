@@ -90,6 +90,10 @@ function ask(msg, cb) {
 // The host accepts all of a chunk under a single state lock and wakes one
 // drainer, so a thousand-link page is cheap.
 const BATCH_LIMIT = 200;
+// Build batches by serialized UTF-8 size, not only by count: a handful of
+// very long URLs can exceed Chromium's 1 MiB native-messaging limit even
+// with few items. Leave a safe margin.
+const BATCH_BYTE_LIMIT = 900 * 1024;
 
 function markUnreachable() {
   try {
@@ -137,10 +141,16 @@ function copyUrl(url) {
 function sendAll(urls) {
   const seen = new Set();
   let batch = [];
+  let batchSize = 0;
+  const serializedSize = (items) => {
+    try { return new TextEncoder().encode(JSON.stringify({ urls: items })).length; }
+    catch (e) { return items.length * 256; }
+  };
   const flush = () => {
     if (batch.length === 0) return;
     const chunk = batch;
     batch = [];
+    batchSize = 0;
     ask({ urls: chunk }, (reply) => {
       if (!reply || !reply.ok) markUnreachable();
       else clearUnreachable();
@@ -150,8 +160,13 @@ function sendAll(urls) {
     const clean = httpUrl(u);
     if (!clean || seen.has(clean)) continue;
     seen.add(clean);
+    const candidate = batch.concat([clean]);
+    const candidateSize = serializedSize(candidate);
+    if (batch.length > 0 && (batch.length >= BATCH_LIMIT || candidateSize > BATCH_BYTE_LIMIT)) {
+      flush();
+    }
     batch.push(clean);
-    if (batch.length >= BATCH_LIMIT) flush();
+    batchSize = serializedSize(batch);
   }
   flush();
 }

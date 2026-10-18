@@ -67,11 +67,6 @@ fn now_secs() -> u64 {
     crate::state::now_secs()
 }
 
-fn remove_both(part: &Path, meta: &Path) {
-    let _ = std::fs::remove_file(meta);
-    let _ = std::fs::remove_file(part);
-}
-
 pub fn load_manifest(part: &Path, url: &str) -> Result<Option<SegmentManifest>> {
     let meta = manifest_path(part);
     if !meta.exists() {
@@ -79,36 +74,68 @@ pub fn load_manifest(part: &Path, url: &str) -> Result<Option<SegmentManifest>> 
     }
     let text = match std::fs::read_to_string(&meta) {
         Ok(t) => t,
-        Err(_) => {
-            remove_both(part, &meta);
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            // Transient I/O error (permission, etc.): do not destroy data.
+            eprintln!("catch: cannot read manifest {}: {e}", meta.display());
             return Ok(None);
         }
     };
     let m: SegmentManifest = match serde_json::from_str(&text) {
         Ok(m) => m,
-        Err(_) => {
-            remove_both(part, &meta);
+        Err(e) => {
+            eprintln!(
+                "catch: corrupt manifest {}: {e}; quarantining part",
+                meta.display()
+            );
+            let _ = std::fs::remove_file(&meta);
+            quarantine_part(part);
             return Ok(None);
         }
     };
-    if m.version != MANIFEST_VERSION || m.url != url || m.total == 0 || m.segments.is_empty() {
-        remove_both(part, &meta);
-        return Ok(None);
-    }
-    if !validate_coverage(&m.segments, m.total) {
-        remove_both(part, &meta);
+    if m.version != MANIFEST_VERSION
+        || m.url != url
+        || m.total == 0
+        || m.segments.is_empty()
+        || !validate_coverage(&m.segments, m.total)
+    {
+        eprintln!(
+            "catch: incompatible manifest {}; quarantining part",
+            meta.display()
+        );
+        let _ = std::fs::remove_file(&meta);
+        quarantine_part(part);
         return Ok(None);
     }
     if !part.is_file() {
         let _ = std::fs::remove_file(&meta);
         return Ok(None);
     }
-    let plen = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+    let plen = match std::fs::metadata(part) {
+        Ok(md) => md.len(),
+        Err(e) => {
+            eprintln!("catch: cannot stat part {}: {e}", part.display());
+            return Ok(None);
+        }
+    };
     if plen != m.total {
-        remove_both(part, &meta);
+        eprintln!(
+            "catch: part size mismatch ({} vs {}); quarantining part",
+            plen, m.total
+        );
+        let _ = std::fs::remove_file(&meta);
+        quarantine_part(part);
         return Ok(None);
     }
     Ok(Some(m))
+}
+
+fn quarantine_part(part: &Path) {
+    if !part.is_file() {
+        return;
+    }
+    let q = part.with_extension(format!("part.quarantined-{}", crate::state::now_secs()));
+    let _ = std::fs::rename(part, &q);
 }
 
 fn validate_coverage(segs: &[SegmentRange], total: u64) -> bool {
@@ -139,9 +166,16 @@ pub fn save_manifest_atomic(part: &Path, m: &SegmentManifest) -> Result<()> {
     let text = serde_json::to_string_pretty(m)?;
     std::fs::write(&tmp, &text).with_context(|| format!("write {}", tmp.display()))?;
     let f = std::fs::OpenOptions::new().write(true).open(&tmp)?;
-    let _ = f.sync_data();
+    f.sync_data()
+        .with_context(|| format!("sync {}", tmp.display()))?;
     drop(f);
     std::fs::rename(&tmp, &meta).with_context(|| format!("rename to {}", meta.display()))?;
+    // Best-effort directory sync for crash durability of the rename.
+    if let Some(parent) = meta.parent() {
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -253,18 +287,30 @@ enum Directive {
     Keep,
     StandDown,
     Abort,
+    /// State could not be read; preserve data and keep going.
+    Unknown,
 }
 
 fn read_directive(id: &str) -> Directive {
-    match crate::state::load_state().ok().and_then(|s| {
-        s.downloads
-            .into_iter()
-            .find(|d| d.id == id)
-            .map(|d| d.status)
-    }) {
+    let state = match crate::state::load_state() {
+        Ok(s) => s,
+        Err(_) => return Directive::Unknown,
+    };
+    match state
+        .downloads
+        .into_iter()
+        .find(|d| d.id == id)
+        .map(|d| d.status)
+    {
         Some(Status::Downloading) => Directive::Keep,
         Some(Status::Paused) => Directive::StandDown,
-        _ => Directive::Abort,
+        Some(_) => Directive::Abort,
+        None => {
+            // Row gone: could be removed (Abort) or state unreadable. We
+            // already read state successfully, so treat missing row as
+            // cancelled/removed.
+            Directive::Abort
+        }
     }
 }
 
@@ -361,8 +407,9 @@ pub async fn run_segmented(
                         cancel.store(2, Ordering::Relaxed);
                     }
                     Some(Ok(Err(SegError::Interrupted(why)))) => {
-                        // A segment's connection died and exhausted... actually Interrupted is per-attempt; run_one_segment retries internally.
-                        // If we see it here, attempts exhausted → treat as fatal.
+                        // A segment exhausted its retry budget on body-stream
+                        // failures (inactivity, premature EOF, oversized body).
+                        // Treat as fatal: stop the other segments and fail.
                         if first_fatal.is_none() { first_fatal = Some(why); }
                         cancel.store(2, Ordering::Relaxed);
                     }
@@ -383,7 +430,7 @@ pub async fn run_segmented(
             match read_directive(id) {
                 Directive::StandDown => cancel.store(1, Ordering::Relaxed),
                 Directive::Abort => cancel.store(2, Ordering::Relaxed),
-                Directive::Keep => {}
+                Directive::Keep | Directive::Unknown => {}
             }
         }
 
@@ -471,6 +518,95 @@ async fn flush_progress(
 }
 
 // ---------- one segment ----------
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_one_segment_body<S>(
+    stream: &mut S,
+    buf: &mut tokio::io::BufWriter<&mut tokio::fs::File>,
+    cancel: &AtomicU8,
+    remaining: u64,
+    written_shared: &AtomicU64,
+    base_written: u64,
+    i: usize,
+    part: &Path,
+) -> Result<u64, SegError>
+where
+    S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let mut last_data = Instant::now();
+    let mut attempt_bytes: u64 = 0;
+    loop {
+        if cancel.load(Ordering::Relaxed) != 0 {
+            let _ = buf.flush().await;
+            return Ok(0);
+        }
+        if attempt_bytes >= remaining {
+            break;
+        }
+        let limit = stall_timeout();
+        let idle = last_data.elapsed();
+        if idle >= limit {
+            let _ = buf.flush().await;
+            return Err(SegError::Interrupted(format!(
+                "segment {i}: no data for {}s",
+                idle.as_secs()
+            )));
+        }
+        let wait = limit - idle;
+        let next = tokio::select! {
+            biased;
+            chunk = stream.next() => Some(chunk),
+            () = tokio::time::sleep(wait.min(crate::download::STOP_POLL)) => None,
+        };
+        let chunk = match next {
+            None => continue,
+            Some(Some(Ok(c))) => c,
+            Some(Some(Err(e))) => {
+                let _ = buf.flush().await;
+                return Err(SegError::Interrupted(format!("segment {i}: {e:#}")));
+            }
+            Some(None) => {
+                let _ = buf.flush().await;
+                if attempt_bytes < remaining {
+                    return Err(SegError::Interrupted(format!(
+                        "segment {i}: body ended at {} of {} bytes",
+                        attempt_bytes, remaining
+                    )));
+                }
+                break;
+            }
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        let space = remaining - attempt_bytes;
+        if (chunk.len() as u64) > space {
+            let to_write = space as usize;
+            if to_write > 0 && buf.write_all(&chunk[..to_write]).await.is_err() {
+                let _ = buf.flush().await;
+                return Err(SegError::Fatal(format!("write {}", part.display())));
+            }
+            let _ = buf.flush().await;
+            return Err(SegError::Interrupted(format!(
+                "segment {i}: server sent extra bytes"
+            )));
+        }
+        if buf.write_all(&chunk).await.is_err() {
+            let _ = buf.flush().await;
+            return Err(SegError::Fatal(format!("write {}", part.display())));
+        }
+        attempt_bytes += chunk.len() as u64;
+        written_shared.store(base_written + attempt_bytes, Ordering::Relaxed);
+        if !chunk.is_empty() {
+            last_data = Instant::now();
+        }
+    }
+    if let Err(e) = buf.flush().await {
+        return Err(SegError::Fatal(format!("flush {}: {e}", part.display())));
+    }
+    Ok(attempt_bytes)
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn run_one_segment(
@@ -646,99 +782,47 @@ async fn run_one_segment(
             }
             let mut buf = tokio::io::BufWriter::with_capacity(256 * 1024, &mut file);
             let mut stream = resp.bytes_stream();
-            let mut last_data = Instant::now();
-            let mut attempt_bytes: u64 = 0;
             let remaining = seg_len - in_seg;
-            let mut oversized = false;
-            loop {
-                if cancel.load(Ordering::Relaxed) != 0 {
-                    let _ = buf.flush().await;
-                    return Ok(());
-                }
-                if attempt_bytes >= remaining {
-                    break;
-                }
-                let limit = stall_timeout();
-                let idle = last_data.elapsed();
-                if idle >= limit {
-                    let _ = buf.flush().await;
-                    return Err(SegError::Interrupted(format!(
-                        "segment {i}: no data for {}s",
-                        idle.as_secs()
-                    )));
-                }
-                let wait = limit - idle;
-                let next = tokio::select! {
-                    biased;
-                    chunk = stream.next() => Some(chunk),
-                    () = tokio::time::sleep(wait.min(crate::download::STOP_POLL)) => None,
-                };
-                let chunk = match next {
-                    None => continue,
-                    Some(Some(Ok(c))) => c,
-                    Some(Some(Err(e))) => {
-                        let _ = buf.flush().await;
-                        return Err(SegError::Interrupted(format!("segment {i}: {e:#}")));
-                    }
-                    Some(None) => {
-                        let _ = buf.flush().await;
-                        if attempt_bytes < remaining {
-                            return Err(SegError::Interrupted(format!(
-                                "segment {i}: body ended at {} of {} bytes",
-                                attempt_bytes, remaining
-                            )));
-                        }
-                        break;
-                    }
-                };
-                if chunk.is_empty() {
-                    continue;
-                }
-                let space = remaining - attempt_bytes;
-                if (chunk.len() as u64) > space {
-                    // oversized body: protocol violation
-                    let to_write = space as usize;
-                    if to_write > 0 {
-                        if buf.write_all(&chunk[..to_write]).await.is_err() {
-                            let _ = buf.flush().await;
-                            return Err(SegError::Fatal(format!("write {}", part.display())));
-                        }
-                        attempt_bytes += to_write as u64;
-                    }
-                    let _ = buf.flush().await;
-                    oversized = true;
-                    break;
-                }
-                if buf.write_all(&chunk).await.is_err() {
-                    let _ = buf.flush().await;
-                    return Err(SegError::Fatal(format!("write {}", part.display())));
-                }
-                attempt_bytes += chunk.len() as u64;
-                written[i].store(in_seg + attempt_bytes, Ordering::Relaxed);
-                if !chunk.is_empty() {
-                    last_data = Instant::now();
-                }
-            }
+            let body_result = stream_one_segment_body(
+                &mut stream,
+                &mut buf,
+                &cancel,
+                remaining,
+                &written[i],
+                in_seg,
+                i,
+                &part,
+            )
+            .await;
             let _ = buf.shutdown().await;
             drop(buf);
             drop(file);
 
-            if oversized {
-                return Err(SegError::Interrupted(format!(
-                    "segment {i}: server sent extra bytes"
-                )));
+            match body_result {
+                Ok(attempt_bytes) => {
+                    in_seg += attempt_bytes;
+                    written[i].store(in_seg, Ordering::Relaxed);
+                }
+                Err(SegError::Interrupted(why)) => {
+                    if cancel.load(Ordering::Relaxed) != 0 {
+                        return Ok(());
+                    }
+                    let wait = backoff(attempts);
+                    eprintln!(
+                        "catch: segment {i}: {why}; retry in {:.1}s",
+                        wait.as_secs_f64()
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                Err(other) => return Err(other),
             }
-            if attempt_bytes < remaining {
-                // shouldn't reach here except via break with full remaining
+            if in_seg < seg_len {
+                // partial result: retry the remaining bytes
+                continue;
             }
-            in_seg += attempt_bytes;
-            written[i].store(in_seg, Ordering::Relaxed);
-            // if we got all bytes for this segment, done
-            if in_seg >= seg_len {
-                break;
-            }
-            // otherwise retry the rest
-            continue;
+            // segment complete
+            break;
         } else if status == reqwest::StatusCode::OK {
             return Err(SegError::Fallback(format!(
                 "segment {i}: server answered 200 to a ranged request"
@@ -769,8 +853,15 @@ async fn run_one_segment(
 
     // durably commit: sync the file, then the manifest
     let f = std::fs::OpenOptions::new().write(true).open(&part);
-    if let Ok(f) = f {
-        let _ = f.sync_data();
+    match f {
+        Ok(f) => {
+            if let Err(e) = f.sync_data() {
+                return Err(SegError::Fatal(format!("sync {}: {e}", part.display())));
+            }
+        }
+        Err(e) => {
+            return Err(SegError::Fatal(format!("open {}: {e}", part.display())));
+        }
     }
     {
         let mut m = manifest.lock().unwrap();

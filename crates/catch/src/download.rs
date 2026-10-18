@@ -254,15 +254,18 @@ impl DirectiveWatch {
                 return d;
             }
         }
-        let directive = match load_state().ok().and_then(|s| {
-            s.downloads
+        let directive = match load_state() {
+            Err(_) => Directive::Keep, // state unreadable: preserve data, keep going
+            Ok(s) => match s
+                .downloads
                 .into_iter()
                 .find(|d| d.id == id)
                 .map(|d| d.status)
-        }) {
-            Some(Status::Downloading) => Directive::Keep,
-            Some(Status::Paused) => Directive::StandDown,
-            _ => Directive::Abort,
+            {
+                Some(Status::Downloading) => Directive::Keep,
+                Some(Status::Paused) => Directive::StandDown,
+                _ => Directive::Abort,
+            },
         };
         self.stamp = stamp;
         self.directive = Some(directive);
@@ -379,7 +382,70 @@ pub async fn download_entry(
     // Only probe when segmentation is even possible: a cap of 1 disables it,
     // and probing would only add a wasted request per file.
     let mut probe_pending = progress.bytes == 0 && segment::segments_cap() >= 2;
+
+    // Recoverable finalization: a previous run may have renamed the part to
+    // its destination but crashed before updating queue state. Complete that
+    // update now instead of creating a second copy.
+    let intent_path = PathBuf::from(format!("{}.finalizing", part.display()));
+    if intent_path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&intent_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(dest_str) = v.get("dest").and_then(|x| x.as_str()) {
+                    let dest = PathBuf::from(dest_str);
+                    if dest.is_file() {
+                        let final_name = dest
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                        let _ = update_state(|state| {
+                            if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
+                                if d.status == Status::Downloading {
+                                    d.status = Status::Done;
+                                    d.bytes = size;
+                                    d.total = size.max(recorded_total);
+                                    d.filename = final_name.clone();
+                                    d.error.clear();
+                                    d.pid = 0;
+                                    d.claimed_at = 0;
+                                }
+                            }
+                            crate::state::record_saved(
+                                state,
+                                &url,
+                                &base,
+                                &dest,
+                                crate::state::DownloadKind::File,
+                            );
+                            Ok(())
+                        });
+                        let _ = std::fs::remove_file(&intent_path);
+                        crate::state::spawn_drain();
+                        return Ok(dest);
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&intent_path);
+    }
+
     if let Some(manifest) = segment::load_manifest(&part, &url)? {
+        // Reconcile validators: prefer queue state, fall back to the
+        // manifest (which may have survived a crash that lost the queue
+        // update). The manifest must not silently lose its identity.
+        let etag = if progress.etag.is_empty() {
+            manifest.etag.clone()
+        } else {
+            progress.etag.clone()
+        };
+        let last_modified = if progress.last_modified.is_empty() {
+            manifest.last_modified.clone()
+        } else {
+            progress.last_modified.clone()
+        };
+        progress.etag = etag.clone();
+        progress.last_modified = last_modified.clone();
+
         let active = load_state()
             .map(|s| {
                 s.downloads
@@ -395,13 +461,28 @@ pub async fn download_entry(
             &client,
             &part,
             manifest.total,
-            progress.etag.clone(),
-            progress.last_modified.clone(),
+            etag,
+            last_modified,
             manifest,
             share,
         )
         .await;
-        match outcome? {
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = mark_error(id, &format!("{e:#}"));
+                let _ = update_state(|state| {
+                    if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
+                        d.pid = 0;
+                        d.claimed_at = 0;
+                    }
+                    Ok(())
+                });
+                crate::state::spawn_drain();
+                return Err(e);
+            }
+        };
+        match outcome {
             segment::SegmentedResult::Complete { manifest } => {
                 segment::remove_manifest(&part);
                 return finish(Finish {
@@ -731,7 +812,9 @@ pub async fn download_entry(
                 })
                 .unwrap_or(1);
             let share = segment::segment_share(active);
-            if segment::eligible(total, share) {
+            if segment::eligible(total, share)
+                && (!progress.etag.is_empty() || !progress.last_modified.is_empty())
+            {
                 // Preallocate the part file and write the manifest.
                 let n = segment::segment_count(total, share);
                 let boundaries = segment::segment_ranges(total, n);
@@ -778,7 +861,23 @@ pub async fn download_entry(
                             share,
                         )
                         .await;
-                        match outcome? {
+                        let outcome = match outcome {
+                            Ok(o) => o,
+                            Err(e) => {
+                                let _ = mark_error(id, &format!("{e:#}"));
+                                let _ = update_state(|state| {
+                                    if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id)
+                                    {
+                                        d.pid = 0;
+                                        d.claimed_at = 0;
+                                    }
+                                    Ok(())
+                                });
+                                crate::state::spawn_drain();
+                                return Err(e);
+                            }
+                        };
+                        match outcome {
                             segment::SegmentedResult::Complete { manifest } => {
                                 segment::remove_manifest(&part);
                                 return finish(Finish {
@@ -1240,18 +1339,24 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
 
     // Race safety: if the row is already cancelled or removed, do not publish
     // a final file. Remove the part and bail.
-    let alive = crate::state::with_lock(|| {
+    let alive_result = crate::state::with_lock(|| {
         let state = crate::state::load_state()?;
         Ok(state
             .downloads
             .iter()
             .any(|d| d.id == id && d.status == Status::Downloading))
-    })
-    .unwrap_or(false);
-    if !alive {
-        let _ = std::fs::remove_file(part);
-        segment::remove_manifest(part);
-        anyhow::bail!("{id} stopped");
+    });
+    match alive_result {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = std::fs::remove_file(part);
+            segment::remove_manifest(part);
+            anyhow::bail!("{id} stopped");
+        }
+        Err(e) => {
+            // State unreadable: preserve partial data and report.
+            anyhow::bail!("{id}: could not verify ownership: {e:#}");
+        }
     }
 
     let held = std::fs::metadata(part)
@@ -1274,6 +1379,13 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
     } else {
         dest
     };
+    // Intent record for recoverable finalization: written before the rename.
+    let intent_path = PathBuf::from(format!("{}.finalizing", part.display()));
+    let _ = std::fs::write(
+        &intent_path,
+        serde_json::json!({"dest": dest.display().to_string(), "url": url}).to_string(),
+    );
+
     tokio::fs::rename(part, &dest)
         .await
         .with_context(|| format!("move to {}", dest.display()))?;
@@ -1314,8 +1426,10 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
             let _ = std::fs::remove_file(safe);
         }
         let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&intent_path);
         anyhow::bail!("{id} stopped");
     }
+    let _ = std::fs::remove_file(&intent_path);
     eprintln!("catch: done {} -> {}", id, dest.display());
     crate::state::spawn_drain();
     Ok(dest)
