@@ -1717,7 +1717,7 @@ Panel {
                           Text {
                             width: parent.width
                             textFormat: Text.PlainText
-                            text: Model.rowMeta(card.entry) + root.speedFor(card.entry.id) + root.etaFor(card.entry.id)
+                            text: Model.rowMeta(card.entry) + (card._busy && root.fraction(card.entry) > 0 ? " · " + Math.floor(root.fraction(card.entry) * 100) + "%" : "") + root.speedFor(card.entry.id) + root.etaFor(card.entry.id)
                             color: root.dim
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.body
@@ -1803,34 +1803,22 @@ Panel {
                         }
                       }
 
-                      // Progress: a visible bar with a percentage readout, IDM-style.
+                      // Progress bar: a clean, visible fill, IDM-style.
                       Rectangle {
                         width: parent.width
-                        height: 6
-                        radius: 3
+                        height: 5
+                        radius: 2.5
                         visible: card._busy
                         color: Util.alpha(root.dim, 0.22)
 
                         Rectangle {
                           width: parent.width * root.fraction(card.entry)
                           height: parent.height
-                          radius: 3
+                          radius: 2.5
                           color: card.status === "error" ? root.urgent : root.accent
                           Behavior on width {
                             NumberAnimation { duration: 250; easing.type: Easing.OutCubic }
                           }
-                        }
-
-                        Text {
-                          anchors.right: parent.right
-                          anchors.rightMargin: Style.spacing.sm
-                          anchors.verticalCenter: parent.verticalCenter
-                          visible: root.fraction(card.entry) > 0
-                          text: Math.floor(root.fraction(card.entry) * 100) + "%"
-                          color: "#ffffff"
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
-                          font.bold: true
                         }
                       }
 
@@ -1839,20 +1827,21 @@ Panel {
                       // approximated by overall fraction), or pending (dim).
                       Row {
                         width: parent.width
-                        height: 4
+                        height: 3
                         spacing: 2
                         visible: card._busy && card.entry.segments && Number(card.entry.segments.total) > 1
+
                         Repeater {
                           model: card.entry.segments ? Number(card.entry.segments.total) : 0
                           delegate: Rectangle {
                             width: (parent.width - (Number(card.entry.segments.total) - 1) * 2) / Number(card.entry.segments.total)
                             height: parent.height
-                            radius: 1
+                            radius: 1.5
                             color: {
                               var done = Number(card.entry.segments.done) || 0
                               if (index < done) return root.accent
-                              if (index === done) return Util.alpha(root.accent, 0.45)
-                              return Util.alpha(root.dim, 0.25)
+                              if (index === done) return Util.alpha(root.accent, 0.55)
+                              return Util.alpha(root.dim, 0.18)
                             }
                           }
                         }
