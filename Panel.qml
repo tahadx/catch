@@ -626,6 +626,8 @@ Panel {
 
     implicitHeight: trigger.implicitHeight
     implicitWidth: Style.spacing.dropdownWidth
+    activeFocusOnTab: true
+    focus: true
 
     function optionValue(o) {
       return (o && typeof o === "object") ? String(o.value) : String(o)
@@ -762,8 +764,22 @@ Panel {
         }
         onClosed: { hit.justClosed = true; dd.popupToggled(false) }
 
+        Keys.onPressed: function (event) {
+          var t = event.text || ""
+          if (event.key === Qt.Key_Escape || t === "h") {
+            drop.close(); event.accepted = true
+          } else if (event.key === Qt.Key_Down || t === "j") {
+            list.currentIndex = Math.min(dd.options.length - 1, list.currentIndex + 1); event.accepted = true
+          } else if (event.key === Qt.Key_Up || t === "k") {
+            list.currentIndex = Math.max(0, list.currentIndex - 1); event.accepted = true
+          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || t === "l") {
+            dd.selectCurrent(); event.accepted = true
+          }
+        }
+
         contentItem: ListView {
           id: list
+          focus: true
           spacing: Style.spacing.labelGap
           clip: true
           implicitHeight: contentHeight
