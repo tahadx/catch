@@ -1779,14 +1779,17 @@ Panel {
                           // Stop ends a live transfer and keeps the row, so it
                           // can be re-queued. A cancelled entry resolves to an
                           // abort inside the backend on its next poll.
+                          // One toggle: stop while a transfer is live, play
+                          // (resume) once it has been stopped. Never an exit
+                          // icon here.
                           PanelActionButton {
-                            visible: root.stoppable(card.entry)
-                            iconText: "󰗼"
-                            tooltipText: "Stop (x), keeps the row"
-                            foreground: root.urgent
-                            hoverColor: root.urgent
+                            visible: root.stoppable(card.entry) || root.resumable(card.entry)
+                            iconText: root.stoppable(card.entry) ? "󰓛" : "󰐊"
+                            tooltipText: root.stoppable(card.entry) ? "Stop (x), keeps the row" : "Resume (p)"
+                            foreground: root.stoppable(card.entry) ? root.urgent : root.accent
+                            hoverColor: root.stoppable(card.entry) ? root.urgent : root.accent
                             fontFamily: root.fontFamily
-                            onClicked: root.cancelEntry(card.did)
+                            onClicked: root.stoppable(card.entry) ? root.cancelEntry(card.did) : root.resumeEntry(card.did)
                           }
 
                           // Remove drops the row and keeps the file. On a live
