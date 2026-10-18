@@ -175,7 +175,12 @@ async fn main() -> Result<()> {
                 catch_now(&url, dir.as_deref(), video, audio, true).await?;
             }
         }
-        Command::Enqueue { url, video, audio, again } => {
+        Command::Enqueue {
+            url,
+            video,
+            audio,
+            again,
+        } => {
             // `--again` forces a fresh, independent download (used by
             // "Download again anyway"): it clears any pending duplicate
             // question and never reuses the active row.
