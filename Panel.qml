@@ -260,6 +260,12 @@ Panel {
     return n
   }
 
+  function currentSegments() {
+    var n = parseInt(root.setting("segments", 4), 10)
+    if (n !== 1 && n !== 2 && n !== 4 && n !== 8) n = 4
+    return n
+  }
+
   // Values arrive as arguments because content-scoped field ids are not
   // visible from root scope (see textEditing above).
   function saveSchedule(a, b) {
@@ -956,7 +962,8 @@ Panel {
       status: String(it.status || "queued"),
       bytes: Number(it.bytes) || 0,
       total: Number(it.total) || 0,
-      error: String(it.error || "")
+      error: String(it.error || ""),
+      segments: it.segments || null
     }
   }
 
@@ -970,6 +977,7 @@ Panel {
     if (cur.total !== obj.total) queueModel.setProperty(i, "total", obj.total)
     if (cur.error !== obj.error) queueModel.setProperty(i, "error", obj.error)
     if (cur.url !== obj.url) queueModel.setProperty(i, "url", obj.url)
+    if (cur.segments !== obj.segments) queueModel.setProperty(i, "segments", obj.segments)
   }
 
   function syncModel(items) {
@@ -2314,6 +2322,50 @@ Panel {
                             root.writeSetting("maxParallel", parseInt(v, 10))
                           }
                         }
+                      }
+
+                      RowLayout {
+                        id: segmentsRow
+                        width: parent.width
+                        spacing: Style.spacing.xl
+
+                        Text {
+                          text: "Download segments"
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.body
+                        }
+
+                        Item { Layout.fillWidth: true; height: 1 }
+
+                        PanelDropdown {
+                          id: segmentsDrop
+                          spaceItem: contentScroll
+                          spaceHeight: contentScroll.height
+                          Layout.preferredWidth: Style.space(140)
+                          Layout.preferredHeight: Style.space(30)
+                          Layout.alignment: Qt.AlignVCenter
+                          foreground: root.foreground
+                          accent: root.accent
+                          options: ["1", "2", "4", "8"]
+                          value: "" + root.currentSegments()
+                          onPopupToggled: function (isOpen) {
+                            root.noteDropdown("segments", isOpen, function () { segmentsDrop.close() })
+                            if (!isOpen) keyCatcher.release()
+                          }
+                          onPicked: function (v) {
+                            root.writeSetting("segments", parseInt(v, 10))
+                          }
+                        }
+                      }
+
+                      Text {
+                        width: parent.width
+                        text: "1 disables segmented downloads; larger files download faster on servers that support byte ranges."
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
                       }
 
                       // NOT READY: parking the machine once the queue empties needs the same

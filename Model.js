@@ -55,7 +55,8 @@ function parse(text) {
       status: String(d.status || "queued"),
       bytes: Number(d.bytes) || 0,
       total: Number(d.total) || 0,
-      error: String(d.error || "")
+      error: String(d.error || ""),
+      segments: (d.segments && typeof d.segments === "object") ? d.segments : null
     })
   }
   return { version: 1, downloads: out, saved: saved, asks: parseAsks(data) }
@@ -220,6 +221,10 @@ function rowMeta(d) {
   if (bytes > 0 && total > bytes) parts.push(formatBytes(bytes) + " / " + formatBytes(total))
   else if (bytes > 0) parts.push(formatBytes(bytes))
   else parts.push(statusLabel(status))
+  if (d && d.segments && Number(d.segments.total) > 1) {
+    var sdone = Number(d.segments.done) || 0
+    parts.push(sdone + "/" + d.segments.total + " seg")
+  }
   return parts.join(" · ")
 }
 
