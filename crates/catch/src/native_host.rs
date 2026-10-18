@@ -531,6 +531,13 @@ async fn accept(items: Vec<Requested>) -> Result<Vec<Outcome>> {
                 extra: serde_json::Map::new(),
                 etag: String::new(),
                 last_modified: String::new(),
+                priority: 0,
+                attempts: 0,
+                next_retry_at: 0,
+                speed: 0,
+                avg_speed: 0,
+                eta: 0,
+                expected_sha256: String::new(),
             });
             outcomes[index].id = Some(id);
         }

@@ -48,10 +48,32 @@ pub fn drain(max: usize) -> Result<()> {
             }
             return Ok(Vec::new());
         }
-        let ids: Vec<(String, bool, bool)> = state
+        // Schedule: outside the window nothing new starts. Entries stay
+        // queued — marked so the UI can say why — and the next in-window
+        // tick releases them. Transfers already live are parked by tick.
+        if crate::schedule::window_closed() == Some(true) {
+            let mut marked = 0;
+            for d in state.downloads.iter_mut() {
+                if d.status == Status::Queued && !d.sched_hold {
+                    d.sched_hold = true;
+                    marked += 1;
+                }
+            }
+            if freed > 0 || marked > 0 {
+                crate::state::save_state(&state)?;
+            }
+            return Ok(Vec::new());
+        }
+        // Priority first (higher runs first), FIFO inside a priority level:
+        // the queue order is the tiebreaker, and sort_by is stable.
+        let mut queued: Vec<&crate::state::Download> = state
             .downloads
             .iter()
             .filter(|d| d.status == Status::Queued)
+            .collect();
+        queued.sort_by_key(|d| std::cmp::Reverse(d.priority));
+        let ids: Vec<(String, bool, bool)> = queued
+            .into_iter()
             .take(max - active)
             .map(|d| {
                 (
@@ -74,6 +96,8 @@ pub fn drain(max: usize) -> Result<()> {
                     d.status = Status::Downloading;
                     d.pid = holder;
                     d.claimed_at = claimed;
+                    d.sched_hold = false;
+                    d.next_retry_at = 0;
                 }
             }
         }

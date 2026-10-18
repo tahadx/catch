@@ -1,3 +1,4 @@
+mod conns;
 mod download;
 mod drain;
 mod install;
@@ -5,6 +6,7 @@ mod native_host;
 mod schedule;
 mod segment;
 mod state;
+mod throttle;
 mod video;
 
 use anyhow::{Context, Result};
@@ -34,6 +36,11 @@ enum Command {
         /// Best-audio stream instead of the full video (with --video).
         #[arg(long)]
         audio: bool,
+        /// Expected SHA-256 of the finished file (64 hex characters).
+        /// Verified before the download is published; a mismatch is
+        /// reported as an integrity error instead of being saved.
+        #[arg(long, value_name = "HEX")]
+        sha256: Option<String>,
     },
     /// Add a URL to the queue and return at once (non-blocking). The row
     /// appears immediately and the transfer runs in the background, exactly
@@ -53,6 +60,9 @@ enum Command {
         /// duplicate question for this URL.
         #[arg(long)]
         again: bool,
+        /// Expected SHA-256 of the finished file (64 hex characters).
+        #[arg(long, value_name = "HEX")]
+        sha256: Option<String>,
     },
     /// Download one queued entry by id (blocking).
     Download {
@@ -116,12 +126,47 @@ enum Command {
     },
     /// Catch every http(s) link on the Wayland clipboard.
     Paste {},
-    /// Pause a queued entry (step 1: queued/failed entries only).
-    Pause { id: String },
-    /// Re-queue a paused, errored, or cancelled entry.
-    Resume { id: String },
-    /// Mark an entry cancelled (files already written are kept).
-    Cancel { id: String },
+    /// Pause (keep partial data; a paused entry stays in the queue).
+    /// With --all, pauses every queued or transferring entry.
+    Pause {
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Re-queue a paused, errored, or stopped entry and start it again.
+    /// The partial data on disk is continued, not discarded, and the retry
+    /// budget starts fresh. With --all, re-queues every such entry.
+    Resume {
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Stop an entry: the worker exits and the partial data stays on disk
+    /// for a later resume. `remove` is the delete. With --all, stops every
+    /// non-finished entry.
+    Cancel {
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Point a stopped or failed entry at a fresh address for the same file
+    /// (expired signed links) and re-queue it. The new URL is probed first:
+    /// when the length or validators prove it is the same file, the partial
+    /// data is kept; when it cannot be proven, the command refuses and
+    /// --force resets the partial data and fetches from zero.
+    Refresh {
+        id: String,
+        url: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Set the transfer priority: higher runs first among queued entries.
+    Priority { id: String, level: i64 },
+    /// Set (or clear, with "none") the expected SHA-256 for an entry.
+    Checksum { id: String, hex: String },
+    /// Explain one entry: partial data on disk, segments, retry state, and
+    /// what to do next.
+    Why { id: String },
     /// Rename what Catch saved for a link: new title for the row and the
     /// file. Works after the row is gone; the file is still on disk.
     Rename {
@@ -163,7 +208,11 @@ async fn main() -> Result<()> {
             dir,
             video,
             audio,
+            sha256,
         } => {
+            if let Some(hex) = &sha256 {
+                validate_sha256(hex)?;
+            }
             // Already on disk: ask, don't fetch a quiet second copy. `copy`
             // is the explicit "download again".
             if raise_ask(&url, "")?.is_some() {
@@ -172,7 +221,7 @@ async fn main() -> Result<()> {
                 // Add reached here only after raise_ask, which asks about both a
                 // saved file and a live transfer, so a live row is already gone.
                 // Keep reusing one as a guard against the race in between.
-                catch_now(&url, dir.as_deref(), video, audio, true).await?;
+                catch_now(&url, dir.as_deref(), video, audio, true, sha256.as_deref()).await?;
             }
         }
         Command::Enqueue {
@@ -180,7 +229,11 @@ async fn main() -> Result<()> {
             video,
             audio,
             again,
+            sha256,
         } => {
+            if let Some(hex) = &sha256 {
+                validate_sha256(hex)?;
+            }
             // `--again` forces a fresh, independent download (used by
             // "Download again anyway"): it clears any pending duplicate
             // question and never reuses the active row.
@@ -221,6 +274,9 @@ async fn main() -> Result<()> {
                 false,
                 !again,
             )?;
+            if let Some(hex) = &sha256 {
+                set_checksum(&id, hex)?;
+            }
             state::spawn_drain();
             if fresh {
                 println!("queued {id}");
@@ -235,7 +291,7 @@ async fn main() -> Result<()> {
             clear_one_ask(&url)?;
             // "Download again": the user chose to fetch this link a second time, so a
             // transfer already running for it must not swallow this one.
-            catch_now(&url, None, false, false, false).await?;
+            catch_now(&url, None, false, false, false, None).await?;
             let raw = title.join(" ");
             if !raw.trim().is_empty() {
                 let id = newest_row_for(&url)?;
@@ -281,28 +337,94 @@ async fn main() -> Result<()> {
                 println!("{} [{}] {}{}{}", d.id, d.status, d.filename, size, extra);
             }
         }
-        Command::Pause { id } => mutate(&id, |d| match d.status {
-            Status::Queued | Status::Downloading => {
-                d.status = Status::Paused;
-                Ok("paused".to_string())
+        Command::Pause { id, all } => {
+            if all {
+                let n = bulk_status(&[Status::Queued, Status::Downloading], Status::Paused)?;
+                println!("paused {n} entry/ies");
+            } else {
+                mutate(&need_id(id)?, |d| match d.status {
+                    Status::Queued | Status::Downloading => {
+                        d.status = Status::Paused;
+                        Ok("paused (partial data kept)".to_string())
+                    }
+                    _ => anyhow::bail!("cannot pause an entry that is {}", d.status),
+                })?;
             }
-            _ => anyhow::bail!("cannot pause an entry that is {}", d.status),
-        })?,
-        Command::Resume { id } => mutate(&id, |d| match d.status {
-            Status::Paused | Status::Error | Status::Cancelled => {
-                d.status = Status::Queued;
-                d.error.clear();
-                Ok("re-queued (run `catch download` to fetch)".to_string())
+        }
+        Command::Resume { id, all } => {
+            if all {
+                let n = bulk_resume()?;
+                println!("re-queued {n} entry/ies");
+            } else {
+                mutate(&need_id(id)?, |d| match d.status {
+                    Status::Paused | Status::Error | Status::Cancelled => {
+                        d.status = Status::Queued;
+                        d.error.clear();
+                        // A user-initiated resume is a fresh retry budget:
+                        // persisted attempts exist to stop *automatic* crash
+                        // loops, not to lock the user out.
+                        d.attempts = 0;
+                        d.next_retry_at = 0;
+                        d.speed = 0;
+                        d.eta = 0;
+                        Ok("re-queued; continuing from the partial data on disk".to_string())
+                    }
+                    _ => anyhow::bail!("entry is already {}", d.status),
+                })?;
             }
-            _ => anyhow::bail!("entry is already {}", d.status),
-        })?,
-        Command::Cancel { id } => mutate(&id, |d| match d.status {
-            Status::Done => anyhow::bail!("entry is already done"),
-            _ => {
-                d.status = Status::Cancelled;
-                Ok("cancelled".to_string())
+            state::spawn_drain();
+        }
+        Command::Cancel { id, all } => {
+            if all {
+                let n = bulk_status(
+                    &[
+                        Status::Queued,
+                        Status::Downloading,
+                        Status::Paused,
+                        Status::Error,
+                    ],
+                    Status::Cancelled,
+                )?;
+                println!("stopped {n} entry/ies (partial data kept)");
+            } else {
+                mutate(&need_id(id)?, |d| match d.status {
+                    Status::Done => anyhow::bail!("entry is already done"),
+                    _ => {
+                        d.status = Status::Cancelled;
+                        Ok("stopped (partial data kept)".to_string())
+                    }
+                })?;
             }
-        })?,
+        }
+        Command::Refresh { id, url, force } => {
+            let outcome = refresh_one(&id, &url, force).await?;
+            println!("{outcome}");
+            state::spawn_drain();
+        }
+        Command::Priority { id, level } => {
+            mutate(&id, move |d| {
+                d.priority = level;
+                Ok(format!("priority {level}"))
+            })?;
+        }
+        Command::Checksum { id, hex } => {
+            let norm = if hex.eq_ignore_ascii_case("none") || hex.trim().is_empty() {
+                String::new()
+            } else {
+                validate_sha256(&hex)?
+            };
+            mutate(&id, move |d| {
+                d.expected_sha256 = norm;
+                Ok(if d.expected_sha256.is_empty() {
+                    "checksum cleared".to_string()
+                } else {
+                    format!("checksum {}", d.expected_sha256)
+                })
+            })?;
+        }
+        Command::Why { id } => {
+            println!("{}", why_one(&id)?);
+        }
         Command::Drain { max } => {
             let max = max.unwrap_or_else(state::max_parallel).clamp(1, 10);
             drain::drain(max)?;
@@ -477,6 +599,7 @@ async fn catch_now(
     video: bool,
     audio: bool,
     reuse_live: bool,
+    sha256: Option<&str>,
 ) -> Result<String> {
     let url = url.trim().to_string();
     if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -496,6 +619,12 @@ async fn catch_now(
         true,
         reuse_live,
     )?;
+    // The checksum must be pinned before the transfer starts: finishing is
+    // when it is enforced, and setting it after the fact would let the first
+    // download publish unverified bytes.
+    if let Some(hex) = sha256 {
+        set_checksum(&id, hex)?;
+    }
     if !fresh {
         // The same link is already waiting or transferring: reuse
         // that row instead of stacking a duplicate.
@@ -572,6 +701,13 @@ fn enqueue_kind(
             extra: serde_json::Map::new(),
             etag: String::new(),
             last_modified: String::new(),
+            priority: 0,
+            attempts: 0,
+            next_retry_at: 0,
+            speed: 0,
+            avg_speed: 0,
+            eta: 0,
+            expected_sha256: String::new(),
         });
         Ok(())
     })
@@ -943,6 +1079,327 @@ fn mutate(id: &str, f: impl FnOnce(&mut Download) -> Result<String>) -> Result<(
     Ok(())
 }
 
+/// A missing positional id with no --all is user error, not a panic.
+fn need_id(id: Option<String>) -> Result<String> {
+    id.with_context(|| "give an id, or --all for every entry")
+}
+
+/// Switch every entry in one of `from` to `to`; returns how many changed.
+fn bulk_status(from: &[Status], to: Status) -> Result<usize> {
+    let mut n = 0;
+    state::update_state(|state| {
+        for d in state.downloads.iter_mut() {
+            if from.contains(&d.status) {
+                d.status = to.clone();
+                n += 1;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(n)
+}
+
+/// Re-queue every paused, errored or stopped entry with a fresh retry budget.
+fn bulk_resume() -> Result<usize> {
+    let mut n = 0;
+    state::update_state(|state| {
+        for d in state.downloads.iter_mut() {
+            if matches!(d.status, Status::Paused | Status::Error | Status::Cancelled) {
+                d.status = Status::Queued;
+                d.error.clear();
+                d.attempts = 0;
+                d.next_retry_at = 0;
+                d.speed = 0;
+                d.eta = 0;
+                n += 1;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(n)
+}
+
+/// A checksum is 64 hex characters; normalized to lower case so comparisons
+/// never fail on formatting.
+fn validate_sha256(hex: &str) -> Result<String> {
+    let norm = hex.trim().to_ascii_lowercase();
+    if norm.len() != 64 || !norm.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "a SHA-256 is 64 hex characters (got {} characters)",
+            norm.len()
+        );
+    }
+    Ok(norm)
+}
+
+fn set_checksum(id: &str, hex: &str) -> Result<()> {
+    let norm = validate_sha256(hex)?;
+    mutate(id, move |d| {
+        d.expected_sha256 = norm;
+        Ok(format!("checksum {}", d.expected_sha256))
+    })
+}
+
+/// One-line description of what a representation claims to be, for refresh
+/// mismatch messages.
+fn describe(total: &u64, etag: &str, last_modified: &str) -> String {
+    let mut bits = Vec::new();
+    if *total > 0 {
+        bits.push(format!("{total} bytes"));
+    }
+    if !etag.is_empty() {
+        bits.push(format!("etag {etag}"));
+    }
+    if !last_modified.is_empty() {
+        bits.push(format!("modified {last_modified}"));
+    }
+    if bits.is_empty() {
+        "unknown".to_string()
+    } else {
+        bits.join(", ")
+    }
+}
+
+/// `catch refresh`: point a stopped/failed row at a fresh address for the
+/// same file (expired signed links are the usual reason). The new URL is
+/// probed first — length and validators are the available proof that the
+/// bytes on disk are still a prefix of what the new address serves. Only
+/// with proof is the partial data kept; `--force` overrides and resets it.
+async fn refresh_one(id: &str, new_url: &str, force: bool) -> Result<String> {
+    let new_url = new_url.trim().to_string();
+    if !new_url.starts_with("http://") && !new_url.starts_with("https://") {
+        anyhow::bail!("only http(s) URLs can be refreshed: {new_url}");
+    }
+    let row = {
+        let state = load_state()?;
+        state
+            .downloads
+            .iter()
+            .find(|d| d.id == id)
+            .with_context(|| format!("unknown download id {id}"))?
+            .clone()
+    };
+    match row.status {
+        Status::Downloading => {
+            anyhow::bail!("{id} is still transferring; stop it first (catch cancel {id})")
+        }
+        Status::Done => {
+            anyhow::bail!("{id} is already done; use `catch replace` to fetch the link again")
+        }
+        _ => {}
+    }
+    let probe = download::probe_remote(&new_url).await?;
+
+    // Proof that the new address serves the same representation. Length
+    // equality is the weak form, matching validators the strong form; a
+    // comparison that could be made and failed is fatal to a resume.
+    let length_both = row.total > 0 && probe.total.is_some();
+    let length_ok = length_both && row.total == probe.total.unwrap();
+    let etag_both = !row.etag.is_empty() && !probe.etag.is_empty();
+    let etag_ok = etag_both && row.etag == probe.etag;
+    let lm_both = !row.last_modified.is_empty() && !probe.last_modified.is_empty();
+    let lm_ok = lm_both && row.last_modified == probe.last_modified;
+    let compared_and_different =
+        (length_both && !length_ok) || (etag_both && !etag_ok) || (lm_both && !lm_ok);
+    let proof = if length_ok {
+        Some("length verified")
+    } else if etag_ok {
+        Some("ETag verified")
+    } else if lm_ok {
+        Some("Last-Modified verified")
+    } else {
+        None
+    };
+
+    let base = state::resolve_download_dir(None);
+    let part = state::dir_for(&base, &row.filename).join(format!("{}.{}.part", row.filename, id));
+    let had_partial = std::fs::metadata(&part)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+
+    if compared_and_different && !force {
+        anyhow::bail!(
+            "the new address serves a different file (old: {}; new: {}); \
+             `catch refresh {id} <url> --force` replaces the partial data",
+            describe(&row.total, &row.etag, &row.last_modified),
+            describe(&probe.total.unwrap_or(0), &probe.etag, &probe.last_modified),
+        );
+    }
+    if proof.is_none() && had_partial && !force {
+        anyhow::bail!(
+            "the new address cannot be verified as the same file (no matching length or \
+             validators); `catch refresh {id} <url> --force` restarts from zero instead"
+        );
+    }
+
+    let reset = compared_and_different || proof.is_none();
+    let kept = row.bytes;
+    state::update_state(|state| {
+        if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
+            d.url = new_url.clone();
+            d.status = Status::Queued;
+            d.error.clear();
+            d.attempts = 0;
+            d.next_retry_at = 0;
+            d.speed = 0;
+            d.eta = 0;
+            d.sched_hold = false;
+            if reset {
+                d.bytes = 0;
+                d.total = 0;
+                d.etag = probe.etag.clone();
+                d.last_modified = probe.last_modified.clone();
+            } else {
+                if d.total == 0 {
+                    d.total = probe.total.unwrap_or(0);
+                }
+                if d.etag.is_empty() {
+                    d.etag = probe.etag.clone();
+                }
+                if d.last_modified.is_empty() {
+                    d.last_modified = probe.last_modified.clone();
+                }
+                if d.total > 0 {
+                    d.bytes = d.bytes.min(d.total);
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if reset {
+        std::fs::remove_file(&part).ok();
+        let _ = std::fs::remove_file(format!("{}.meta", part.display()));
+        if compared_and_different {
+            Ok("refreshed: the new address serves a different file; partial data reset, fetching from zero".to_string())
+        } else {
+            Ok("refreshed: could not verify the new address serves the same file; fetching from zero".to_string())
+        }
+    } else {
+        Ok(format!(
+            "refreshed: same file ({}); continuing from {kept} bytes",
+            proof.unwrap_or("unverified")
+        ))
+    }
+}
+
+/// `catch why`: everything the backend knows about one entry, in plain text.
+fn why_one(id: &str) -> Result<String> {
+    let state = load_state()?;
+    let d = state
+        .downloads
+        .iter()
+        .find(|d| d.id == id)
+        .with_context(|| format!("unknown download id {id}"))?;
+    let base = state::resolve_download_dir(None);
+    let part = state::dir_for(&base, &d.filename).join(format!("{}.{}.part", d.filename, d.id));
+    let mut out = String::new();
+    let pct = if d.total > 0 {
+        format!(" ({:.0}%)", d.bytes as f64 * 100.0 / d.total as f64)
+    } else {
+        String::new()
+    };
+    out.push_str(&format!("{} [{}] {}{}\n", d.id, d.status, d.filename, pct));
+    out.push_str(&format!("  url: {}\n", d.url));
+    out.push_str(&format!("  bytes: {}/{}\n", d.bytes, d.total));
+    if d.status == Status::Downloading && d.speed > 0 {
+        out.push_str(&format!(
+            "  speed: {} (avg {}), eta {}s\n",
+            download::fmt_rate(d.speed),
+            download::fmt_rate(d.avg_speed),
+            d.eta
+        ));
+    }
+    if d.priority != 0 {
+        out.push_str(&format!("  priority: {}\n", d.priority));
+    }
+    if d.attempts > 0 {
+        out.push_str(&format!(
+            "  attempts: {}/{}",
+            d.attempts,
+            download::max_attempts()
+        ));
+        let now = state::now_secs();
+        if d.next_retry_at > now {
+            out.push_str(&format!(" (next retry in {}s)", d.next_retry_at - now));
+        }
+        out.push('\n');
+    }
+    match std::fs::metadata(&part) {
+        Ok(m) => out.push_str(&format!(
+            "  partial data: {} bytes at {}\n",
+            m.len(),
+            part.display()
+        )),
+        Err(_) => out.push_str("  partial data: none\n"),
+    }
+    match segment::manifest_summary(&part, &d.url) {
+        Some((total, done, count)) => out.push_str(&format!(
+            "  segments: {done}/{count} done (representation {total} bytes)\n"
+        )),
+        None => out.push_str("  segments: none (sequential transfer, or already finished)\n"),
+    }
+    if !d.etag.is_empty() || !d.last_modified.is_empty() {
+        out.push_str(&format!(
+            "  validators: etag={} last-modified={}\n",
+            if d.etag.is_empty() { "-" } else { &d.etag },
+            if d.last_modified.is_empty() {
+                "-"
+            } else {
+                &d.last_modified
+            }
+        ));
+    }
+    if !d.expected_sha256.is_empty() {
+        out.push_str(&format!("  expected sha256: {}\n", d.expected_sha256));
+    }
+    if !d.error.is_empty() {
+        out.push_str(&format!("  last note: {}\n", d.error));
+    }
+    let now = state::now_secs();
+    let assessment = match d.status {
+        Status::Done => "saved; nothing to do".to_string(),
+        Status::Downloading if d.speed > 0 => {
+            format!("transferring now at {}", download::fmt_rate(d.speed))
+        }
+        Status::Downloading => "transferring now".to_string(),
+        Status::Queued if d.sched_hold => "waiting for the scheduled window".to_string(),
+        Status::Queued => "queued; starts when a parallel slot is free".to_string(),
+        Status::Paused => {
+            "paused; the partial data is kept — `catch resume <id>` continues".to_string()
+        }
+        Status::Cancelled => {
+            "stopped; the partial data is kept — `catch resume <id>` continues, `catch remove <id>` deletes".to_string()
+        }
+        Status::Error => {
+            let e = d.error.to_lowercase();
+            if e.contains("page, not the file")
+                || e.contains("expired")
+                || e.contains(" 401")
+                || e.contains(" 403")
+                || e.contains("access denied")
+            {
+                "the link expired or hit a login wall — `catch refresh <id> <new-url>` then `catch resume <id>`".to_string()
+            } else if d.attempts >= download::max_attempts() {
+                format!(
+                    "retry budget exhausted ({}) — `catch resume <id>` starts a fresh budget",
+                    d.error
+                )
+            } else if d.next_retry_at > now {
+                format!("will retry automatically in {}s", d.next_retry_at - now)
+            } else if !d.error.is_empty() {
+                format!(
+                    "failed: {} — `catch resume <id>` retries from the partial data",
+                    d.error
+                )
+            } else {
+                "failed — `catch resume <id>` retries".to_string()
+            }
+        }
+    };
+    out.push_str(&format!("  assessment: {assessment}\n"));
+    Ok(out)
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::{extract_urls, newest_row_for, Status};
@@ -985,6 +1442,13 @@ mod cli_tests {
             audio_only: false,
             etag: String::new(),
             last_modified: String::new(),
+            priority: 0,
+            attempts: 0,
+            next_retry_at: 0,
+            speed: 0,
+            avg_speed: 0,
+            eta: 0,
+            expected_sha256: String::new(),
             title: String::new(),
             extra: serde_json::Map::new(),
         };

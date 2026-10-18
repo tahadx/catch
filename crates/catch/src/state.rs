@@ -84,6 +84,35 @@ pub struct Download {
     pub etag: String,
     #[serde(default)]
     pub last_modified: String,
+    /// User-chosen queue order: higher runs first, ties keep queue order.
+    /// Never a reason to drop anything; drain only sorts by it.
+    #[serde(default)]
+    pub priority: i64,
+    /// Connection attempts the last worker used. Persisted so a restart does
+    /// not silently reset the retry budget: `resume` starts a *new* budget
+    /// on purpose, a crashed worker does not.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Unix seconds when the next automatic retry is due (0 = none). Written
+    /// with each `retrying in Ns` note so `catch why` can say when.
+    #[serde(default)]
+    pub next_retry_at: u64,
+    /// Live rate in bytes/s as measured by the worker on a monotonic clock
+    /// (0 when unknown or idle). The panel may prefer this over its own
+    /// sampling: it survives panel restarts because it is persisted.
+    #[serde(default)]
+    pub speed: u64,
+    /// Average rate over the whole transfer, bytes/s.
+    #[serde(default)]
+    pub avg_speed: u64,
+    /// Seconds remaining at the current rate (0 = unknown).
+    #[serde(default)]
+    pub eta: u64,
+    /// Optional lowercase hex SHA-256 the user pinned for this download.
+    /// Verified over the part file before it is published; a mismatch is
+    /// reported as an integrity error and never silently published.
+    #[serde(default)]
+    pub expected_sha256: String,
     /// Fields written by other versions (older or newer) pass through
     /// untouched: a stale backend rewriting state must never strip a fresh
     /// writer's data — this exact clobber erased `title` on every drain.
@@ -355,6 +384,12 @@ pub fn load_state() -> Result<State> {
 }
 
 /// Atomic write beside the target, then rename. Never modifies user files.
+///
+/// The temp file is fsynced before the rename and the directory after it, so
+/// a power loss cannot leave a state file that is newer by name but empty (or
+/// half-written) by content — queue state is the user's only record of what
+/// is in flight. The rename itself keeps readers crash-proof: they see the
+/// old file or the new one, never a mixture.
 pub fn save_state(state: &State) -> Result<()> {
     let dir = state_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -362,7 +397,13 @@ pub fn save_state(state: &State) -> Result<()> {
     let tmp = dir.join("state.json.tmp");
     let text = serde_json::to_string_pretty(state)?;
     std::fs::write(&tmp, &text).with_context(|| format!("write {}", tmp.display()))?;
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
+        let _ = f.sync_data();
+    }
     std::fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
+    if let Ok(d) = std::fs::File::open(&dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 
@@ -782,7 +823,7 @@ impl Drop for LockGuard {
 
 /// Unix pid from /proc. An empty cmdline is a zombie or kernel thread, an
 /// unreadable/missing file means the process is gone.
-fn pid_live(pid: u32) -> bool {
+pub(crate) fn pid_live(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -1362,6 +1403,103 @@ pub fn segments_setting() -> usize {
     4
 }
 
+/// Traffic mode, from the widget settings in shell.json (or CATCH_BW_MODE).
+/// Modes shape how much of the machine's capacity Catch is willing to use:
+/// `unlimited` takes what it can, `balanced` keeps connection use moderate,
+/// `low` restricts it hard. The mode only changes *defaults*; an explicit
+/// bandwidth cap or connection budget always wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrafficMode {
+    Unlimited,
+    Balanced,
+    Low,
+}
+
+impl TrafficMode {
+    /// Connection budget this mode allows when nothing explicit is set.
+    /// Unlimited takes exactly what the user configured (parallel slots ×
+    /// segments per file) — that is the peak the settings promise, and the
+    /// global registry makes sure several workers cannot exceed it together.
+    /// Balanced halves it, Low quarters it, both with a floor that keeps a
+    /// transfer moving.
+    pub fn default_budget(&self) -> usize {
+        self.budget_for(max_parallel() * segments_setting())
+    }
+
+    /// The same mapping on a caller-supplied configuration — pure, so it can
+    /// be tested without reading this machine's shell settings.
+    pub fn budget_for(&self, configured: usize) -> usize {
+        let configured = configured.clamp(1, 64);
+        match self {
+            TrafficMode::Unlimited => configured,
+            TrafficMode::Balanced => (configured / 2).max(2),
+            TrafficMode::Low => (configured / 4).max(1),
+        }
+    }
+}
+
+pub fn traffic_mode() -> TrafficMode {
+    let raw = std::env::var("CATCH_BW_MODE").ok().or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let shell = std::path::PathBuf::from(home).join(".config/omarchy/shell.json");
+        let text = std::fs::read_to_string(&shell).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        find_widget_value(&v, "bwMode")?.as_str().map(String::from)
+    });
+    match raw.as_deref().map(str::trim) {
+        Some("balanced") => TrafficMode::Balanced,
+        Some("low") => TrafficMode::Low,
+        _ => TrafficMode::Unlimited,
+    }
+}
+
+/// Explicit global bandwidth cap in bytes/second (0 = none), from the widget
+/// `bwCapKb` (KiB/s) or CATCH_BW_CAP_BPS. The cap is global: each worker is
+/// allowed `cap / active workers` so the sum across processes stays within it.
+pub fn bandwidth_cap_bps() -> u64 {
+    if let Ok(raw) = std::env::var("CATCH_BW_CAP_BPS") {
+        if let Ok(n) = raw.trim().parse::<u64>() {
+            return n;
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let shell = std::path::PathBuf::from(home).join(".config/omarchy/shell.json");
+        if let Ok(text) = std::fs::read_to_string(&shell) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(kb) = find_widget_value(&v, "bwCapKb").and_then(|x| x.as_u64()) {
+                    return kb.saturating_mul(1024);
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Connection slices the bandwidth cap makes sensible: a cap of 1 MiB/s
+/// cannot feed eight full-rate connections. `None` means no cap configured.
+pub fn cap_slices() -> Option<usize> {
+    let cap = bandwidth_cap_bps();
+    if cap == 0 {
+        return None;
+    }
+    Some((cap / (64 * 1024)).max(1) as usize)
+}
+
+fn find_widget_value<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    let layout = v.get("bar")?.get("layout")?;
+    for section in ["left", "center", "right"] {
+        let entries = layout.get(section)?.as_array()?;
+        for e in entries {
+            if e.get("id")?.as_str()? == "io.github.tahadx.catch" {
+                if let Some(found) = e.get(key) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn find_widget_segments(v: &serde_json::Value) -> Option<usize> {
     let layout = v.get("bar")?.get("layout")?;
     for section in ["left", "center", "right"] {
@@ -1427,6 +1565,13 @@ mod tests {
             audio_only: false,
             etag: String::new(),
             last_modified: String::new(),
+            priority: 0,
+            attempts: 0,
+            next_retry_at: 0,
+            speed: 0,
+            avg_speed: 0,
+            eta: 0,
+            expected_sha256: String::new(),
             title: String::new(),
             extra: serde_json::Map::new(),
         }
@@ -1740,6 +1885,13 @@ mod dedup_tests {
             audio_only: false,
             etag: String::new(),
             last_modified: String::new(),
+            priority: 0,
+            attempts: 0,
+            next_retry_at: 0,
+            speed: 0,
+            avg_speed: 0,
+            eta: 0,
+            expected_sha256: String::new(),
             title: String::new(),
             extra: serde_json::Map::new(),
         }
@@ -1954,6 +2106,13 @@ mod saved_tests {
             audio_only: false,
             etag: String::new(),
             last_modified: String::new(),
+            priority: 0,
+            attempts: 0,
+            next_retry_at: 0,
+            speed: 0,
+            avg_speed: 0,
+            eta: 0,
+            expected_sha256: String::new(),
             title: "App".into(),
             extra: serde_json::Map::new(),
         });

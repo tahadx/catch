@@ -76,9 +76,11 @@ pub fn load_manifest(part: &Path, url: &str) -> Result<Option<SegmentManifest>> 
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            // Transient I/O error (permission, etc.): do not destroy data.
-            eprintln!("catch: cannot read manifest {}: {e}", meta.display());
-            return Ok(None);
+            // A transient read error must not read as "no manifest": the
+            // part is preallocated to full size, and treating it as a plain
+            // partial file once published a file of holes as complete.
+            // Fail the transfer instead; both files stay for the next try.
+            anyhow::bail!("cannot read manifest {}: {e}", meta.display());
         }
     };
     let m: SegmentManifest = match serde_json::from_str(&text) {
@@ -114,8 +116,9 @@ pub fn load_manifest(part: &Path, url: &str) -> Result<Option<SegmentManifest>> 
     let plen = match std::fs::metadata(part) {
         Ok(md) => md.len(),
         Err(e) => {
-            eprintln!("catch: cannot stat part {}: {e}", part.display());
-            return Ok(None);
+            // The part existed a moment ago (`is_file()` above); a stat
+            // error now is transient I/O trouble, not a missing part.
+            anyhow::bail!("cannot stat part {}: {e}", part.display());
         }
     };
     if plen != m.total {
@@ -128,6 +131,15 @@ pub fn load_manifest(part: &Path, url: &str) -> Result<Option<SegmentManifest>> 
         return Ok(None);
     }
     Ok(Some(m))
+}
+
+/// (total bytes, done segments, segment count) for `catch why`; `None` when
+/// no usable manifest exists (sequential transfer, finished download, or a
+/// quarantined/corrupt manifest).
+pub fn manifest_summary(part: &Path, url: &str) -> Option<(u64, usize, usize)> {
+    let m = load_manifest(part, url).ok().flatten()?;
+    let done = m.segments.iter().filter(|s| s.done).count();
+    Some((m.total, done, m.segments.len()))
 }
 
 fn quarantine_part(part: &Path) {
@@ -204,14 +216,9 @@ pub fn min_piece_bytes() -> u64 {
 }
 
 pub fn connection_budget() -> usize {
-    if let Ok(raw) = std::env::var("CATCH_MAX_CONNECTIONS") {
-        if let Ok(n) = raw.trim().parse::<usize>() {
-            if (1..=256).contains(&n) {
-                return n;
-            }
-        }
-    }
-    8
+    // One place decides the global connection budget: the cross-process
+    // permit registry (environment override, then the traffic mode).
+    crate::conns::budget()
 }
 
 pub fn segments_cap() -> usize {
@@ -220,9 +227,14 @@ pub fn segments_cap() -> usize {
 
 pub fn segment_share(active: usize) -> usize {
     let cap = segments_cap();
-    let budget = connection_budget();
     let active = active.max(1);
-    (budget / active).clamp(1, cap)
+    let share = (connection_budget() / active).clamp(1, cap);
+    // A bandwidth cap can only feed so many full-rate connections; beyond
+    // that the byte limiter would just serialize them.
+    match crate::state::cap_slices() {
+        Some(slices) => share.min((slices / active).max(1)),
+        None => share,
+    }
 }
 
 pub fn segment_count(total: u64, share: usize) -> usize {
@@ -282,6 +294,38 @@ enum SegError {
     Interrupted(String),
 }
 
+/// One contiguous piece of one segment: the unit of work the runner
+/// schedules. Every work range ends at its segment's end, so a task that
+/// covers its whole work has covered its whole segment tail on top of
+/// everything earlier works of that segment wrote.
+#[derive(Clone, Copy, Debug)]
+struct Work {
+    seg: usize,
+    start: u64,
+    end: u64,
+}
+
+impl Work {
+    fn len(&self) -> u64 {
+        self.end - self.start + 1
+    }
+}
+
+/// What a segment task reports back. `covered` is its own coverage from
+/// `work.start`; less than `work.len()` on `Finished` means it stopped on
+/// purpose so an idle slot can pick up the remainder.
+enum TaskEnd {
+    Finished {
+        work: Work,
+        covered: u64,
+    },
+    GaveUp {
+        work: Work,
+        covered: u64,
+        why: String,
+    },
+}
+
 #[derive(Clone, Copy)]
 enum Directive {
     Keep,
@@ -325,6 +369,7 @@ pub async fn run_segmented(
     last_modified: String,
     manifest: SegmentManifest,
     share: usize,
+    limiter: Option<Arc<crate::throttle::RateLimiter>>,
 ) -> Result<SegmentedResult> {
     let n = manifest.segments.len();
     let written: Arc<Vec<AtomicU64>> = Arc::new((0..n).map(|_| AtomicU64::new(0)).collect());
@@ -333,15 +378,34 @@ pub async fn run_segmented(
             .map(|i| AtomicBool::new(manifest.segments[i].done))
             .collect(),
     );
-    // seed written for already-done segments (informational; they are done)
+    // A split instruction per segment: the absolute offset a running task
+    // should stop at so its tail becomes fresh work. u64::MAX = no split.
+    let split_at: Arc<Vec<AtomicU64>> =
+        Arc::new((0..n).map(|_| AtomicU64::new(u64::MAX)).collect());
+    let seg_starts: Vec<u64> = manifest.segments.iter().map(|s| s.start).collect();
     let manifest = Arc::new(Mutex::new(manifest));
     let cancel = Arc::new(AtomicU8::new(0)); // 0 run, 1 pause, 2 abort/fail
 
-    let mut pending: std::collections::VecDeque<usize> = (0..n)
-        .filter(|&i| !done_flags[i].load(Ordering::Relaxed))
+    let mut pending: std::collections::VecDeque<Work> = manifest
+        .lock()
+        .unwrap()
+        .segments
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !done_flags[*i].load(Ordering::Relaxed))
+        .map(|(i, s)| Work {
+            seg: i,
+            start: s.start,
+            end: s.end,
+        })
         .collect();
+    // At most one work item per segment runs at a time, so the per-segment
+    // `written` frontier stays meaningful.
+    let mut running: std::collections::HashMap<usize, Work> = std::collections::HashMap::new();
+    // One re-queue per segment: after the second exhaustion, fail.
+    let mut requeues = vec![0u8; n];
 
-    let mut joinset: tokio::task::JoinSet<Result<(), SegError>> = tokio::task::JoinSet::new();
+    let mut joinset: tokio::task::JoinSet<Result<TaskEnd, SegError>> = tokio::task::JoinSet::new();
 
     let mut first_fatal: Option<String> = None;
     let mut first_fallback: Option<String> = None;
@@ -352,26 +416,22 @@ pub async fn run_segmented(
     loop {
         // spawn as many as the budget allows
         while joinset.len() < share && !pending.is_empty() && cancel.load(Ordering::Relaxed) == 0 {
-            let i = pending.front().copied().unwrap();
-            let seg = {
-                let m = manifest.lock().unwrap();
-                m.segments[i].clone()
-            };
-            let seg_len = seg.end - seg.start + 1;
-            // reset per-segment written counter for a fresh attempt (resume handled inside task via in_seg)
+            let work = pending.pop_front().unwrap();
+            running.insert(work.seg, work);
+            split_at[work.seg].store(u64::MAX, Ordering::Relaxed);
             let task_written = Arc::clone(&written);
             let task_done = Arc::clone(&done_flags);
             let task_manifest = Arc::clone(&manifest);
             let task_cancel = Arc::clone(&cancel);
+            let task_split = Arc::clone(&split_at);
+            let task_limiter = limiter.clone();
             let url = url.to_string();
             let client = client.clone();
             let part = part.to_path_buf();
             let etag = etag.clone();
             let last_modified = last_modified.clone();
             joinset.spawn(run_one_segment(
-                i,
-                seg,
-                seg_len,
+                work,
                 url,
                 client,
                 part,
@@ -382,8 +442,42 @@ pub async fn run_segmented(
                 task_cancel,
                 task_written,
                 task_done,
+                task_split,
+                task_limiter,
             ));
-            pending.pop_front();
+        }
+
+        // Idle capacity with nothing pending: split the slowest running range
+        // so the free slot helps the straggler instead of waiting for it.
+        // The split is only an instruction — the victim reports its exact
+        // frontier as it stops, and that frontier becomes the tail work.
+        if pending.is_empty()
+            && running.len() < share
+            && share >= 2
+            && cancel.load(Ordering::Relaxed) == 0
+        {
+            let mut best: Option<(usize, u64, u64)> = None; // seg, remaining, claim
+            for (&seg, w) in &running {
+                if split_at[seg].load(Ordering::Relaxed) != u64::MAX {
+                    continue;
+                }
+                let claim = seg_starts[seg] + written[seg].load(Ordering::Relaxed);
+                if claim <= w.start {
+                    // No progress on this work yet: splitting it would only
+                    // re-queue the same range.
+                    continue;
+                }
+                let remaining = w.end + 1 - claim;
+                if remaining <= min_piece_bytes() {
+                    continue;
+                }
+                if best.map(|(_, r, _)| remaining > r).unwrap_or(true) {
+                    best = Some((seg, remaining, claim));
+                }
+            }
+            if let Some((seg, _, claim)) = best {
+                split_at[seg].store(claim, Ordering::Relaxed);
+            }
         }
 
         if pending.is_empty() && joinset.is_empty() {
@@ -397,7 +491,44 @@ pub async fn run_segmented(
             res = joinset.join_next(), if !joinset.is_empty() => {
                 got = true;
                 match res {
-                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Ok(TaskEnd::Finished { work, covered }))) => {
+                        running.remove(&work.seg);
+                        split_at[work.seg].store(u64::MAX, Ordering::Relaxed);
+                        if covered < work.len() && cancel.load(Ordering::Relaxed) == 0 {
+                            // Stopped for a handoff: the remainder becomes
+                            // fresh work and the next iteration spawns it
+                            // into the slot this task just freed.
+                            pending.push_back(Work {
+                                seg: work.seg,
+                                start: work.start + covered,
+                                end: work.end,
+                            });
+                        }
+                    }
+                    Some(Ok(Ok(TaskEnd::GaveUp { work, covered, why }))) => {
+                        running.remove(&work.seg);
+                        split_at[work.seg].store(u64::MAX, Ordering::Relaxed);
+                        let start = (work.start + covered).min(work.end);
+                        if cancel.load(Ordering::Relaxed) == 0 && requeues[work.seg] == 0 {
+                            // Keep every byte already written and try the
+                            // remainder once more on a fresh connection
+                            // instead of failing the transfer and making
+                            // the user resume it by hand.
+                            requeues[work.seg] = 1;
+                            eprintln!(
+                                "catch: {id} segment {} exhausted its attempts ({why}); re-queued the remainder",
+                                work.seg
+                            );
+                            pending.push_back(Work {
+                                seg: work.seg,
+                                start,
+                                end: work.end,
+                            });
+                        } else if first_fatal.is_none() {
+                            first_fatal = Some(why);
+                            cancel.store(2, Ordering::Relaxed);
+                        }
+                    }
                     Some(Ok(Err(SegError::Fallback(why)))) => {
                         if first_fallback.is_none() { first_fallback = Some(why); }
                         cancel.store(2, Ordering::Relaxed);
@@ -438,7 +569,15 @@ pub async fn run_segmented(
         if cancel.load(Ordering::Relaxed) != 0 {
             joinset.abort_all();
             while joinset.join_next().await.is_some() {}
-            flush_progress(id, total, &manifest, &done_flags, &written).await;
+            flush_progress(
+                id,
+                total,
+                &manifest,
+                &done_flags,
+                &written,
+                limiter.as_deref(),
+            )
+            .await;
             let c = cancel.load(Ordering::Relaxed);
             if c == 1 {
                 return Ok(SegmentedResult::Paused);
@@ -455,7 +594,15 @@ pub async fn run_segmented(
         // periodic flush
         if last_flush.elapsed() >= crate::download::FLUSH_EVERY {
             last_flush = Instant::now();
-            flush_progress(id, total, &manifest, &done_flags, &written).await;
+            flush_progress(
+                id,
+                total,
+                &manifest,
+                &done_flags,
+                &written,
+                limiter.as_deref(),
+            )
+            .await;
         }
     }
 
@@ -465,7 +612,15 @@ pub async fn run_segmented(
             return Err(anyhow::anyhow!("segment {} did not complete", i));
         }
     }
-    flush_progress(id, total, &manifest, &done_flags, &written).await;
+    flush_progress(
+        id,
+        total,
+        &manifest,
+        &done_flags,
+        &written,
+        limiter.as_deref(),
+    )
+    .await;
     let final_manifest = {
         let m = manifest.lock().unwrap();
         m.clone()
@@ -481,6 +636,7 @@ async fn flush_progress(
     manifest: &Arc<Mutex<SegmentManifest>>,
     done_flags: &Arc<Vec<AtomicBool>>,
     written: &Arc<Vec<AtomicU64>>,
+    limiter: Option<&crate::throttle::RateLimiter>,
 ) {
     let n = done_flags.len();
     let mut done_bytes: u64 = 0;
@@ -501,7 +657,14 @@ async fn flush_progress(
         .iter()
         .filter(|f| f.load(Ordering::Relaxed))
         .count();
+    let mut active = 1usize;
     let _ = crate::state::update_state(|state| {
+        active = state
+            .downloads
+            .iter()
+            .filter(|d| d.status == Status::Downloading)
+            .count()
+            .max(1);
         if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
             if d.status == Status::Downloading {
                 d.bytes = bytes;
@@ -515,6 +678,11 @@ async fn flush_progress(
         }
         Ok(())
     });
+    // Global cap: this worker's share follows the number of transfers
+    // running right now, refreshed at every flush.
+    if let (Some(l), Some(share)) = (limiter, crate::throttle::worker_limit(active)) {
+        l.set_rate(share);
+    }
 }
 
 // ---------- one segment ----------
@@ -529,6 +697,9 @@ async fn stream_one_segment_body<S>(
     base_written: u64,
     i: usize,
     part: &Path,
+    work_start: u64,
+    split_at: &AtomicU64,
+    limiter: Option<&crate::throttle::RateLimiter>,
 ) -> Result<u64, SegError>
 where
     S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
@@ -542,6 +713,12 @@ where
             return Ok(0);
         }
         if attempt_bytes >= remaining {
+            break;
+        }
+        // A handoff split can arrive mid-body: stop at the instructed
+        // frontier and let the runner re-queue the tail on a fresh slot.
+        let stop = split_at.load(Ordering::Relaxed);
+        if stop != u64::MAX && work_start + attempt_bytes >= stop {
             break;
         }
         let limit = stall_timeout();
@@ -592,12 +769,19 @@ where
                 "segment {i}: server sent extra bytes"
             )));
         }
+        if let Some(l) = limiter {
+            // Throttle before the write: the wait is the backpressure.
+            l.acquire(chunk.len() as u64).await;
+        }
         if buf.write_all(&chunk).await.is_err() {
             let _ = buf.flush().await;
             return Err(SegError::Fatal(format!("write {}", part.display())));
         }
         attempt_bytes += chunk.len() as u64;
-        written_shared.store(base_written + attempt_bytes, Ordering::Relaxed);
+        // fetch_max: after a split, head and tail tasks update the same
+        // per-segment frontier, and the union coverage is the max — never a
+        // backwards step.
+        written_shared.fetch_max(base_written + attempt_bytes, Ordering::Relaxed);
         if !chunk.is_empty() {
             last_data = Instant::now();
         }
@@ -610,9 +794,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn run_one_segment(
-    i: usize,
-    seg: SegmentRange,
-    seg_len: u64,
+    work: Work,
     url: String,
     client: reqwest::Client,
     part: PathBuf,
@@ -623,28 +805,54 @@ async fn run_one_segment(
     cancel: Arc<AtomicU8>,
     written: Arc<Vec<AtomicU64>>,
     done_flags: Arc<Vec<AtomicBool>>,
-) -> Result<(), SegError> {
+    split_at: Arc<Vec<AtomicU64>>,
+    limiter: Option<Arc<crate::throttle::RateLimiter>>,
+) -> Result<TaskEnd, SegError> {
     use reqwest::header;
     use tokio::io::AsyncWriteExt;
 
-    let mut in_seg: u64 = 0;
+    let i = work.seg;
+    let seg = {
+        let m = manifest.lock().unwrap();
+        m.segments[i].clone()
+    };
+    let seg_len = work.len();
+    // Segment-relative offset of this work's first byte; `written` is a
+    // segment-relative frontier shared by every work item of this segment.
+    let base_off = work.start - seg.start;
+
+    let mut in_seg: u64 = 0; // bytes covered from work.start
     let mut attempts = 0u32;
     loop {
         if cancel.load(Ordering::Relaxed) != 0 {
-            return Ok(());
+            return Ok(TaskEnd::Finished {
+                work,
+                covered: in_seg,
+            });
         }
         if in_seg >= seg_len {
             break;
         }
+        // A split was requested (or this task is already at the frontier):
+        // report progress and let the runner hand the tail to a fresh slot.
+        let stop = split_at[i].load(Ordering::Relaxed);
+        if stop != u64::MAX && work.start + in_seg >= stop {
+            return Ok(TaskEnd::Finished {
+                work,
+                covered: in_seg,
+            });
+        }
         if attempts >= max_attempts() {
-            return Err(SegError::Fatal(format!(
-                "segment {i} gave up after {attempts} attempts"
-            )));
+            return Ok(TaskEnd::GaveUp {
+                work,
+                covered: in_seg,
+                why: format!("segment {i}: gave up after {attempts} attempts"),
+            });
         }
         attempts += 1;
 
-        let want_start = seg.start + in_seg;
-        let want_end = seg.end;
+        let want_start = work.start + in_seg;
+        let want_end = work.end;
 
         let mut req = client.get(&url).header(header::ACCEPT_ENCODING, "identity");
         req = req.header(header::RANGE, format!("bytes={}-{}", want_start, want_end));
@@ -789,9 +997,12 @@ async fn run_one_segment(
                 &cancel,
                 remaining,
                 &written[i],
-                in_seg,
+                base_off + in_seg,
                 i,
                 &part,
+                work.start,
+                &split_at[i],
+                limiter.as_deref(),
             )
             .await;
             let _ = buf.shutdown().await;
@@ -801,11 +1012,23 @@ async fn run_one_segment(
             match body_result {
                 Ok(attempt_bytes) => {
                     in_seg += attempt_bytes;
-                    written[i].store(in_seg, Ordering::Relaxed);
+                    written[i].fetch_max(base_off + in_seg, Ordering::Relaxed);
+                    // Stopped for the runner's split: report now so the tail
+                    // can go to a fresh connection.
+                    let stop = split_at[i].load(Ordering::Relaxed);
+                    if stop != u64::MAX && work.start + in_seg >= stop {
+                        return Ok(TaskEnd::Finished {
+                            work,
+                            covered: in_seg,
+                        });
+                    }
                 }
                 Err(SegError::Interrupted(why)) => {
                     if cancel.load(Ordering::Relaxed) != 0 {
-                        return Ok(());
+                        return Ok(TaskEnd::Finished {
+                            work,
+                            covered: in_seg,
+                        });
                     }
                     let wait = backoff(attempts);
                     eprintln!(
@@ -874,8 +1097,11 @@ async fn run_one_segment(
         }
     }
     done_flags[i].store(true, Ordering::Relaxed);
-    written[i].store(seg_len, Ordering::Relaxed);
-    Ok(())
+    written[i].fetch_max(seg.end - seg.start + 1, Ordering::Relaxed);
+    Ok(TaskEnd::Finished {
+        work,
+        covered: in_seg,
+    })
 }
 
 // ---------- helpers ----------

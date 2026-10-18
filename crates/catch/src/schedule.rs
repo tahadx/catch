@@ -2,18 +2,14 @@ use anyhow::{Context, Result};
 
 use crate::state::{max_parallel, update_state, Status};
 
-// NOT READY — not wired into the UI and not exercised by CI.
-//
-// The window maths, the systemd timer and the power action are all here and
-// work, but nothing parks a transfer while the window is shut: `tick` only
-// *starts* queued entries, it never holds them back, so the switch would be a
-// promise Catch does not keep yet. The settings are kept out of
-// manifest.json and the panel hides its controls (see the NOT READY notes
-// there). Enable it by finishing the hold/resume half and dropping those.
-//
 // Overnight-friendly schedule read from the widget settings in shell.json:
 // schedEnabled ("on"/"off"), schedStart/schedStop ("HH:MM", overnight wrap
 // allowed), schedWhenDone ("nothing"/"suspend"/"shutdown").
+//
+// The window is enforced in two places: `drain` refuses to start queued
+// entries while the window is shut (marking them `sched_hold`, which the
+// panel shows as "Scheduled"), and `tick` parks transfers that are running
+// when the window closes and releases everything when it opens again.
 pub struct Schedule {
     pub start_min: u16,
     pub stop_min: u16,
@@ -88,6 +84,13 @@ fn today_marker() -> std::path::PathBuf {
     crate::state::state_dir().join(format!("done-{day}"))
 }
 
+/// None when the scheduler is off or misconfigured; Some(true) when the
+/// window is shut (new work must wait), Some(false) when it is open.
+pub fn window_closed() -> Option<bool> {
+    let sched = read_schedule()?;
+    Some(!in_window(now_minutes(), sched.start_min, sched.stop_min))
+}
+
 /// One scheduler pass, run every minute by the systemd timer:
 /// inside the window, release parked entries and drain; outside it,
 /// park live transfers. When the queue runs dry out of hours, run the
@@ -102,8 +105,10 @@ pub fn tick() -> Result<()> {
         let mut released = 0;
         update_state(|state| {
             for d in state.downloads.iter_mut() {
-                if d.status == Status::Paused && d.sched_hold {
-                    d.status = Status::Queued;
+                if d.sched_hold && matches!(d.status, Status::Paused | Status::Queued) {
+                    if d.status == Status::Paused {
+                        d.status = Status::Queued;
+                    }
                     d.sched_hold = false;
                     released += 1;
                 }
