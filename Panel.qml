@@ -1053,6 +1053,27 @@ Panel {
     return s ? " · " + s : ""
   }
 
+  // Estimated time remaining for a downloading row, derived from the
+  // smoothed speed. Returns "" when unknown.
+  function etaFor(id) {
+    var d = null
+    for (var i = 0; i < root.queue.downloads.length; i++) {
+      if (root.queue.downloads[i].id === id) { d = root.queue.downloads[i]; break }
+    }
+    if (!d || d.status !== "downloading") return ""
+    var total = Number(d.total) || 0
+    var bytes = root.rowBytes(d)
+    if (total <= 0 || bytes >= total) return ""
+    var seen = root.speedSeen[id]
+    var rate = seen ? Number(seen.rate) : 0
+    if (rate <= 0) return ""
+    var secs = (total - bytes) / rate
+    if (!isFinite(secs) || secs < 0) return ""
+    if (secs < 60) return " · " + Math.ceil(secs) + "s left"
+    if (secs < 3600) return " · " + Math.floor(secs / 60) + "m " + Math.floor(secs % 60) + "s left"
+    return " · " + Math.floor(secs / 3600) + "h " + Math.floor((secs % 3600) / 60) + "m left"
+  }
+
   FileView {
     id: stateFile
     path: root.statePath
@@ -1610,7 +1631,8 @@ Panel {
                       status: status,
                       bytes: bytes,
                       total: total,
-                      error: error
+                      error: error,
+                      segments: segments
                     })
                     readonly property bool isCursor: root.cursorIndex === index
                     readonly property bool isMarked: root.isMarked(did)
@@ -1695,7 +1717,7 @@ Panel {
                           Text {
                             width: parent.width
                             textFormat: Text.PlainText
-                            text: Model.rowMeta(card.entry) + root.speedFor(card.entry.id)
+                            text: Model.rowMeta(card.entry) + root.speedFor(card.entry.id) + root.etaFor(card.entry.id)
                             color: root.dim
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.body
@@ -1781,21 +1803,57 @@ Panel {
                         }
                       }
 
-                      // Progress: a hairline bar under the card's top edge.
+                      // Progress: a visible bar with a percentage readout, IDM-style.
                       Rectangle {
                         width: parent.width
-                        height: 3
-                        radius: 2
+                        height: 6
+                        radius: 3
                         visible: card._busy
-                        color: Util.alpha(root.dim, 0.25)
+                        color: Util.alpha(root.dim, 0.22)
 
                         Rectangle {
                           width: parent.width * root.fraction(card.entry)
                           height: parent.height
-                          radius: 2
+                          radius: 3
                           color: card.status === "error" ? root.urgent : root.accent
                           Behavior on width {
                             NumberAnimation { duration: 250; easing.type: Easing.OutCubic }
+                          }
+                        }
+
+                        Text {
+                          anchors.right: parent.right
+                          anchors.rightMargin: Style.spacing.sm
+                          anchors.verticalCenter: parent.verticalCenter
+                          visible: root.fraction(card.entry) > 0
+                          text: Math.floor(root.fraction(card.entry) * 100) + "%"
+                          color: "#ffffff"
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                        }
+                      }
+
+                      // Segment bar: one block per byte range, IDM-style. Each
+                      // block is done (accent), active (accent, partial fill
+                      // approximated by overall fraction), or pending (dim).
+                      Row {
+                        width: parent.width
+                        height: 4
+                        spacing: 2
+                        visible: card._busy && card.entry.segments && Number(card.entry.segments.total) > 1
+                        Repeater {
+                          model: card.entry.segments ? Number(card.entry.segments.total) : 0
+                          delegate: Rectangle {
+                            width: (parent.width - (Number(card.entry.segments.total) - 1) * 2) / Number(card.entry.segments.total)
+                            height: parent.height
+                            radius: 1
+                            color: {
+                              var done = Number(card.entry.segments.done) || 0
+                              if (index < done) return root.accent
+                              if (index === done) return Util.alpha(root.accent, 0.45)
+                              return Util.alpha(root.dim, 0.25)
+                            }
                           }
                         }
                       }
