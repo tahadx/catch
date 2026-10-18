@@ -710,8 +710,6 @@ Panel {
         cursorShape: Qt.PointingHandCursor
         // A press that closes an open popup must not reopen it on release.
         property bool justClosed: false
-        onOpened: justClosed = false
-        onClosed: justClosed = true
         onClicked: {
           if (justClosed) { justClosed = false; return }
           dd.toggle()
@@ -749,6 +747,7 @@ Panel {
         }
 
         onOpened: {
+          hit.justClosed = false
           // Flip above the trigger when the list would run past the bottom of
           // the visible area: the settings rows sit low, and a clipped option
           // is no option at all.
@@ -761,7 +760,7 @@ Panel {
           list.forceActiveFocus()
           dd.popupToggled(true)
         }
-        onClosed: dd.popupToggled(false)
+        onClosed: { hit.justClosed = true; dd.popupToggled(false) }
 
         contentItem: ListView {
           id: list
