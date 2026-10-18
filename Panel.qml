@@ -1366,7 +1366,9 @@ Panel {
         if (m) root.toggleMark(m.id)
       }
       onReturnRequested: {
-        // Enter does nothing. See onActivateRequested above.
+        // Enter opens the finished file.
+        var m = root.queue.downloads[root.cursorIndex]
+        if (m && m.status === "done") root.openFile(m.id)
       }
       onDeleteRequested: {
         if (root.typing() || root.showingSettings) return
@@ -1673,6 +1675,10 @@ Panel {
                       hoverEnabled: true
                       acceptedButtons: Qt.LeftButton
                       onClicked: root.cursorIndex = card.index
+                      onDoubleClicked: {
+                        root.cursorIndex = card.index
+                        if (card.entry.status === "done") root.openFile(card.entry.id)
+                      }
                     }
 
                     Column {
@@ -1784,7 +1790,7 @@ Panel {
                           // icon here.
                           PanelActionButton {
                             visible: root.stoppable(card.entry) || root.resumable(card.entry)
-                            iconText: root.stoppable(card.entry) ? "󰓛" : "󰐊"
+                            iconText: root.stoppable(card.entry) ? "󰏤" : "󰐊"
                             tooltipText: root.stoppable(card.entry) ? "Stop (x), keeps the row" : "Resume (p)"
                             foreground: root.stoppable(card.entry) ? root.urgent : root.accent
                             hoverColor: root.stoppable(card.entry) ? root.urgent : root.accent
@@ -1803,14 +1809,7 @@ Panel {
                             onClicked: root.removeEntry(card.did)
                           }
 
-                          PanelActionButton {
-                            iconText: card.isOpen ? "󰅖" : "•••"
-                            tooltipText: card.isOpen ? "Hide actions" : "Row actions"
-                            foreground: card.isOpen ? root.accent : root.dim
-                            hoverColor: root.accent
-                            fontFamily: root.fontFamily
-                            onClicked: root.toggleRowActions(card.did)
-                          }
+                          // Row actions menu removed: open via double-click or Enter.
                         }
                       }
 
