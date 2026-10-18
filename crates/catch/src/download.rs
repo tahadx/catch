@@ -159,16 +159,40 @@ pub(crate) fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(millis.clamp(50, BACKOFF_MAX.as_millis() as u64))
 }
 
-/// A server-provided Retry-After (seconds form), clamped.
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+/// A server-provided Retry-After (seconds or HTTP-date form), clamped.
+pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let raw = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
         .ok()?
         .trim()
         .to_string();
-    let secs = raw.parse::<u64>().ok()?;
-    Some(Duration::from_secs(secs).min(RETRY_AFTER_MAX))
+    // Integer seconds form.
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs).min(RETRY_AFTER_MAX));
+    }
+    // HTTP-date form (RFC 7231). Far-future and malformed values are clamped
+    // or rejected rather than parking the worker indefinitely.
+    if let Ok(date) = chrono::DateTime::parse_from_rfc2822(&raw) {
+        let now = chrono::Utc::now();
+        let delay = date.signed_duration_since(now);
+        if delay.num_seconds() < 0 {
+            return Some(Duration::ZERO);
+        }
+        let secs = delay.num_seconds() as u64;
+        return Some(Duration::from_secs(secs).min(RETRY_AFTER_MAX));
+    }
+    // Try the IMF-fixdate spelling explicitly (RFC 7231 preferred form).
+    if let Ok(date) = chrono::NaiveDateTime::parse_from_str(&raw, "%a, %d %b %Y %H:%M:%S GMT") {
+        let now = chrono::Utc::now().naive_utc();
+        let delay = date.signed_duration_since(now);
+        if delay.num_seconds() < 0 {
+            return Some(Duration::ZERO);
+        }
+        let secs = delay.num_seconds() as u64;
+        return Some(Duration::from_secs(secs).min(RETRY_AFTER_MAX));
+    }
+    None
 }
 
 /// Classify an HTTP failure status. Temporary conditions retry; anything
@@ -272,6 +296,7 @@ pub async fn download_entry(
     let url = entry.url.clone();
     let recorded_name = sanitize_filename(&entry.filename);
     let recorded_bytes = entry.bytes;
+    let recorded_total = entry.total;
     let recorded_etag = entry.etag.clone();
     let recorded_modified = entry.last_modified.clone();
     let base = resolve_download_dir(dir_override);
@@ -338,7 +363,7 @@ pub async fn download_entry(
     // Resume offset: bytes already on disk win over the recorded counter.
     let mut progress = Progress {
         bytes: std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0),
-        total: 0,
+        total: recorded_total,
         last_flush: Instant::now(),
         last_error: String::new(),
         etag: recorded_etag,
@@ -537,7 +562,21 @@ pub async fn download_entry(
                 .get(reqwest::header::LAST_MODIFIED)
                 .and_then(|v| v.to_str().ok());
             match header.and_then(parse_content_range) {
-                Some((start, end, total)) if start == progress.bytes && end + 1 > start => {
+                Some((start, end, None)) if start == progress.bytes && end + 1 > start => {
+                    // Unknown representation length: a ranged response cannot
+                    // establish completion. Fall back to a plain sequential
+                    // download (resumable state is discarded).
+                    progress.resumable = false;
+                    if progress.bytes > 0 {
+                        restart_from_zero(&part, &mut progress);
+                    }
+                    drop(resp);
+                    continue;
+                }
+                Some((start, end, total))
+                    if start == progress.bytes && end + 1 > start && total.is_some() =>
+                {
+                    let total = total.unwrap();
                     // A server is supposed to answer 200 to a stale
                     // If-Range, but trust is not proof: if the response
                     // itself carries different validators (or a different
@@ -547,8 +586,7 @@ pub async fn download_entry(
                         !progress.etag.is_empty() && resp_etag.is_some_and(|e| e != progress.etag);
                     let modified_changed = !progress.last_modified.is_empty()
                         && resp_modified.is_some_and(|lm| lm != progress.last_modified);
-                    let size_changed =
-                        total.is_some() && progress.total > 0 && total != Some(progress.total);
+                    let size_changed = progress.total > 0 && Some(total) != Some(progress.total);
                     if progress.bytes > 0 && (etag_changed || modified_changed || size_changed) {
                         eprintln!(
                             "catch: {id} remote changed under a resumed transfer; restarting from zero"
@@ -556,11 +594,7 @@ pub async fn download_entry(
                         restart_from_zero(&part, &mut progress);
                         continue;
                     }
-                    if let Some(total) = total {
-                        progress.total = total;
-                    } else {
-                        progress.total = progress.bytes + (end + 1 - start);
-                    }
+                    progress.total = total;
                 }
                 _ => {
                     let why = "malformed Content-Range on a resumed transfer";
@@ -1203,14 +1237,31 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
         overwrite,
         base,
     } = f;
+
+    // Race safety: if the row is already cancelled or removed, do not publish
+    // a final file. Remove the part and bail.
+    let alive = crate::state::with_lock(|| {
+        let state = crate::state::load_state()?;
+        Ok(state
+            .downloads
+            .iter()
+            .any(|d| d.id == id && d.status == Status::Downloading))
+    })
+    .unwrap_or(false);
+    if !alive {
+        let _ = std::fs::remove_file(part);
+        segment::remove_manifest(part);
+        anyhow::bail!("{id} stopped");
+    }
+
     let held = std::fs::metadata(part)
         .map(|m| m.len())
         .with_context(|| format!("stat {}", part.display()))?;
-    let total = total.map(|t| t.max(held)).unwrap_or(held);
-    if total > 0 && held < total {
-        // Never report success for a file that is short of its announced
-        // size: the bytes that are there stay in the part file for a resume.
-        let msg = format!("incomplete: {held} of {total} bytes");
+    let total = total.unwrap_or(held);
+    if total > 0 && held != total {
+        // Never report success for a file whose size disagrees with the
+        // announced total: too short or too long both fail.
+        let msg = format!("size mismatch: {held} of {total} bytes");
         let _ = mark_error(id, &msg);
         anyhow::bail!("{msg}");
     }
@@ -1231,9 +1282,11 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| dest_name.to_string());
     let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(held);
+
+    // Re-check under the lock: cancellation or removal may have won during
+    // the rename. If so, drop the published file and do not mark done.
+    let mut lost = false;
     update_state(|state| {
-        // A stop order may have landed with the final chunk: only take the
-        // win if nobody cancelled or removed us mid-flight.
         if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
             if d.status == Status::Downloading {
                 d.status = Status::Done;
@@ -1243,18 +1296,26 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
                 d.error.clear();
                 d.pid = 0;
                 d.claimed_at = 0;
+            } else {
+                lost = true;
             }
+        } else {
+            // Row was removed: completion lost.
+            lost = true;
         }
-        // The file is on disk whatever happened to the row above, so record
-        // it: a link caught again must still be recognised as a duplicate
-        // after the queue is cleared. This runs in the *same* locked write as
-        // the status change, and for every completion path — a transfer
-        // finished from an existing part file used to be omitted from the
-        // index entirely, so the next send of that link downloaded a
-        // silent second copy.
-        crate::state::record_saved(state, url, base, &dest, crate::state::DownloadKind::File);
+        if !lost {
+            crate::state::record_saved(state, url, base, &dest, crate::state::DownloadKind::File);
+        }
         Ok(())
     })?;
+    if lost {
+        // Best-effort cleanup of the published file.
+        if let Some(safe) = crate::state::resolve_inside(base, &dest.to_string_lossy()) {
+            let _ = std::fs::remove_file(safe);
+        }
+        let _ = std::fs::remove_file(&dest);
+        anyhow::bail!("{id} stopped");
+    }
     eprintln!("catch: done {} -> {}", id, dest.display());
     crate::state::spawn_drain();
     Ok(dest)
@@ -1326,6 +1387,38 @@ mod range_tests {
                 "{code} must be retried"
             );
         }
+    }
+
+    #[test]
+    fn retry_after_parses_http_date() {
+        use chrono::{Duration as ChronoDuration, Utc};
+        let future = Utc::now() + ChronoDuration::seconds(10);
+        let date_str = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, date_str.parse().unwrap());
+        match retry_after(&headers) {
+            Some(d) => assert!(
+                d.as_secs() >= 5 && d.as_secs() <= 15,
+                "expected ~10s, got {d:?}"
+            ),
+            None => panic!("http-date Retry-After must parse"),
+        }
+        // malformed
+        let mut h2 = reqwest::header::HeaderMap::new();
+        h2.insert(reqwest::header::RETRY_AFTER, "not-a-date".parse().unwrap());
+        assert!(retry_after(&h2).is_none());
+        // far future clamped
+        let far = Utc::now() + ChronoDuration::days(10);
+        let far_str = far.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let mut h3 = reqwest::header::HeaderMap::new();
+        h3.insert(reqwest::header::RETRY_AFTER, far_str.parse().unwrap());
+        assert_eq!(retry_after(&h3), Some(RETRY_AFTER_MAX));
+        // past date -> zero (no wait)
+        let past = Utc::now() - ChronoDuration::seconds(10);
+        let past_str = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let mut h4 = reqwest::header::HeaderMap::new();
+        h4.insert(reqwest::header::RETRY_AFTER, past_str.parse().unwrap());
+        assert_eq!(retry_after(&h4), Some(Duration::ZERO));
     }
 
     #[test]

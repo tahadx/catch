@@ -1154,3 +1154,136 @@ fn version_never_runs_self_configure_and_configure_can_suppress_it() {
     let runs = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(runs.lines().count(), 1, "configure ran {runs:?}");
 }
+
+#[test]
+fn unknown_total_content_range_falls_back_to_full_download() {
+    let sb = Sandbox::new("unknown-total");
+    let body = patterned(5000, 7);
+    let serve = body.clone();
+    let hits = Arc::new(Mutex::new(0usize));
+    let count = hits.clone();
+    let server = Server::start(move |_req, n| {
+        *count.lock().unwrap() += 1;
+        if n == 0 {
+            let mut r = Reply::new(206);
+            r.headers
+                .push(("Content-Range".into(), "bytes 0-99/*".into()));
+            r.headers.push(("Content-Length".into(), "100".into()));
+            r.body = Body::Bytes(serve[..100].to_vec());
+            r
+        } else {
+            Reply::ok(serve.clone())
+        }
+    });
+    sb.seed(vec![row(
+        "unk",
+        "http://placeholder/f.bin",
+        "f.bin",
+        "queued",
+    )]);
+    let url = server.url("f.bin");
+    let mut state = sb.state();
+    state["downloads"][0]["url"] = json!(url);
+    sb.write_state(&state);
+
+    let mut cmd = sb.cmd();
+    cmd.args(["download", "unk", "--dir", &dir(&sb)]);
+    let out = run(cmd, Duration::from_secs(20));
+    assert!(
+        out.status.success(),
+        "unknown-total did not recover: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(sb.base().join("f.bin")).unwrap(), body);
+    assert!(
+        *hits.lock().unwrap() >= 2,
+        "must fall back to a full download, not stop at 100 bytes"
+    );
+}
+
+#[test]
+fn larger_representation_without_validators_restarts() {
+    let sb = Sandbox::new("larger-repr");
+    let old = vec![0xAAu8; 100];
+    let new = patterned(7000, 91);
+    sb.seed(vec![row(
+        "big",
+        "http://placeholder/f.bin",
+        "f.bin",
+        "queued",
+    )]);
+    let part = sb.part("big", "f.bin");
+    std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+    std::fs::write(&part, &old).unwrap();
+
+    let serve = new.clone();
+    let server = Server::start(move |_req, _n| Reply::ok(serve.clone()));
+    let url = server.url("f.bin");
+    let mut state = sb.state();
+    state["downloads"][0]["url"] = json!(url);
+    state["downloads"][0]["bytes"] = json!(100);
+    // no etag / last_modified (validators absent), total unknown
+    sb.write_state(&state);
+
+    let mut cmd = sb.cmd();
+    cmd.args(["download", "big", "--dir", &dir(&sb)]);
+    let out = run(cmd, Duration::from_secs(20));
+    assert!(
+        out.status.success(),
+        "larger representation failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(sb.base().join("f.bin")).unwrap(), new);
+}
+
+#[test]
+fn rename_cannot_escape_download_dir() {
+    let sb = Sandbox::new("rename-traversal");
+    let outside = sb.root.join("outside.txt");
+    std::fs::write(&outside, b"secret").unwrap();
+
+    let url = "https://x.test/a";
+    let state = json!({
+        "version": 1,
+        "downloads": [],
+        "saved": { url: { "path": "../../outside.txt", "kind": "file", "bytes": 6, "at": 1 } },
+        "asks": []
+    });
+    sb.write_state(&state);
+
+    let mut cmd = sb.cmd();
+    cmd.args(["rename", url, "newname"]);
+    let _ = run(cmd, Duration::from_secs(10));
+
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"secret",
+        "rename must not touch a file outside the download dir"
+    );
+}
+
+#[test]
+fn replace_cannot_delete_outside_download_dir() {
+    let sb = Sandbox::new("replace-traversal");
+    let outside = sb.root.join("outside.txt");
+    std::fs::write(&outside, b"secret").unwrap();
+
+    let url = "https://x.test/a";
+    let state = json!({
+        "version": 1,
+        "downloads": [],
+        "saved": { url: { "path": "../../outside.txt", "kind": "file", "bytes": 6, "at": 1 } },
+        "asks": []
+    });
+    sb.write_state(&state);
+
+    let mut cmd = sb.cmd();
+    cmd.args(["replace", url]);
+    let _ = run(cmd, Duration::from_secs(10));
+
+    assert!(
+        outside.exists(),
+        "replace must not delete a file outside the download dir"
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"secret");
+}

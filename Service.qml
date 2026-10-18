@@ -27,6 +27,9 @@ Item {
   // Last scheduling shape seen (queued/downloading rows). Only a change here
   // needs a drainer; a byte counter moving does not.
   property string lastSchedule: ""
+  // True once backend configuration (binary links, host manifests) has
+  // completed. Drains must not run before that.
+  property bool configured: false
   // An event landed while a drainer was already running. Re-check once when
   // it exits instead of losing the wake-up.
   property bool drainPending: false
@@ -43,10 +46,20 @@ Item {
   // without the restarted-timer starvation that frequent progress flushes
   // would cause.
   function evaluate() {
+    if (!root.configured) return
     var next = Model.scheduleSignature(Model.parse(root.stateText))
     if (next === root.lastSchedule) return
     root.lastSchedule = next
     root.maybeDrain()
+  }
+
+  // Force one scheduling evaluation, ignoring the last signature. Used after
+  // configuration completes so a queued item drains even when the signature
+  // has not changed since the (deferred) first read.
+  function forceEvaluate() {
+    if (!root.configured) return
+    root.lastSchedule = ""
+    root.evaluate()
   }
 
   function maybeDrain() {
@@ -74,7 +87,9 @@ Item {
     onFileChanged: watcher.reload()
     onLoaded: {
       root.stateText = watcher.text()
-      if (!evaluateTimer.running) evaluateTimer.start()
+      if (root.configured) {
+        if (!evaluateTimer.running) evaluateTimer.start()
+      }
     }
     onLoadFailed: {
       root.stateText = ""
@@ -86,10 +101,10 @@ Item {
     id: configureProcess
     running: false
     onExited: {
-      // Configuration may have (re)installed the binaries; take one look at
-      // the current queue. A state change after this arrives through
-      // FileView as usual.
-      root.evaluate()
+      // Configuration may have (re)installed the binaries; mark ready and
+      // force one scheduling evaluation even if the signature is unchanged.
+      root.configured = true
+      root.forceEvaluate()
     }
   }
 

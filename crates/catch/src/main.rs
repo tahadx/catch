@@ -406,10 +406,9 @@ async fn main() -> Result<()> {
             // changed format). The old file leaves only after the new one
             // is in place, and only when it sits inside the download dir.
             if dest != old {
-                if let Some(dir) = old.parent() {
-                    if let Some(safe) = state::resolve_inside(dir, &old.to_string_lossy()) {
-                        let _ = std::fs::remove_file(safe);
-                    }
+                let base = state::resolve_download_dir(None);
+                if let Some(safe) = state::resolve_inside(&base, &old.to_string_lossy()) {
+                    let _ = std::fs::remove_file(safe);
                 }
             }
             state::spawn_drain();
@@ -610,27 +609,26 @@ fn rename_target(
     let mut final_name = wanted.clone();
     let mut dest = PathBuf::new();
     if wanted != old_name {
-        let mut src = if old_rel.is_empty() {
-            base.join(old_name)
-        } else {
-            base.join(old_rel)
-        };
-        if !src.is_file() {
-            // Older records may predate the saved index, or the folder
-            // setting may have flipped under us.
+        // Resolve the source safely against the download root. An untrusted
+        // or stale relative path must never point outside the download dir.
+        let mut src: Option<PathBuf> = None;
+        if old_rel.is_empty() {
             for dir in [
+                base.clone(),
                 state::video_dir(&base),
                 state::dir_for(&base, old_name),
-                base.clone(),
             ] {
                 let candidate = dir.join(old_name);
-                if candidate.is_file() {
-                    src = candidate;
+                if let Some(safe) = state::resolve_inside(&base, &candidate.to_string_lossy()) {
+                    src = Some(safe);
                     break;
                 }
             }
+        } else {
+            let candidate = base.join(old_rel);
+            src = state::resolve_inside(&base, &candidate.to_string_lossy());
         }
-        if src.is_file() {
+        if let Some(src) = src {
             let dir = src
                 .parent()
                 .map(|p| p.to_path_buf())
@@ -894,9 +892,10 @@ fn remove_one(id: &str, delete_file: bool) -> Result<()> {
     let _ = std::fs::remove_file(format!("{}.meta", part.display()));
     if delete_file {
         // The file may predate categories or the setting may have flipped:
-        // try the category dir first, then the flat base.
+        // try the category dir first, then the flat base. The boundary is
+        // always the download root, never the file's own parent.
         for dir in [state::dir_for(&base, &name), base.clone()] {
-            if let Some(p) = state::resolve_inside(&dir, &dir.join(&name).to_string_lossy()) {
+            if let Some(p) = state::resolve_inside(&base, &dir.join(&name).to_string_lossy()) {
                 let _ = std::fs::remove_file(&p);
                 break;
             }
