@@ -962,8 +962,7 @@ Panel {
       status: String(it.status || "queued"),
       bytes: Number(it.bytes) || 0,
       total: Number(it.total) || 0,
-      error: String(it.error || ""),
-      segments: it.segments || null
+      error: String(it.error || "")
     }
   }
 
@@ -977,7 +976,6 @@ Panel {
     if (cur.total !== obj.total) queueModel.setProperty(i, "total", obj.total)
     if (cur.error !== obj.error) queueModel.setProperty(i, "error", obj.error)
     if (cur.url !== obj.url) queueModel.setProperty(i, "url", obj.url)
-    if (cur.segments !== obj.segments) queueModel.setProperty(i, "segments", obj.segments)
   }
 
   function syncModel(items) {
@@ -1051,6 +1049,17 @@ Panel {
   function speedFor(id) {
     var s = root.speeds[id]
     return s ? " · " + s : ""
+  }
+
+  // Segments diagnostic for a row, looked up from the parsed queue state
+  // (not a ListModel role, so it never breaks delegate creation).
+  function segmentsFor(id) {
+    var q = root.queue
+    if (!q || !q.downloads) return null
+    for (var i = 0; i < q.downloads.length; i++) {
+      if (q.downloads[i].id === id) return q.downloads[i].segments || null
+    }
+    return null
   }
 
   // Estimated time remaining for a downloading row, derived from the
@@ -1631,8 +1640,7 @@ Panel {
                       status: status,
                       bytes: bytes,
                       total: total,
-                      error: error,
-                      segments: segments
+                      error: error
                     })
                     readonly property bool isCursor: root.cursorIndex === index
                     readonly property bool isMarked: root.isMarked(did)
@@ -1717,7 +1725,7 @@ Panel {
                           Text {
                             width: parent.width
                             textFormat: Text.PlainText
-                            text: Model.rowMeta(card.entry) + (card._busy && root.fraction(card.entry) > 0 ? " · " + Math.floor(root.fraction(card.entry) * 100) + "%" : "") + root.speedFor(card.entry.id) + root.etaFor(card.entry.id)
+                            text: Model.rowMeta(card.entry) + (function(){ var s = root.segmentsFor(card.entry.id); return (s && Number(s.total) > 1) ? " · " + (Number(s.done)||0) + "/" + s.total + " seg" : "" })() + (card._busy && root.fraction(card.entry) > 0 ? " · " + Math.floor(root.fraction(card.entry) * 100) + "%" : "") + root.speedFor(card.entry.id) + root.etaFor(card.entry.id)
                             color: root.dim
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.body
@@ -1829,16 +1837,17 @@ Panel {
                         width: parent.width
                         height: 3
                         spacing: 2
-                        visible: card._busy && card.entry.segments && Number(card.entry.segments.total) > 1
+                        property var segs: root.segmentsFor(card.entry.id)
+                        visible: card._busy && segs && Number(segs.total) > 1
 
                         Repeater {
-                          model: card.entry.segments ? Number(card.entry.segments.total) : 0
+                          model: parent.segs ? Number(parent.segs.total) : 0
                           delegate: Rectangle {
-                            width: (parent.width - (Number(card.entry.segments.total) - 1) * 2) / Number(card.entry.segments.total)
-                            height: parent.height
+                            width: (parent.parent.width - (Number(parent.parent.segs.total) - 1) * 2) / Number(parent.parent.segs.total)
+                            height: parent.parent.height
                             radius: 1.5
                             color: {
-                              var done = Number(card.entry.segments.done) || 0
+                              var done = Number(parent.parent.segs.done) || 0
                               if (index < done) return root.accent
                               if (index === done) return Util.alpha(root.accent, 0.55)
                               return Util.alpha(root.dim, 0.18)
