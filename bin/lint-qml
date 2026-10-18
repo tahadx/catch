@@ -1,0 +1,46 @@
+#!/bin/bash
+# Parse-level QML syntax check for the shell plugin. Fails only on syntax
+# diagnostics: qmllint < 6.6 (Ubuntu 24.04 ships 6.4.2) exits 255 for any
+# warning and reports parse errors as bare file:line lines, while 6.6+ tags
+# them with [syntax]. CI has no Omarchy qs.* modules, so unresolved-import
+# warnings are expected there. Set LINT_QML_VERBOSE=1 to print every
+# diagnostic on success too; failures always print them.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+# Prefer Qt6's canonical path: distros also ship a legacy Qt5 qmllint on
+# PATH (/usr/bin/qmllint) that has different output and exit codes.
+lint=""
+if [ -x /usr/lib/qt6/bin/qmllint ]; then
+  lint=/usr/lib/qt6/bin/qmllint
+else
+  lint="$(command -v qmllint || true)"
+fi
+if [ -z "$lint" ]; then
+  echo "qmllint not available; skipping QML syntax check"
+  exit 0
+fi
+
+if out="$("$lint" Service.qml Panel.qml 2>&1)"; then
+  rc=0
+else
+  rc=$?
+fi
+
+if grep -qE '^[^:]+\.qml:[0-9]+|\[syntax\]|^Error' <<<"$out"; then
+  printf '%s\n' "$out"
+  echo "qmllint: syntax errors found" >&2
+  exit 1
+fi
+# 255 is the only benign non-zero: warnings on qmllint < 6.6.
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 255 ]; then
+  printf '%s\n' "$out"
+  echo "qmllint: unexpected exit code $rc" >&2
+  exit 1
+fi
+
+if [ "${LINT_QML_VERBOSE:-0}" = "1" ]; then
+  printf '%s\n' "$out"
+fi
+warnings=$(grep -cE '^Warning' <<<"$out" || true)
+echo "QML syntax: ok ($warnings warnings ignored)"

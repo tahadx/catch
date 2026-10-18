@@ -3,12 +3,13 @@
 #   git config core.hooksPath .githooks
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
-echo "pre-push: fmt, clippy, tests, model js, installer, release, dist"
+echo "pre-push: fmt, clippy, tests, model js, qml, installer, release, dist"
 cargo fmt --check -p catch
 cargo clippy -p catch --all-targets -- -D warnings
 cargo test -p catch --quiet
 node tests/model.test.js
 cmp AGENTS.md CLAUDE.md
+bin/lint-qml
 bash tests/install.test.sh
 bin/check-release
 if command -v omarchy >/dev/null 2>&1; then

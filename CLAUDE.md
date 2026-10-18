@@ -14,7 +14,7 @@ Catch is an Omarchy shell plugin plus a Rust download backend. The queue, the by
 | `crates/catch/src/drain.rs` | Slot scheduling and worker spawning |
 | `Panel.qml`, `Service.qml`, `Model.js` | Bar widget, service, and pure JS logic tested by Node |
 | `extensions/chromium-catch/`, `extensions/firefox-catch/` | Browser extensions; `background-3.js` must stay identical in both |
-| `bin/`, `install.sh` | Configure/uninstall, dist refresh, version and release checks |
+| `bin/`, `install.sh` | Configure/uninstall, dist refresh, QML lint, version and release checks |
 | `bin/dist/` | Shipped x86_64 binaries, generated and committed |
 | `crates/catch/tests/`, `tests/` | End-to-end, model, installer, and benchmark suites |
 | `docs/release.md` | Tag-driven release process |
@@ -92,7 +92,7 @@ For QML or extension changes, also run:
 node --check extensions/chromium-catch/background-3.js
 node --check extensions/firefox-catch/background-3.js
 cmp extensions/chromium-catch/background-3.js extensions/firefox-catch/background-3.js
-/usr/lib/qt6/bin/qmllint --max-warnings 9999 Service.qml Panel.qml
+bin/lint-qml
 omarchy plugin validate .
 ```
 
