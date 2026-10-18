@@ -765,14 +765,13 @@ Panel {
         onClosed: { hit.justClosed = true; dd.popupToggled(false) }
 
         Keys.onPressed: function (event) {
-          var t = event.text || ""
-          if (event.key === Qt.Key_Escape || t === "h") {
+          if (event.key === Qt.Key_Escape) {
             drop.close(); event.accepted = true
-          } else if (event.key === Qt.Key_Down || t === "j") {
+          } else if (event.key === Qt.Key_Down || event.text === "j") {
             list.currentIndex = Math.min(dd.options.length - 1, list.currentIndex + 1); event.accepted = true
-          } else if (event.key === Qt.Key_Up || t === "k") {
+          } else if (event.key === Qt.Key_Up || event.text === "k") {
             list.currentIndex = Math.max(0, list.currentIndex - 1); event.accepted = true
-          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || t === "l") {
+          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             dd.selectCurrent(); event.accepted = true
           }
         }
