@@ -21,3 +21,15 @@ CLAUDE.md linguist-documentation
 # Byte-exact test fixtures (none on disk today) would be pinned here with
 # `-text`, e.g. `crates/catch/tests/fixtures/** -text`, so checkout never
 # rewrites fixture bytes.
+
+# Tests and documentation are development-only: keep them out of the published
+# release tarball (git archive / GitHub release assets) and out of language
+# statistics. They remain in the working tree and in CI.
+tests/ export-ignore
+crates/catch/tests/ export-ignore
+docs/ export-ignore
+AGENTS.md export-ignore
+CLAUDE.md export-ignore
+
+crates/catch/tests/** linguist-detectable=false
+tests/** linguist-detectable=false
