@@ -10,7 +10,7 @@ const path = require("node:path")
 const src = fs
   .readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library\s*$/m, "")
-const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, statusLabel, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath }")()
+const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath }")()
 
 assert.strictEqual(Model.expandHome("~", "/home/you"), "/home/you")
 assert.strictEqual(Model.expandHome("~/Downloads/catch", "/home/you"), "/home/you/Downloads/catch")
@@ -252,5 +252,30 @@ assert.strictEqual(Model.scheduleSignature(Model.parse(JSON.stringify({
 assert.notStrictEqual(base, Model.scheduleSignature(two("done", 1)), "a completion is a scheduling event")
 assert.strictEqual(Model.scheduleSignature(Model.empty()), "")
 assert.strictEqual(Model.scheduleSignature(null), "")
+
+// Backend-measured fields survive the parse, and the badge says "Scheduled"
+// while the scheduler holds a queued row out of its window.
+const scheduled = Model.parse(JSON.stringify({
+  version: 1,
+  downloads: [
+    { id: "a", url: "u", filename: "a.bin", status: "queued", bytes: 0, total: 0, error: "", sched_hold: true, priority: 2, speed: 123, eta: 4, attempts: 1 },
+  ],
+})).downloads[0]
+assert.strictEqual(scheduled.sched_hold, true)
+assert.strictEqual(scheduled.priority, 2)
+assert.strictEqual(scheduled.speed, 123)
+assert.strictEqual(scheduled.eta, 4)
+assert.strictEqual(Model.statusLabelFor(scheduled), "Scheduled")
+assert.strictEqual(Model.statusLabelFor({ status: "queued" }), "Queued", "no flag means an ordinary queued row")
+assert.strictEqual(Model.statusLabelFor({ status: "downloading" }), "Downloading")
+assert.strictEqual(Model.rowMeta(scheduled), "BIN · Scheduled")
+
+// A transfer that is still moving never reads 100%: only a done row does.
+const moving = Model.statusText(Model.parse(JSON.stringify({
+  version: 1,
+  downloads: [{ id: "a", url: "u", filename: "a.bin", status: "downloading", bytes: 100, total: 100, error: "" }],
+})))
+assert.ok(moving.includes("99%"), "moving transfers cap at 99%: " + moving)
+assert.ok(!moving.includes("100%"), "moving transfers never read 100%: " + moving)
 
 console.log("model.test.js: ok")

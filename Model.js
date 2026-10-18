@@ -56,6 +56,12 @@ function parse(text) {
       bytes: Number(d.bytes) || 0,
       total: Number(d.total) || 0,
       error: String(d.error || ""),
+      speed: Number(d.speed) || 0,
+      avg_speed: Number(d.avg_speed) || 0,
+      eta: Number(d.eta) || 0,
+      priority: Number(d.priority) || 0,
+      attempts: Number(d.attempts) || 0,
+      sched_hold: d.sched_hold === true || d.sched_hold === "true",
       segments: (d.segments && typeof d.segments === "object") ? d.segments : null
     })
   }
@@ -198,6 +204,15 @@ function statusLabel(status) {
   }
 }
 
+// Same badge, but scheduler-aware: a queued row the window is holding back
+// says so instead of looking stuck in the queue.
+function statusLabelFor(d) {
+  if (!d) return "Queued"
+  var status = String(d.status || "")
+  if (status === "queued" && d.sched_hold === true) return "Scheduled"
+  return statusLabel(status)
+}
+
 // The type beside the size: the file's own extension, or the kind when the
 // name has none worth showing ("Video" for a stream still resolving).
 function kindLabel(d) {
@@ -220,7 +235,7 @@ function rowMeta(d) {
   var parts = [kindLabel(d)]
   if (bytes > 0 && total > bytes) parts.push(formatBytes(bytes) + " / " + formatBytes(total))
   else if (bytes > 0) parts.push(formatBytes(bytes))
-  else parts.push(statusLabel(status))
+  else parts.push(statusLabelFor(d))
   if (d && d.segments && Number(d.segments.total) > 1) {
     var sdone = Number(d.segments.done) || 0
     parts.push(sdone + "/" + d.segments.total + " seg")
@@ -316,7 +331,8 @@ function statusText(state) {
   }
   var first = active[0]
   var frac = overallFraction(state)
-  var pct = frac >= 0 ? " · " + Math.floor(frac * 100) + "%" : ""
+  // Never read 100% while anything is still moving; only a done row is 100.
+  var pct = frac >= 0 ? " · " + Math.min(99, Math.floor(frac * 100)) + "%" : ""
   var more = active.length > 1 ? " (+" + (active.length - 1) + " more)" : ""
   return "Catch — " + displayName(first) + pct + more
 }
