@@ -351,7 +351,9 @@ pub async fn download_entry(
 
     // Segmented resume: if a sidecar manifest exists and is valid, run the
     // segmented downloader instead of the sequential path.
-    let mut probe_pending = progress.bytes == 0;
+    // Only probe when segmentation is even possible: a cap of 1 disables it,
+    // and probing would only add a wasted request per file.
+    let mut probe_pending = progress.bytes == 0 && segment::segments_cap() >= 2;
     if let Some(manifest) = segment::load_manifest(&part, &url)? {
         let active = load_state()
             .map(|s| {
