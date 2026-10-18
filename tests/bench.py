@@ -61,26 +61,67 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with bench.stats.lock:
             bench.stats.requests += 1
         payload = bench.payload
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Content-Type", "application/octet-stream")
-        self.end_headers()
+        rng = self.headers.get("Range")
         rate = bench.rate_bytes_per_sec
         started = time.monotonic()
         sent = 0
-        try:
-            while sent < len(payload):
-                end = min(sent + CHUNK, len(payload))
-                self.wfile.write(payload[sent:end])
-                self.wfile.flush()
-                sent = end
-                if rate > 0:
-                    target = sent / rate
-                    lag = target - (time.monotonic() - started)
-                    if lag > 0:
-                        time.sleep(lag)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        if rng and rng.startswith("bytes="):
+            try:
+                part = rng[len("bytes="):]
+                s_str, e_str = part.split("-", 1)
+                start = int(s_str) if s_str else 0
+                end = int(e_str) if e_str else len(payload) - 1
+            except ValueError:
+                start, end = 0, len(payload) - 1
+            end = min(end, len(payload) - 1)
+            if start > end or start >= len(payload):
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{len(payload)}")
+                self.end_headers()
+                return
+            body = payload[start:end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(payload)}")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("ETag", '"bench-etag"')
+            self.send_header("Last-Modified", "Wed, 01 Jan 2025 00:00:00 GMT")
+            self.end_headers()
+            try:
+                pos = 0
+                while pos < len(body):
+                    chunk_end = min(pos + CHUNK, len(body))
+                    self.wfile.write(body[pos:chunk_end])
+                    self.wfile.flush()
+                    sent += chunk_end - pos
+                    pos = chunk_end
+                    if rate > 0:
+                        target = sent / rate
+                        lag = target - (time.monotonic() - started)
+                        if lag > 0:
+                            time.sleep(lag)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("ETag", '"bench-etag"')
+            self.send_header("Last-Modified", "Wed, 01 Jan 2025 00:00:00 GMT")
+            self.end_headers()
+            try:
+                while sent < len(payload):
+                    end = min(sent + CHUNK, len(payload))
+                    self.wfile.write(payload[sent:end])
+                    self.wfile.flush()
+                    sent = end
+                    if rate > 0:
+                        target = sent / rate
+                        lag = target - (time.monotonic() - started)
+                        if lag > 0:
+                            time.sleep(lag)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         with bench.stats.lock:
             bench.stats.bytes_sent += sent
 
@@ -388,7 +429,7 @@ def main() -> int:
                     "  seg={segments} c={concurrency:>2} wall={wall_seconds:>6.2f}s "
                     "agg={aggregate_mib_per_second:>7.2f} MiB/s "
                     "per-file={per_file_mib_per_second:>6.2f} MiB/s "
-                    "req={http_requests} retries={retries} "
+                    "req={http_requests} "
                     "catch-cpu={catch_cpu_seconds:>6.2f}s "
                     "rss={peak_catch_rss_mib:>5.1f} MiB "
                     "p50={p50:.2f}s p95={p95:.2f}s status-max={status_max:.1f}ms".format(
