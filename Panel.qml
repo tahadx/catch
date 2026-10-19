@@ -2143,16 +2143,22 @@ Panel {
                     }
                   }
 
-                  SolidButton {
+                  PanelActionButton {
                     id: linkSchedule
                     // The link input is the Start-now default; this is the
-                    // same link one step later.
+                    // same link one step later. A compact clock icon keeps
+                    // the row from reading as two competing buttons.
                     visible: root.refreshId === ""
                     anchors.right: linkGo.left
                     anchors.rightMargin: Style.spacing.sm
                     anchors.verticalCenter: parent.verticalCenter
-                    height: parent.height - root.fieldButtonInset * 2
-                    text: "Schedule…"
+                    size: parent.height - root.fieldButtonInset * 2
+                    iconText: "󰥔"
+                    fontSize: Style.font.subtitle
+                    tooltipText: "Schedule this link for later"
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    focusable: true
                     onClicked: {
                       var text = linkField.text.trim()
                       linkField.text = ""
