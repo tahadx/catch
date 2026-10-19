@@ -34,6 +34,36 @@ Panel {
   property int cursorIndex: -1
   property var marked: ({})
   property bool showingSettings: false
+  // Dedicated scheduler page: the daily window, one-time schedules and the
+  // timer state. Values are drafts until saved; the backend is the enforcer.
+  property bool showingScheduler: false
+  property var schedStatus: ({})
+  property string schedNotice: ""
+  property bool schedWindowEnabled: false
+  property string schedWindowStart: "02:00"
+  property string schedWindowStop: "06:00"
+  property string schedWindowNotice: ""
+  property string schedJobUrl: ""
+  property string schedJobDate: ""
+  property string schedJobTime: ""
+  property string schedJobDir: ""
+  // Non-empty while the form is rescheduling an existing queue row.
+  property string schedEditingId: ""
+  // Form dates are written through this signal as well as the root props:
+  // a TextField's `text` assignment breaks its binding, so a preset must
+  // update the field explicitly instead of relying on a binding.
+  signal schedTimesReady(string date, string time)
+  // The destination field is filled separately: presets change the time
+  // without touching what the user typed for the folder.
+  signal schedDirReady(string dir)
+  // A link typed on the home page, carried into the scheduler form.
+  signal schedUrlReady(string url)
+  // Bumped by a local timer so "in 12m" and "starts 14:30" stay honest
+  // without rebuilding the scheduled list.
+  property int schedClock: 0
+  // Shape of the scheduled list (ids + times); the ListModel is rebuilt only
+  // when this changes, so a progress flush elsewhere costs nothing.
+  property string schedSig: ""
   // Row id whose address is being replaced: the URL input switches to
   // "refresh" mode and the pasted link goes through `catch refresh`, which
   // verifies the new address before reusing the partial data.
@@ -89,6 +119,307 @@ Panel {
   function toggleSettings() {
     root.hold()
     root.showingSettings = !root.showingSettings
+    if (root.showingSettings) {
+      root.showingScheduler = false
+      root.initScheduler()
+    }
+  }
+
+  // Read a scheduler status field with a fallback: an older backend or a
+  // failed query must not leave the page with blank labels.
+  function sched(key, fallback) {
+    var v = root.schedStatus ? root.schedStatus[key] : undefined
+    return v === undefined || v === null ? fallback : v
+  }
+
+  function nowSec() {
+    return Math.floor(Date.now() / 1000)
+  }
+
+  function rowById(id) {
+    var list = (root.queue && root.queue.downloads) || []
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].id === id) return list[i]
+    }
+    return null
+  }
+
+  // Load the saved window and reset the one-time form to a sane next hour
+  // whenever a scheduler screen is opened. Drafts never overwrite saved
+  // values until Save succeeds.
+  function initScheduler() {
+    root.schedWindowEnabled = String(root.setting("schedEnabled", "off")) === "on"
+    root.schedWindowStart = String(root.setting("schedStart", "02:00"))
+    root.schedWindowStop = String(root.setting("schedStop", "06:00"))
+    root.schedWindowNotice = ""
+    if (root.schedJobDate === "" || root.schedJobTime === "") {
+      var next = Model.nextHourInputs(Date.now())
+      root.schedJobDate = next.date
+      root.schedJobTime = next.time
+    }
+    if (root.showingScheduler) root.refreshScheduler()
+  }
+
+  function toggleScheduler() {
+    root.hold()
+    if (root.showingScheduler) {
+      root.closeScheduler()
+      return
+    }
+    root.showingSettings = false
+    root.showingScheduler = true
+    root.schedEditingId = ""
+    root.schedJobUrl = ""
+    root.schedJobDir = ""
+    root.schedNotice = ""
+    root.initScheduler()
+  }
+
+  function closeScheduler() {
+    root.showingScheduler = false
+    root.schedEditingId = ""
+    root.schedNotice = ""
+    keyCatcher.release()
+  }
+
+  // Tab on the scheduler page lands in its first field. The catcher owns the
+  // content-scoped field ids, so it does the focusing.
+  function schedFocusField() {
+    keyCatcher.focusSchedulerField("job-url")
+  }
+
+  function refreshScheduler() {
+    if (schedProc.running) return
+    schedProc.running = true
+  }
+
+  // "Schedule…" on a row: open the list page with this entry ready to
+  // reschedule. The backend validates the time again.
+  function scheduleEntry(d) {
+    if (!d) return
+    root.hold()
+    root.showingSettings = false
+    root.showingScheduler = true
+    root.initScheduler()
+    root.schedEditingId = d.id
+    root.schedJobUrl = String(d.url || "")
+    root.schedJobDir = String(d.dir || "")
+    var now = root.nowSec()
+    var at = Number(d.scheduled_at) || 0
+    var inputs = at > now ? Model.stampInputs(at) : Model.nextHourInputs(Date.now())
+    root.setFormTimes(inputs.date, inputs.time)
+    root.schedDirReady(String(d.dir || ""))
+    root.schedNotice = "Rescheduling " + Model.displayName(d)
+    root.refreshScheduler()
+  }
+
+  // "Schedule…" beside the link input: same form as the row action, with
+  // the typed link already in it. Start-now stays the default on the input
+  // itself; this only moves the link to the scheduler.
+  function scheduleFromInput(text) {
+    root.hold()
+    root.showingSettings = false
+    root.showingScheduler = true
+    root.initScheduler()
+    root.schedEditingId = ""
+    root.schedJobUrl = String(text || "").trim()
+    root.schedJobDir = ""
+    root.schedNotice = ""
+    var next = Model.nextHourInputs(Date.now())
+    root.setFormTimes(next.date, next.time)
+    root.schedDirReady("")
+    root.schedUrlReady(root.schedJobUrl)
+    root.refreshScheduler()
+  }
+
+  function clearSchedJob() {
+    root.schedEditingId = ""
+    root.schedJobUrl = ""
+    root.schedJobDir = ""
+    root.schedNotice = ""
+    var next = Model.nextHourInputs(Date.now())
+    root.setFormTimes(next.date, next.time)
+    root.schedDirReady("")
+  }
+
+  function setFormTimes(date, time) {
+    root.schedJobDate = String(date || "")
+    root.schedJobTime = String(time || "")
+    root.schedTimesReady(root.schedJobDate, root.schedJobTime)
+  }
+
+  function applyPreset(seconds) {
+    var inputs = Model.stampInputs(root.nowSec() + Number(seconds))
+    root.setFormTimes(inputs.date, inputs.time)
+  }
+
+  function tomorrowMorning() {
+    var d = new Date()
+    d.setDate(d.getDate() + 1)
+    var day = d.getFullYear() + "-"
+      + (d.getMonth() < 9 ? "0" : "") + (d.getMonth() + 1) + "-"
+      + (d.getDate() < 10 ? "0" : "") + d.getDate()
+    root.setFormTimes(day, "09:00")
+  }
+
+  // Save the daily window. Equal times mean the whole day; the backend
+  // treats them the same way. Enabling the window also ensures the timer,
+  // since a window is worthless if the machine cannot run it.
+  function saveWindowSettings(startText, stopText) {
+    var start = Model.parseClock(startText)
+    var stop = Model.parseClock(stopText)
+    if (start === null) {
+      root.actionError = "Window start must be HH:MM (24h)."
+      errorTimer.restart()
+      return
+    }
+    if (stop === null) {
+      root.actionError = "Window end must be HH:MM (24h)."
+      errorTimer.restart()
+      return
+    }
+    var a = Model.clockText(start)
+    var b = Model.clockText(stop)
+    root.writeSetting("schedStart", a)
+    root.writeSetting("schedStop", b)
+    root.schedWindowStart = a
+    root.schedWindowStop = b
+    root.schedWindowNotice = start === stop
+      ? "Saved — the whole day is allowed."
+      : "Saved — " + Model.windowSummary(a, b, true) + "."
+    if (root.schedWindowEnabled && root.sched("timer_active", false) !== true) {
+      root.runCatch(["schedule", "install"], "Could not install the scheduler timer.")
+    }
+    root.refreshScheduler()
+  }
+
+  function setWindowEnabled(enabled) {
+    root.schedWindowEnabled = enabled
+    root.writeSetting("schedEnabled", enabled ? "on" : "off")
+    // The timer is deliberately *not* removed when the window is turned
+    // off: one-time schedules still need it. Removal is an explicit action
+    // on the scheduler page.
+    if (enabled && root.sched("timer_active", false) !== true) {
+      root.runCatch(["schedule", "install"], "Could not install the scheduler timer.")
+    }
+    root.schedWindowNotice = enabled
+      ? "Window on — " + Model.windowSummary(root.schedWindowStart, root.schedWindowStop, true) + "."
+      : "Window off — downloads may run any time. The timer stays for one-time schedules."
+    root.refreshScheduler()
+  }
+
+  // Preset windows are converted into the same validated settings as a typed
+  // window; they are not a separate scheduling path.
+  function applyWindowPreset(startText, stopText) {
+    root.saveWindowSettings(startText, stopText)
+    if (root.schedWindowEnabled !== true) root.setWindowEnabled(true)
+  }
+
+  function installSchedulerTimer() {
+    root.hold()
+    root.runRow(["schedule", "install"], "Could not install the scheduler timer.")
+  }
+
+  function removeSchedulerTimer() {
+    root.hold()
+    root.runRow(["schedule", "remove"], "Could not remove the scheduler timer.")
+  }
+
+  // Create the one-time schedule (or reschedule the selected row). The
+  // backend parses/validates again; the panel only catches obvious input
+  // mistakes before a process is spawned. `urlText`/`dirText` come from the
+  // fields: a bound `text` would be broken by typing, and the button click
+  // does not make the field lose focus. Returns true when a request was
+  // sent.
+  function queueScheduledJob(urlText, dirText) {
+    var ts = Model.scheduleStamp(root.schedJobDate, root.schedJobTime, Date.now())
+    if (ts === null) {
+      root.actionError = "Choose a future date (YYYY-MM-DD) and time (HH:MM)."
+      errorTimer.restart()
+      return false
+    }
+    if (root.schedEditingId !== "") {
+      root.hold()
+      root.runRow(
+        ["schedule", "at", root.schedEditingId, String(ts), "--dir", String(dirText || "")],
+        "Could not reschedule that download."
+      )
+      root.schedNotice = "Reschedule requested for " + root.schedJobDate + " " + root.schedJobTime + "."
+      root.schedEditingId = ""
+      // The destination now belongs to the row; clear the draft so a later
+      // enqueue does not inherit it silently.
+      root.schedJobDir = ""
+      root.schedDirReady("")
+      root.refreshScheduler()
+      return true
+    }
+    var links = Model.clipboardLinks(urlText)
+    if (links.length === 0) {
+      root.actionError = "Links start with http(s)://"
+      errorTimer.restart()
+      return false
+    }
+    var args = ["enqueue"].concat(links).concat(["--at", String(ts)])
+    var folder = String(dirText || "").trim()
+    if (folder !== "") args = args.concat(["--dir", folder])
+    root.hold()
+    root.runCatch(
+      args,
+      links.length === 1
+        ? "Could not schedule that link."
+        : "Could not schedule those " + links.length + " links."
+    )
+    root.schedJobUrl = ""
+    root.schedJobDir = ""
+    root.schedNotice = "Schedule requested for " + root.schedJobDate + " " + root.schedJobTime + "."
+    root.refreshScheduler()
+    return true
+  }
+
+  function startScheduledNow(id) {
+    root.hold()
+    root.runRow(["schedule", "now", id], "Could not start that download now.")
+  }
+
+  // One line for the scheduled list, from backend state only.
+  function schedRowState(r) {
+    if (!r) return ""
+    // Touch the clock property so bindings re-evaluate while the page stays
+    // open, without rebuilding the list itself.
+    var tick = root.schedClock
+    var now = root.nowSec()
+    if (r.hold) return "Waiting for the daily window"
+    if (Number(r.at) <= now) return "Due — starting soon"
+    return "Waiting " + Model.untilText(Number(r.at), now)
+  }
+
+  // The scheduled list, kept in a ListModel so a progress flush on some
+  // other row does not rebuild it. Rebuilt only when the scheduled shape
+  // changes.
+  function syncScheduledModel() {
+    var rows = Model.scheduledRows(root.queue)
+    var parts = []
+    for (var i = 0; i < rows.length; i++) {
+      parts.push(rows[i].id + ":" + rows[i].scheduled_at + ":" + rows[i].status
+        + ":" + (rows[i].sched_hold ? 1 : 0) + ":" + rows[i].filename)
+    }
+    var sig = parts.join("|")
+    if (sig === root.schedSig) return
+    root.schedSig = sig
+    schedModel.clear()
+    for (var j = 0; j < rows.length; j++) {
+      var d = rows[j]
+      schedModel.append({
+        sid: d.id,
+        at: Number(d.scheduled_at) || 0,
+        name: Model.displayName(d),
+        filename: String(d.filename || ""),
+        kind: String(d.kind || "file"),
+        hold: d.sched_hold === true,
+        status: String(d.status || "queued"),
+        dir: String(d.dir || ""),
+      })
+    }
   }
 
   // URL arrives as an argument: content-scoped field ids are not visible
@@ -281,25 +612,6 @@ Panel {
     return n
   }
 
-  // Values arrive as arguments because content-scoped field ids are not
-  // visible from root scope (see textEditing above).
-  function saveSchedule(a, b) {
-    root.hold()
-    var ok = function (v) { return /^([01]\d|2[0-3]):[0-5]\d$/.test(v) }
-    if (a !== "" && !ok(a)) {
-      root.actionError = "Window start must be HH:MM (24h)."
-      errorTimer.restart()
-      return
-    }
-    if (b !== "" && !ok(b)) {
-      root.actionError = "Window end must be HH:MM (24h)."
-      errorTimer.restart()
-      return
-    }
-    if (a !== "") root.writeSetting("schedStart", a)
-    if (b !== "") root.writeSetting("schedStop", b)
-  }
-
   // Global bandwidth limit in KB/s; empty clears it. Stored in the widget
   // settings; the backend reads it on every transfer, so it applies to
   // running downloads within a few seconds.
@@ -410,6 +722,7 @@ Panel {
     root.refreshSpeeds()
     root.syncAsks()
     root.noteArrival()
+    root.syncScheduledModel()
   }
 
   function refresh() {
@@ -447,6 +760,8 @@ Panel {
     root.cursorIndex = -1
     root.marked = ({})
     root.showingSettings = false
+    root.showingScheduler = false
+    root.schedEditingId = ""
     root.showShortcuts = false
     root.expandedRow = ""
     root.conflict = null
@@ -1015,6 +1330,12 @@ Panel {
     id: queueModel
   }
 
+  // Pending one-time rows for the scheduler page. Kept separate from the
+  // queue model because the page shows a sorted subset, not the whole list.
+  ListModel {
+    id: schedModel
+  }
+
   function rowObject(it) {
     return {
       did: String(it.id || ""),
@@ -1135,6 +1456,12 @@ Panel {
     return false
   }
 
+  // One-time time for the row badge/meta ("Scheduled · starts 14:30").
+  function scheduledAtFor(id) {
+    var d = root.rowById(id)
+    return d ? Number(d.scheduled_at) || 0 : 0
+  }
+
   // Display percent: an active transfer is capped at 99% so only a row the
   // backend has finished (and verified) ever reads 100%.
   function percentFor(d) {
@@ -1209,6 +1536,57 @@ Panel {
     onLoadFailed: root.reload("")
   }
 
+  // Scheduler status: the backend owns the window math and the timer state,
+  // so the page asks it instead of guessing from stored settings.
+  Process {
+    id: schedProc
+    running: false
+    command: ["catch", "schedule", "status", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var parsed = null
+        try {
+          parsed = JSON.parse(String(text || ""))
+        } catch (e) {
+          parsed = null
+        }
+        root.schedStatus = parsed && typeof parsed === "object"
+          ? parsed
+          : { valid: false, available: false, message: "Scheduler status unavailable." }
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (String(text || "").trim() !== "") console.warn("catch/scheduler:", String(text).trim())
+      }
+    }
+    onExited: function (code) {
+      if (code !== 0 && (!root.schedStatus || !root.schedStatus.message)) {
+        root.schedStatus = { valid: false, available: false, message: "Scheduler status unavailable." }
+      }
+      if (root.showingScheduler) schedPoll.restart()
+    }
+  }
+
+  // While the page is open, re-read status so a timer install from another
+  // terminal shows up, and keep the relative times honest.
+  Timer {
+    id: schedPoll
+    interval: 8000
+    repeat: false
+    onTriggered: root.refreshScheduler()
+  }
+
+  Timer {
+    id: schedClock
+    interval: 20000
+    repeat: true
+    running: root.showingScheduler
+    onTriggered: root.schedClock++
+  }
+
   Process {
     id: cmdRunner
     running: false
@@ -1220,6 +1598,7 @@ Panel {
       // Force a refresh so renames (and other in-place edits) show up
       // even if the file watcher misses the atomic replace.
       stateFile.reload()
+      if (root.showingScheduler) root.refreshScheduler()
       root.nextCmd()
     }
   }
@@ -1233,6 +1612,7 @@ Panel {
         errorTimer.restart()
       }
       stateFile.reload()
+      if (root.showingScheduler) root.refreshScheduler()
       root.nextRow()
     }
   }
@@ -1302,6 +1682,8 @@ Panel {
   // in the reference's letterspaced small-caps style.
   readonly property string headerMeta: root.conflict !== null
     ? "already in your folder · enter chooses · esc cancels"
+    : root.showingScheduler
+    ? "scheduler · one-time and daily windows · esc goes back"
     : root.showingSettings
     ? "settings · super+d toggles · esc goes back"
     : "download manager · " + Model.statusText(root.queue).replace(/^Catch — /, "")
@@ -1373,18 +1755,31 @@ Panel {
           || dirField.activeFocus
           || schedStartField.activeFocus
           || schedStopField.activeFocus
+          || schedWinStartField.activeFocus
+          || schedWinStopField.activeFocus
+          || schedJobUrlField.activeFocus
+          || schedJobDateField.activeFocus
+          || schedJobTimeField.activeFocus
+          || schedJobDirField.activeFocus
       }
 
       onCloseRequested: {
-        // Esc steps back one level: settings → queue, queue → closed.
-        if (root.showingSettings) root.toggleSettings()
+        // Esc steps back one level: scheduler/settings → queue, queue → closed.
+        if (root.showingScheduler) root.closeScheduler()
+        else if (root.showingSettings) root.toggleSettings()
         else root.close()
       }
       onTabRequested: function (direction) {
         // The home page has two zones: the row list and the link input.
         // Tab walks between them so a link can be typed without the mouse.
         // Settings is a form with no list, so Tab keeps switching panels.
-        if (!root.showingSettings && root.conflict === null) {
+        if (root.showingScheduler) {
+          // The scheduler is a form: Tab puts the keyboard in its first
+          // field instead of moving to another panel.
+          root.schedFocusField()
+          return
+        }
+        if (!root.showingSettings && !root.showingScheduler && root.conflict === null) {
           if (root.focusZone === "input") keyCatcher.release()
           else keyCatcher.focusInput()
           return
@@ -1392,10 +1787,28 @@ Panel {
         root.switchPanel(direction)
       }
 
+      // Focus one scheduler field by name from the root scope (the fields
+      // themselves are only visible from here).
+      function focusSchedulerField(which) {
+        var field = which === "job-time" ? schedJobTimeField
+          : which === "job-date" ? schedJobDateField
+          : which === "job-dir" ? schedJobDirField
+          : which === "win-start" ? schedWinStartField
+          : which === "win-stop" ? schedWinStopField
+          : schedJobUrlField
+        // The URL field is hidden while rescheduling; never park the
+        // keyboard in an invisible item (that left `blocked` stuck on).
+        if (which === "job-url" && root.schedEditingId !== "") field = schedJobDateField
+        if (!field.visible || field.height <= 0) field = schedJobDateField
+        root.textEditing = true
+        field.forceActiveFocus()
+        if (typeof field.selectAll === "function") field.selectAll()
+      }
+
       // Put the keyboard in the link field. Only reachable from the content
       // scope: linkField is invisible from root scope (see textEditing).
       function focusInput() {
-        if (root.showingSettings || root.conflict !== null) return
+        if (root.showingSettings || root.showingScheduler || root.conflict !== null) return
         root.focusZone = "input"
         linkField.forceActiveFocus()
         if (typeof linkField.selectAll === "function") linkField.selectAll()
@@ -1433,7 +1846,9 @@ Panel {
           return
         }
         if (event.key === Qt.Key_V && (event.modifiers & (Qt.ControlModifier | Qt.MetaModifier))) {
-          pasteIntoField(field, field === linkField && root.refreshId === "")
+          var multiple = (field === linkField && root.refreshId === "")
+            || field === schedJobUrlField
+          pasteIntoField(field, multiple)
           event.accepted = true
         }
       }
@@ -1443,6 +1858,21 @@ Panel {
       // field with the mouse.
       function pasteIntoInput() {
         if (root.showingSettings || root.conflict !== null) return
+        if (root.showingScheduler) {
+          // The URL field is hidden while rescheduling: pasting a link there
+          // would park the keyboard in an invisible item, so the destination
+          // field takes the paste instead.
+          if (root.schedEditingId !== "") {
+            root.textEditing = true
+            schedJobDirField.forceActiveFocus()
+            pasteIntoField(schedJobDirField, false)
+            return
+          }
+          root.textEditing = true
+          schedJobUrlField.forceActiveFocus()
+          pasteIntoField(schedJobUrlField, true)
+          return
+        }
         focusInput()
         pasteIntoField(linkField, root.refreshId === "")
       }
@@ -1469,13 +1899,13 @@ Panel {
         // moves now (up/down, j/k).
         if (dx !== 0) return
         // Settings is a form, not the list: the cursor stays put here.
-        if (root.showingSettings) return
+        if (root.showingSettings || root.showingScheduler) return
         if (root.queue.downloads.length === 0) return
         if (root.cursorIndex < 0) root.cursorIndex = 0
         else root.cursorIndex = Math.max(0, Math.min(root.queue.downloads.length - 1, root.cursorIndex + dy))
       }
       onActivateRequested: {
-        if (root.typing() || root.showingSettings) return
+        if (root.typing() || root.showingSettings || root.showingScheduler) return
         root.hold()
         // Space marks. Enter is deliberately inert for now: it used to arm
         // row activation, which opened the finished file — and, until that was
@@ -1488,13 +1918,13 @@ Panel {
       onReturnRequested: {
         // Enter opens the finished file, but only when not typing in the
         // input: a Return there submits the link instead.
-        if (root.typing() || root.showingSettings) return
+        if (root.typing() || root.showingSettings || root.showingScheduler) return
         root.hold()
         var m = root.queue.downloads[root.cursorIndex]
         if (m && m.status === "done") root.openFile(m.id)
       }
       onDeleteRequested: {
-        if (root.typing() || root.showingSettings) return
+        if (root.typing() || root.showingSettings || root.showingScheduler) return
         root.hold()
         var x = root.queue.downloads[root.cursorIndex]
         if (x) root.removeEntry(x.id)
@@ -1513,9 +1943,14 @@ Panel {
           if (!root.typing()) root.toggleSettings()
           return
         }
-        // Queue actions stay off while settings are up or a field is
-        // typing — a stray "c" must not clear marks from another screen.
-        if (root.typing() || root.showingSettings) return
+        if (t === "t" || t === "T") {
+          if (!root.typing()) root.toggleScheduler()
+          return
+        }
+        // Queue actions stay off while settings or the scheduler are up, or a
+        // field is typing — a stray "c" must not clear marks from another
+        // screen.
+        if (root.typing() || root.showingSettings || root.showingScheduler) return
         root.hold()
         if (t === "c" || t === "C") {
           if (root.markedCount() > 0) root.deleteMarked()
@@ -1574,7 +2009,9 @@ Panel {
 
                     Text {
                       textFormat: Text.PlainText
-                      text: root.showingSettings ? "Catch settings" : "Catch"
+                      text: root.showingScheduler
+                        ? "Catch scheduler"
+                        : (root.showingSettings ? "Catch settings" : "Catch")
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.display
@@ -1599,6 +2036,16 @@ Panel {
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: Style.spacing.sm
+
+                    PanelActionButton {
+                      iconText: "󰥔"
+                      fontSize: Style.font.heading
+                      tooltipText: root.showingScheduler ? "Back to queue (t)" : "Scheduler (t)"
+                      foreground: root.showingScheduler ? root.accent : root.foreground
+                      fontFamily: root.fontFamily
+                      focusable: true
+                      onClicked: root.toggleScheduler()
+                    }
 
                     PanelActionButton {
                       iconText: "󰉋"
@@ -1640,7 +2087,7 @@ Panel {
                   height: Style.space(46)
                   radius: root.fieldRadius
                   clip: true
-                  visible: !root.showingSettings && root.conflict === null
+                  visible: !root.showingSettings && !root.showingScheduler && root.conflict === null
                   color: linkField.activeFocus
                     ? Style.focusFillFor(root.foreground, root.accent)
                     : Style.controlFill(false, false, root.foreground, root.accent)
@@ -1650,7 +2097,7 @@ Panel {
                     id: linkField
                     anchors.left: parent.left
                     anchors.leftMargin: Style.spacing.xl + parent.borderLeft
-                    anchors.right: linkGo.left
+                    anchors.right: linkSchedule.left
                     anchors.rightMargin: Style.spacing.sm
                     anchors.verticalCenter: parent.verticalCenter
                     height: parent.height - Style.spacing.md
@@ -1697,6 +2144,33 @@ Panel {
                   }
 
                   SolidButton {
+                    id: linkSchedule
+                    // The link input is the Start-now default; this is the
+                    // same link one step later.
+                    visible: root.refreshId === ""
+                    anchors.right: linkGo.left
+                    anchors.rightMargin: Style.spacing.sm
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: parent.height - root.fieldButtonInset * 2
+                    text: "Schedule…"
+                    bordered: true
+                    foreground: root.dim
+                    accent: root.dim
+                    fontFamily: root.fontFamily
+                    focusable: true
+                    onClicked: {
+                      var text = linkField.text.trim()
+                      linkField.text = ""
+                      if (text === "") {
+                        root.actionError = "Links start with http(s)://"
+                        errorTimer.restart()
+                        return
+                      }
+                      root.scheduleFromInput(text)
+                    }
+                  }
+
+                  SolidButton {
                     id: linkGo
                     anchors.right: parent.right
                     anchors.rightMargin: root.fieldButtonInset + parent.borderRight
@@ -1722,7 +2196,7 @@ Panel {
                 Item {
                   width: parent.width
                   height: Style.space(22)
-                  visible: !root.showingSettings && root.conflict === null
+                  visible: !root.showingSettings && !root.showingScheduler && root.conflict === null
 
                   Text {
                     anchors.left: parent.left
@@ -1747,7 +2221,7 @@ Panel {
                 }
 
                 Label {
-                  visible: !root.showingSettings && root.conflict === null && root.queue.downloads.length === 0
+                  visible: !root.showingSettings && !root.showingScheduler && root.conflict === null && root.queue.downloads.length === 0
                   width: parent.width
                   text: "Nothing yet — send a download from the browser (Alt+Shift+C)."
                   color: root.dim
@@ -1774,7 +2248,7 @@ Panel {
 
                     width: column.width
                     radius: Style.cornerRadius
-                    visible: !root.showingSettings && root.conflict === null
+                    visible: !root.showingSettings && !root.showingScheduler && root.conflict === null
 
 
                     // Stable proxy over this row's roles: role updates re-run
@@ -1790,7 +2264,8 @@ Panel {
                       bytes: bytes,
                       total: total,
                       error: error,
-                      sched_hold: root.scheduledFor(did)
+                      sched_hold: root.scheduledFor(did),
+                      scheduled_at: root.scheduledAtFor(did)
                     })
                     readonly property bool isCursor: root.cursorIndex === index
                     readonly property bool isMarked: root.isMarked(did)
@@ -1929,7 +2404,7 @@ Panel {
                               id: badgeText
                               anchors.centerIn: parent
                               textFormat: Text.PlainText
-                              text: Model.statusLabel(card.status)
+                              text: Model.statusLabelFor(card.entry)
                               color: root.badgeColor(card.status)
                               font.family: root.fontFamily
                               font.pixelSize: Style.font.caption
@@ -2095,6 +2570,20 @@ Panel {
                           fontFamily: root.fontFamily
                           onClicked: root.openFile(card.entry.id)
                         }
+
+                        PanelActionButton {
+                          // One-time schedules belong to queued, paused and
+                          // failed rows: they still own their partial data.
+                          // A live transfer is rescheduled after it stops.
+                          visible: card.entry.status === "queued"
+                            || card.entry.status === "paused"
+                            || card.entry.status === "error"
+                          iconText: "󰥔"
+                          tooltipText: "Schedule…"
+                          foreground: root.foreground
+                          fontFamily: root.fontFamily
+                          onClicked: root.scheduleEntry(root.rowById(card.entry.id))
+                        }
                       }
                     }
                   }
@@ -2105,13 +2594,13 @@ Panel {
                   width: parent.width
                   foreground: root.foreground
                   strength: 0.1
-                  visible: !root.showingSettings && root.conflict === null
+                  visible: !root.showingSettings && !root.showingScheduler && root.conflict === null
                 }
 
                 Item {
                   width: parent.width
                   height: Style.space(30)
-                  visible: !root.showingSettings && root.conflict === null
+                  visible: !root.showingSettings && !root.showingScheduler && root.conflict === null
 
                   // A RowLayout, not a Row: children of a positioner may not
                   // be anchored, so vertical centring is a layout attachment.
@@ -2178,7 +2667,7 @@ Panel {
                 Column {
                   width: parent.width
                   spacing: Style.spacing.sm
-                  visible: !root.showingSettings && root.conflict === null && root.showShortcuts
+                  visible: !root.showingSettings && !root.showingScheduler && root.conflict === null && root.showShortcuts
 
                   Repeater {
                     model: [
@@ -2394,7 +2883,12 @@ Panel {
                     event.accepted = true
                   }
                   onVisibleChanged: {
-                    if (!visible) {
+                    if (visible) {
+                      // Values come from the saved window, not from stale
+                      // field text left over from an earlier visit.
+                      schedStartField.text = root.schedWindowStart
+                      schedStopField.text = root.schedWindowStop
+                    } else {
                       // Focus must never stay trapped in a hidden field, or
                       // every panel shortcut silently stops working. A popup
                       // outlives its hidden parent too, so those go as well.
@@ -2710,46 +3204,651 @@ Panel {
                     radius: Style.cornerRadius
                     color: Style.normalFillFor(root.foreground, root.accent)
                     borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
-                    implicitHeight: windowBody.implicitHeight + Style.spacing.xl * 2
+                    implicitHeight: schedCardBody.implicitHeight + Style.spacing.xl * 2
 
                     Column {
-                      id: windowBody
+                      id: schedCardBody
                       anchors.left: parent.left
                       anchors.right: parent.right
                       anchors.top: parent.top
                       anchors.margins: Style.spacing.xl
                       spacing: Style.spacing.lg
 
-                      PanelDropdown {
-                        id: scheduleDrop
-                        spaceItem: contentScroll
-                        spaceHeight: contentScroll.height
+                      RowLayout {
                         width: parent.width
-                        height: Style.space(30)
-                        foreground: root.foreground
-                        accent: root.accent
-                        options: [
-                          { value: "off", label: "anytime" },
-                          { value: "on", label: "scheduled window" }
-                        ]
-                        value: String(root.setting("schedEnabled", "off"))
-                        onPopupToggled: function (isOpen) {
-                          root.noteDropdown("schedule", isOpen, function () { scheduleDrop.close() })
-                          if (!isOpen) keyCatcher.release()
+                        spacing: Style.spacing.md
+
+                        Text {
+                          Layout.fillWidth: true
+                          textFormat: Text.PlainText
+                          text: "Daily window"
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.body
+                          font.bold: true
                         }
-                        onPicked: function (v) {
-                          root.writeSetting("schedEnabled", v)
-                          // The timer is what enforces the window; keep it in
-                          // sync so the user never touches the terminal.
-                          if (v === "on") root.runCatch(["schedule", "--install"], "Could not install the scheduler timer.")
-                          else root.runCatch(["schedule", "--remove"], "Could not remove the scheduler timer.")
+
+                        PanelDropdown {
+                          id: scheduleDrop
+                          spaceItem: contentScroll
+                          spaceHeight: contentScroll.height
+                          Layout.preferredWidth: Style.space(150)
+                          Layout.preferredHeight: Style.space(30)
+                          Layout.alignment: Qt.AlignVCenter
+                          foreground: root.foreground
+                          accent: root.accent
+                          options: [
+                            { value: "off", label: "anytime" },
+                            { value: "on", label: "scheduled window" }
+                          ]
+                          value: root.schedWindowEnabled ? "on" : "off"
+                          onPopupToggled: function (isOpen) {
+                            root.noteDropdown("schedule", isOpen, function () { scheduleDrop.close() })
+                            if (!isOpen) keyCatcher.release()
+                          }
+                          onPicked: function (v) { root.setWindowEnabled(v === "on") }
                         }
                       }
 
                       Text {
                         width: parent.width
                         textFormat: Text.PlainText
-                        text: "Transfers start inside the window and park outside it."
+                        text: "Outside the window Catch parks transfers it started and leaves them queued. A transfer you started by hand keeps running. Turning the window off does not remove the timer: one-time schedules still need it."
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
+                      }
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.spacing.sm
+
+                        BorderSurface {
+                          Layout.preferredWidth: Style.space(92)
+                          Layout.preferredHeight: Style.space(38)
+                          radius: root.fieldRadius
+                          clip: true
+                          color: schedStartField.activeFocus
+                            ? Style.focusFillFor(root.foreground, root.accent)
+                            : Style.controlFill(false, false, root.foreground, root.accent)
+                          borderSpec: Border.controlSpec(schedStartField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
+
+                          TextField {
+                            id: schedStartField
+                            anchors.fill: parent
+                            anchors.leftMargin: Style.spacing.md + parent.borderLeft
+                            anchors.rightMargin: Style.spacing.md + parent.borderRight
+                            foreground: root.foreground
+                            accent: root.accent
+                            font.family: root.fontFamily
+                            horizontalPadding: 0
+                            verticalPadding: 0
+                            placeholderTextColor: root.dim
+                            placeholderText: "from"
+                            background: Item {}
+                            text: ""
+                            Keys.onEscapePressed: function (event) {
+                              keyCatcher.release()
+                              event.accepted = true
+                            }
+                            Keys.onPressed: function (event) {
+                              if (event.key === Qt.Key_Tab) {
+                                keyCatcher.focusSchedulerField("win-stop")
+                                event.accepted = true
+                                return
+                              }
+                              keyCatcher.fieldKey(schedStartField, event)
+                            }
+                            onActiveFocusChanged: keyCatcher.syncEditing()
+                            onAccepted: {
+                              root.saveWindowSettings(schedStartField.text.trim(), schedStopField.text.trim())
+                              keyCatcher.release()
+                            }
+                          }
+                        }
+
+                        Text {
+                          text: "to"
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.body
+                        }
+
+                        BorderSurface {
+                          Layout.preferredWidth: Style.space(92)
+                          Layout.preferredHeight: Style.space(38)
+                          radius: root.fieldRadius
+                          clip: true
+                          color: schedStopField.activeFocus
+                            ? Style.focusFillFor(root.foreground, root.accent)
+                            : Style.controlFill(false, false, root.foreground, root.accent)
+                          borderSpec: Border.controlSpec(schedStopField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
+
+                          TextField {
+                            id: schedStopField
+                            anchors.fill: parent
+                            anchors.leftMargin: Style.spacing.md + parent.borderLeft
+                            anchors.rightMargin: Style.spacing.md + parent.borderRight
+                            foreground: root.foreground
+                            accent: root.accent
+                            font.family: root.fontFamily
+                            horizontalPadding: 0
+                            verticalPadding: 0
+                            placeholderTextColor: root.dim
+                            placeholderText: "until"
+                            background: Item {}
+                            text: ""
+                            Keys.onEscapePressed: function (event) {
+                              keyCatcher.release()
+                              event.accepted = true
+                            }
+                            Keys.onPressed: function (event) {
+                              if (event.key === Qt.Key_Tab) {
+                                keyCatcher.focusSchedulerField("win-start")
+                                event.accepted = true
+                                return
+                              }
+                              keyCatcher.fieldKey(schedStopField, event)
+                            }
+                            onActiveFocusChanged: keyCatcher.syncEditing()
+                            onAccepted: {
+                              root.saveWindowSettings(schedStartField.text.trim(), schedStopField.text.trim())
+                              keyCatcher.release()
+                            }
+                          }
+                        }
+
+                        Item { Layout.fillWidth: true; height: 1 }
+
+                        SolidButton {
+                          text: "Save"
+                          onClicked: {
+                            root.saveWindowSettings(schedStartField.text.trim(), schedStopField.text.trim())
+                            keyCatcher.release()
+                          }
+                        }
+                      }
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.spacing.md
+
+                        Text {
+                          Layout.fillWidth: true
+                          textFormat: Text.PlainText
+                          text: Model.windowSummary(root.schedWindowStart, root.schedWindowStop, root.schedWindowEnabled)
+                            + " · equal times mean the whole day"
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          wrapMode: Text.Wrap
+                        }
+
+                        SolidButton {
+                          text: "Scheduler…"
+                          bordered: true
+                          foreground: root.dim
+                          accent: root.dim
+                          fontFamily: root.fontFamily
+                          focusable: true
+                          onClicked: root.toggleScheduler()
+                        }
+                      }
+                    }
+                  }
+
+                }
+
+                // ------------------------------------------------------- scheduler
+                Column {
+                  id: schedulerView
+                  width: parent.width
+                  spacing: Style.spacing.lg
+                  visible: root.showingScheduler && root.conflict === null
+                  Keys.onEscapePressed: function (event) {
+                    root.closeScheduler()
+                    event.accepted = true
+                  }
+                  onVisibleChanged: {
+                    if (visible) {
+                      keyCatcher.release()
+                      schedWinStartField.text = root.schedWindowStart
+                      schedWinStopField.text = root.schedWindowStop
+                      schedJobDateField.text = root.schedJobDate
+                      schedJobTimeField.text = root.schedJobTime
+                      schedJobDirField.text = root.schedJobDir
+                      root.refreshScheduler()
+                    } else {
+                      keyCatcher.release()
+                      root.closeDropdowns()
+                    }
+                  }
+
+                  // Presets and resets change the root draft; a TextField's
+                  // `text` assignment broke its binding, so the change is
+                  // delivered explicitly.
+                  Connections {
+                    target: root
+                    function onSchedTimesReady(date, time) {
+                      schedJobDateField.text = date
+                      schedJobTimeField.text = time
+                    }
+                    function onSchedDirReady(dir) {
+                      schedJobDirField.text = dir
+                    }
+                    function onSchedUrlReady(url) {
+                      schedJobUrlField.text = url
+                      // The page may not be visible yet when this fires; focus
+                      // once it is, and only believe "typing" if the field
+                      // actually took focus (a blocked-but-unfocused catcher
+                      // is a keyboard dead end).
+                      Qt.callLater(function () {
+                        if (!root.showingScheduler) return
+                        schedJobUrlField.forceActiveFocus()
+                        root.textEditing = schedJobUrlField.activeFocus
+                      })
+                    }
+                  }
+
+                  // Read the fields at submit time: focus can stay in a field
+                  // while the button is clicked, so `onTextEdited` has the
+                  // latest values but a broken `text` binding would not.
+                  function submitJob() {
+                    var editing = root.schedEditingId !== ""
+                    if (!root.queueScheduledJob(schedJobUrlField.text, schedJobDirField.text)) return
+                    // Hand the keyboard back to the page: the field no longer
+                    // owns it, so esc/s/tab work again.
+                    keyCatcher.release()
+                    if (!editing) {
+                      schedJobUrlField.text = ""
+                      schedJobDirField.text = ""
+                    }
+                  }
+
+                  PanelSectionHeader {
+                    width: parent.width
+                    text: "SCHEDULER"
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                  }
+
+                  BorderSurface {
+                    width: parent.width
+                    radius: Style.cornerRadius
+                    color: Style.normalFillFor(root.foreground, root.accent)
+                    borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+                    implicitHeight: schedStatusBody.implicitHeight + Style.spacing.xl * 2
+
+                    Column {
+                      id: schedStatusBody
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.top: parent.top
+                      anchors.margins: Style.spacing.xl
+                      spacing: Style.spacing.md
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.spacing.md
+
+                        Rectangle {
+                          width: Style.space(7)
+                          height: width
+                          radius: width / 2
+                          Layout.alignment: Qt.AlignTop
+                          Layout.topMargin: Style.space(6)
+                          color: root.sched("valid", true) === false
+                            ? root.urgent
+                            : (root.sched("open", false) === true ? root.accent : root.dim)
+                        }
+
+                        Text {
+                          Layout.fillWidth: true
+                          textFormat: Text.PlainText
+                          text: String(root.sched("message", "Reading scheduler status…"))
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.body
+                          wrapMode: Text.Wrap
+                        }
+                      }
+
+                      Text {
+                        width: parent.width
+                        visible: String(root.sched("policy", "")) !== ""
+                        textFormat: Text.PlainText
+                        text: String(root.sched("policy", ""))
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
+                      }
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.spacing.md
+
+                        Text {
+                          Layout.fillWidth: true
+                          textFormat: Text.PlainText
+                          text: root.sched("timer_active", false) === true
+                            ? "Timer active · checks every minute"
+                            : "Timer not active"
+                          color: root.sched("timer_active", false) === true ? root.dim : root.urgent
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                        }
+
+                        SolidButton {
+                          text: root.sched("timer_active", false) === true ? "Remove timer" : "Install timer"
+                          bordered: true
+                          foreground: root.foreground
+                          accent: root.accent
+                          fontFamily: root.fontFamily
+                          focusable: true
+                          onClicked: {
+                            if (root.sched("timer_active", false) === true) root.removeSchedulerTimer()
+                            else root.installSchedulerTimer()
+                          }
+                        }
+                      }
+
+                      Text {
+                        width: parent.width
+                        visible: root.sched("timer_active", false) !== true
+                        textFormat: Text.PlainText
+                        text: "Schedules persist, but without the timer they only run while Catch is open. Installing it is per-user and needs no root."
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
+                      }
+
+                      Text {
+                        width: parent.width
+                        visible: String(root.sched("error", "")) !== ""
+                        textFormat: Text.PlainText
+                        text: "Settings problem: " + String(root.sched("error", ""))
+                        color: root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
+                      }
+                    }
+                  }
+
+                  PanelSectionHeader {
+                    width: parent.width
+                    text: "DAILY WINDOW"
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                  }
+
+                  BorderSurface {
+                    width: parent.width
+                    radius: Style.cornerRadius
+                    color: Style.normalFillFor(root.foreground, root.accent)
+                    borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+                    implicitHeight: schedWindowBody.implicitHeight + Style.spacing.xl * 2
+
+                    Column {
+                      id: schedWindowBody
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.top: parent.top
+                      anchors.margins: Style.spacing.xl
+                      spacing: Style.spacing.lg
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.spacing.md
+
+                        Text {
+                          Layout.fillWidth: true
+                          textFormat: Text.PlainText
+                          text: "Only download inside the window"
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.body
+                          font.bold: true
+                        }
+
+                        PanelDropdown {
+                          id: schedWindowDrop
+                          spaceItem: contentScroll
+                          spaceHeight: contentScroll.height
+                          Layout.preferredWidth: Style.space(150)
+                          Layout.preferredHeight: Style.space(30)
+                          Layout.alignment: Qt.AlignVCenter
+                          foreground: root.foreground
+                          accent: root.accent
+                          options: [
+                            { value: "off", label: "anytime" },
+                            { value: "on", label: "scheduled window" }
+                          ]
+                          value: root.schedWindowEnabled ? "on" : "off"
+                          onPopupToggled: function (isOpen) {
+                            root.noteDropdown("schedWindow", isOpen, function () { schedWindowDrop.close() })
+                            if (!isOpen) keyCatcher.release()
+                          }
+                          onPicked: function (v) { root.setWindowEnabled(v === "on") }
+                        }
+                      }
+
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: "Start is inclusive, end is exclusive. Equal times allow the whole day. Overnight windows (for example 22:00 to 06:00) wrap past midnight."
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
+                      }
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.spacing.sm
+
+                        BorderSurface {
+                          Layout.preferredWidth: Style.space(92)
+                          Layout.preferredHeight: Style.space(38)
+                          radius: root.fieldRadius
+                          clip: true
+                          color: schedWinStartField.activeFocus
+                            ? Style.focusFillFor(root.foreground, root.accent)
+                            : Style.controlFill(false, false, root.foreground, root.accent)
+                          borderSpec: Border.controlSpec(schedWinStartField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
+
+                          TextField {
+                            id: schedWinStartField
+                            anchors.fill: parent
+                            anchors.leftMargin: Style.spacing.md + parent.borderLeft
+                            anchors.rightMargin: Style.spacing.md + parent.borderRight
+                            foreground: root.foreground
+                            accent: root.accent
+                            font.family: root.fontFamily
+                            horizontalPadding: 0
+                            verticalPadding: 0
+                            placeholderTextColor: root.dim
+                            placeholderText: "from"
+                            background: Item {}
+                            text: ""
+                            Keys.onEscapePressed: function (event) {
+                              keyCatcher.release()
+                              event.accepted = true
+                            }
+                            Keys.onPressed: function (event) {
+                              if (event.key === Qt.Key_Tab) {
+                                keyCatcher.focusSchedulerField("win-stop")
+                                event.accepted = true
+                                return
+                              }
+                              keyCatcher.fieldKey(schedWinStartField, event)
+                            }
+                            onActiveFocusChanged: keyCatcher.syncEditing()
+                            onAccepted: {
+                              root.saveWindowSettings(schedWinStartField.text.trim(), schedWinStopField.text.trim())
+                              keyCatcher.release()
+                            }
+                          }
+                        }
+
+                        Text {
+                          text: "to"
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.body
+                        }
+
+                        BorderSurface {
+                          Layout.preferredWidth: Style.space(92)
+                          Layout.preferredHeight: Style.space(38)
+                          radius: root.fieldRadius
+                          clip: true
+                          color: schedWinStopField.activeFocus
+                            ? Style.focusFillFor(root.foreground, root.accent)
+                            : Style.controlFill(false, false, root.foreground, root.accent)
+                          borderSpec: Border.controlSpec(schedWinStopField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
+
+                          TextField {
+                            id: schedWinStopField
+                            anchors.fill: parent
+                            anchors.leftMargin: Style.spacing.md + parent.borderLeft
+                            anchors.rightMargin: Style.spacing.md + parent.borderRight
+                            foreground: root.foreground
+                            accent: root.accent
+                            font.family: root.fontFamily
+                            horizontalPadding: 0
+                            verticalPadding: 0
+                            placeholderTextColor: root.dim
+                            placeholderText: "until"
+                            background: Item {}
+                            text: ""
+                            Keys.onEscapePressed: function (event) {
+                              keyCatcher.release()
+                              event.accepted = true
+                            }
+                            Keys.onPressed: function (event) {
+                              if (event.key === Qt.Key_Tab) {
+                                keyCatcher.focusSchedulerField("win-start")
+                                event.accepted = true
+                                return
+                              }
+                              keyCatcher.fieldKey(schedWinStopField, event)
+                            }
+                            onActiveFocusChanged: keyCatcher.syncEditing()
+                            onAccepted: {
+                              root.saveWindowSettings(schedWinStartField.text.trim(), schedWinStopField.text.trim())
+                              keyCatcher.release()
+                            }
+                          }
+                        }
+
+                        Item { Layout.fillWidth: true; height: 1 }
+
+                        SolidButton {
+                          text: "Save"
+                          onClicked: {
+                            root.saveWindowSettings(schedWinStartField.text.trim(), schedWinStopField.text.trim())
+                            keyCatcher.release()
+                          }
+                        }
+                      }
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.spacing.sm
+
+                        SolidButton {
+                          text: "Any time"
+                          bordered: true
+                          foreground: root.dim
+                          accent: root.dim
+                          fontFamily: root.fontFamily
+                          focusable: true
+                          onClicked: root.setWindowEnabled(false)
+                        }
+                        SolidButton {
+                          text: "Nights 02:00–06:00"
+                          bordered: true
+                          foreground: root.dim
+                          accent: root.dim
+                          fontFamily: root.fontFamily
+                          focusable: true
+                          onClicked: {
+                            schedWinStartField.text = "02:00"
+                            schedWinStopField.text = "06:00"
+                            root.applyWindowPreset("02:00", "06:00")
+                          }
+                        }
+                        SolidButton {
+                          text: "Overnight 22:00–06:00"
+                          bordered: true
+                          foreground: root.dim
+                          accent: root.dim
+                          fontFamily: root.fontFamily
+                          focusable: true
+                          onClicked: {
+                            schedWinStartField.text = "22:00"
+                            schedWinStopField.text = "06:00"
+                            root.applyWindowPreset("22:00", "06:00")
+                          }
+                        }
+                        Item { Layout.fillWidth: true; height: 1 }
+                      }
+
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: Model.windowSummary(root.schedWindowStart, root.schedWindowStop, root.schedWindowEnabled)
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
+                      }
+
+                      Text {
+                        width: parent.width
+                        visible: root.schedWindowNotice !== ""
+                        textFormat: Text.PlainText
+                        text: root.schedWindowNotice
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
+                      }
+                    }
+                  }
+
+                  PanelSectionHeader {
+                    width: parent.width
+                    text: root.schedEditingId !== "" ? "RESCHEDULE DOWNLOAD" : "SCHEDULE A DOWNLOAD"
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                  }
+
+                  BorderSurface {
+                    width: parent.width
+                    radius: Style.cornerRadius
+                    color: Style.normalFillFor(root.foreground, root.accent)
+                    borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+                    implicitHeight: schedJobBody.implicitHeight + Style.spacing.xl * 2
+
+                    Column {
+                      id: schedJobBody
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.top: parent.top
+                      anchors.margins: Style.spacing.xl
+                      spacing: Style.spacing.md
+
+                      Text {
+                        width: parent.width
+                        visible: root.schedNotice !== ""
+                        textFormat: Text.PlainText
+                        text: root.schedNotice
                         color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
@@ -2759,38 +3858,26 @@ Panel {
                       BorderSurface {
                         width: parent.width
                         height: Style.space(40)
+                        visible: root.schedEditingId === ""
                         radius: root.fieldRadius
                         clip: true
-                        color: (schedStartField.activeFocus || schedStopField.activeFocus)
+                        color: schedJobUrlField.activeFocus
                           ? Style.focusFillFor(root.foreground, root.accent)
                           : Style.controlFill(false, false, root.foreground, root.accent)
-                        borderSpec: Border.controlSpec((schedStartField.activeFocus || schedStopField.activeFocus) ? "focus" : "normal", root.foreground, root.accent)
-
-                        // Split point between the two halves. anchors.left/right take an item,
-                        // not a number, so the midpoint is a real zero-width item
-                        // that both fields and the rule anchor to.
-                        Item {
-                          id: schedMid
-                          anchors.horizontalCenter: parent.horizontalCenter
-                          width: 0
-                          height: 1
-                        }
+                        borderSpec: Border.controlSpec(schedJobUrlField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
 
                         TextField {
-                          id: schedStartField
-                          anchors.left: parent.left
+                          id: schedJobUrlField
+                          anchors.fill: parent
                           anchors.leftMargin: Style.spacing.lg + parent.borderLeft
-                          anchors.right: schedMid.left
-                          anchors.rightMargin: Style.spacing.md
-                          anchors.verticalCenter: parent.verticalCenter
-                          height: parent.height - Style.spacing.sm
+                          anchors.rightMargin: Style.spacing.lg + parent.borderRight
                           foreground: root.foreground
                           accent: root.accent
                           font.family: root.fontFamily
                           horizontalPadding: 0
                           verticalPadding: 0
                           placeholderTextColor: root.dim
-                          placeholderText: "From " + String(root.setting("schedStart", "02:00"))
+                          placeholderText: "Paste one or more http(s) links"
                           background: Item {}
                           text: ""
                           Keys.onEscapePressed: function (event) {
@@ -2798,76 +3885,317 @@ Panel {
                             event.accepted = true
                           }
                           Keys.onPressed: function (event) {
-                            keyCatcher.fieldKey(schedStartField, event)
+                            if (event.key === Qt.Key_Tab) {
+                              keyCatcher.focusSchedulerField("job-date")
+                              event.accepted = true
+                              return
+                            }
+                            keyCatcher.fieldKey(schedJobUrlField, event)
                           }
                           onActiveFocusChanged: keyCatcher.syncEditing()
-                          onAccepted: {
-                            root.saveSchedule(schedStartField.text.trim(), schedStopField.text.trim())
-                            schedStartField.text = ""
-                            schedStopField.text = ""
-                            keyCatcher.release()
+                          onAccepted: schedulerView.submitJob()
+                        }
+                      }
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.spacing.sm
+
+                        BorderSurface {
+                          Layout.fillWidth: true
+                          Layout.preferredHeight: Style.space(38)
+                          radius: root.fieldRadius
+                          clip: true
+                          color: schedJobDateField.activeFocus
+                            ? Style.focusFillFor(root.foreground, root.accent)
+                            : Style.controlFill(false, false, root.foreground, root.accent)
+                          borderSpec: Border.controlSpec(schedJobDateField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
+
+                          TextField {
+                            id: schedJobDateField
+                            anchors.fill: parent
+                            anchors.leftMargin: Style.spacing.md + parent.borderLeft
+                            anchors.rightMargin: Style.spacing.md + parent.borderRight
+                            foreground: root.foreground
+                            accent: root.accent
+                            font.family: root.fontFamily
+                            horizontalPadding: 0
+                            verticalPadding: 0
+                            placeholderTextColor: root.dim
+                            placeholderText: "YYYY-MM-DD"
+                            background: Item {}
+                            text: ""
+                            Keys.onEscapePressed: function (event) {
+                              keyCatcher.release()
+                              event.accepted = true
+                            }
+                            Keys.onPressed: function (event) {
+                              if (event.key === Qt.Key_Tab) {
+                                keyCatcher.focusSchedulerField("job-time")
+                                event.accepted = true
+                                return
+                              }
+                              keyCatcher.fieldKey(schedJobDateField, event)
+                            }
+                            onActiveFocusChanged: keyCatcher.syncEditing()
+                            onTextEdited: root.schedJobDate = text
+                            onAccepted: schedulerView.submitJob()
                           }
                         }
 
-                        Rectangle {
-                          anchors.horizontalCenter: schedMid.horizontalCenter
-                          anchors.verticalCenter: parent.verticalCenter
-                          width: 1
-                          height: parent.height - Style.spacing.xl
-                          color: Util.alpha(root.dim, 0.3)
-                        }
+                        BorderSurface {
+                          Layout.preferredWidth: Style.space(92)
+                          Layout.preferredHeight: Style.space(38)
+                          radius: root.fieldRadius
+                          clip: true
+                          color: schedJobTimeField.activeFocus
+                            ? Style.focusFillFor(root.foreground, root.accent)
+                            : Style.controlFill(false, false, root.foreground, root.accent)
+                          borderSpec: Border.controlSpec(schedJobTimeField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
 
-                        TextField {
-                          id: schedStopField
-                          anchors.left: schedMid.right
-                          anchors.leftMargin: Style.spacing.md
-                          anchors.right: schedSave.left
-                          anchors.rightMargin: Style.spacing.sm
-                          anchors.verticalCenter: parent.verticalCenter
-                          height: parent.height - Style.spacing.sm
-                          foreground: root.foreground
-                          accent: root.accent
-                          font.family: root.fontFamily
-                          horizontalPadding: 0
-                          verticalPadding: 0
-                          placeholderTextColor: root.dim
-                          placeholderText: "Until " + String(root.setting("schedStop", "06:00"))
-                          background: Item {}
-                          text: ""
-                          Keys.onEscapePressed: function (event) {
-                            keyCatcher.release()
-                            event.accepted = true
+                          TextField {
+                            id: schedJobTimeField
+                            anchors.fill: parent
+                            anchors.leftMargin: Style.spacing.md + parent.borderLeft
+                            anchors.rightMargin: Style.spacing.md + parent.borderRight
+                            foreground: root.foreground
+                            accent: root.accent
+                            font.family: root.fontFamily
+                            horizontalPadding: 0
+                            verticalPadding: 0
+                            placeholderTextColor: root.dim
+                            placeholderText: "HH:MM"
+                            background: Item {}
+                            text: ""
+                            Keys.onEscapePressed: function (event) {
+                              keyCatcher.release()
+                              event.accepted = true
+                            }
+                            Keys.onPressed: function (event) {
+                              if (event.key === Qt.Key_Tab) {
+                                keyCatcher.focusSchedulerField("job-dir")
+                                event.accepted = true
+                                return
+                              }
+                              keyCatcher.fieldKey(schedJobTimeField, event)
+                            }
+                            onActiveFocusChanged: keyCatcher.syncEditing()
+                            onTextEdited: root.schedJobTime = text
+                            onAccepted: schedulerView.submitJob()
                           }
-                          Keys.onPressed: function (event) {
-                            keyCatcher.fieldKey(schedStopField, event)
-                          }
-                          onActiveFocusChanged: keyCatcher.syncEditing()
-                          onAccepted: {
-                            root.saveSchedule(schedStartField.text.trim(), schedStopField.text.trim())
-                            schedStartField.text = ""
-                            schedStopField.text = ""
-                            keyCatcher.release()
-                          }
+                        }
+                      }
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.spacing.sm
+
+                        SolidButton {
+                          text: "+1 hour"
+                          bordered: true
+                          foreground: root.dim
+                          accent: root.dim
+                          fontFamily: root.fontFamily
+                          focusable: true
+                          onClicked: root.applyPreset(3600)
+                        }
+                        SolidButton {
+                          text: "+3 hours"
+                          bordered: true
+                          foreground: root.dim
+                          accent: root.dim
+                          fontFamily: root.fontFamily
+                          focusable: true
+                          onClicked: root.applyPreset(3 * 3600)
+                        }
+                        SolidButton {
+                          text: "Tomorrow 09:00"
+                          bordered: true
+                          foreground: root.dim
+                          accent: root.dim
+                          fontFamily: root.fontFamily
+                          focusable: true
+                          onClicked: root.tomorrowMorning()
+                        }
+                        Item { Layout.fillWidth: true; height: 1 }
+
+                        SolidButton {
+                          text: root.schedEditingId !== "" ? "Reschedule" : "Schedule"
+                          onClicked: schedulerView.submitJob()
                         }
 
                         SolidButton {
-                          id: schedSave
-                          anchors.right: parent.right
-                          anchors.rightMargin: root.fieldButtonInset + parent.borderRight
-                          anchors.verticalCenter: parent.verticalCenter
-                          height: parent.height - root.fieldButtonInset * 2
-                          text: "Save"
+                          visible: root.schedEditingId !== ""
+                          text: "Cancel"
+                          bordered: true
+                          foreground: root.dim
+                          accent: root.dim
+                          fontFamily: root.fontFamily
+                          focusable: true
                           onClicked: {
-                            root.saveSchedule(schedStartField.text.trim(), schedStopField.text.trim())
-                            schedStartField.text = ""
-                            schedStopField.text = ""
+                            root.clearSchedJob()
                             keyCatcher.release()
+                          }
+                        }
+                      }
+
+                      BorderSurface {
+                        width: parent.width
+                        height: Style.space(38)
+                        radius: root.fieldRadius
+                        clip: true
+                        color: schedJobDirField.activeFocus
+                          ? Style.focusFillFor(root.foreground, root.accent)
+                          : Style.controlFill(false, false, root.foreground, root.accent)
+                        borderSpec: Border.controlSpec(schedJobDirField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
+
+                        TextField {
+                          id: schedJobDirField
+                          anchors.fill: parent
+                          anchors.leftMargin: Style.spacing.md + parent.borderLeft
+                          anchors.rightMargin: Style.spacing.md + parent.borderRight
+                          foreground: root.foreground
+                          accent: root.accent
+                          font.family: root.fontFamily
+                          horizontalPadding: 0
+                          verticalPadding: 0
+                          placeholderTextColor: root.dim
+                          placeholderText: "Destination folder (empty = the download folder)"
+                          background: Item {}
+                          text: ""
+                          Keys.onEscapePressed: function (event) {
+                            keyCatcher.release()
+                            event.accepted = true
+                          }
+                          Keys.onPressed: function (event) {
+                            if (event.key === Qt.Key_Tab) {
+                              keyCatcher.focusSchedulerField("job-url")
+                              event.accepted = true
+                              return
+                            }
+                            keyCatcher.fieldKey(schedJobDirField, event)
+                          }
+                          onActiveFocusChanged: keyCatcher.syncEditing()
+                          onTextEdited: root.schedJobDir = text
+                          onAccepted: schedulerView.submitJob()
+                        }
+                      }
+
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: "A scheduled job is queued now and starts at its time, inside the daily window. Start still obeys the parallel limit and the window; it only skips this entry's own delay."
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
+                      }
+                    }
+                  }
+
+                  PanelSectionHeader {
+                    width: parent.width
+                    text: "SCHEDULED"
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                  }
+
+                  Label {
+                    visible: schedModel.count === 0
+                    width: parent.width
+                    text: "Nothing scheduled. One-time jobs keep their queue row and their chosen folder until they run."
+                    color: root.dim
+                    wrapMode: Text.Wrap
+                    font.family: root.fontFamily
+                  }
+
+                  Repeater {
+                    model: schedModel
+                    delegate: BorderSurface {
+                      width: schedulerView.width
+                      radius: Style.cornerRadius
+                      color: Style.normalFillFor(root.foreground, root.accent)
+                      borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+                      implicitHeight: schedRowBody.implicitHeight + Style.spacing.lg * 2
+
+                      Column {
+                        id: schedRowBody
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: Style.spacing.lg
+                        spacing: Style.spacing.xs
+
+                        Text {
+                          width: parent.width
+                          textFormat: Text.PlainText
+                          text: String(model.name || model.filename)
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.body
+                          elide: Text.ElideRight
+                        }
+
+                        Text {
+                          width: parent.width
+                          textFormat: Text.PlainText
+                          text: Qt.formatDateTime(new Date(Number(model.at) * 1000), "ddd d MMM · HH:mm")
+                            + " · " + root.schedRowState({ at: model.at, hold: model.hold })
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          elide: Text.ElideRight
+                        }
+
+                        Text {
+                          width: parent.width
+                          visible: String(model.dir || "") !== ""
+                          textFormat: Text.PlainText
+                          text: "to " + Model.shortPath(String(model.dir || ""), root.home)
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          elide: Text.ElideMiddle
+                        }
+
+                        RowLayout {
+                          width: parent.width
+                          spacing: Style.spacing.sm
+
+                          SolidButton {
+                            text: "Start now"
+                            bordered: true
+                            foreground: root.foreground
+                            accent: root.accent
+                            fontFamily: root.fontFamily
+                            focusable: true
+                            onClicked: root.startScheduledNow(model.sid)
+                          }
+                          SolidButton {
+                            text: "Reschedule"
+                            bordered: true
+                            foreground: root.dim
+                            accent: root.dim
+                            fontFamily: root.fontFamily
+                            focusable: true
+                            onClicked: root.scheduleEntry(root.rowById(model.sid))
+                          }
+                          Item { Layout.fillWidth: true; height: 1 }
+                          SolidButton {
+                            text: "Remove"
+                            bordered: true
+                            foreground: root.dim
+                            accent: root.dim
+                            fontFamily: root.fontFamily
+                            focusable: true
+                            onClicked: root.removeEntry(model.sid)
                           }
                         }
                       }
                     }
                   }
                 }
+
               }
             }
 

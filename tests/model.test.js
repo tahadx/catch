@@ -10,7 +10,7 @@ const path = require("node:path")
 const src = fs
   .readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library\s*$/m, "")
-const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath }")()
+const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath, parseClock, clockText, windowOpen, windowFlip, windowSummary, scheduleStamp, stampInputs, nextHourInputs, scheduledRows, nextDue, untilText, whenShort }")()
 
 assert.strictEqual(Model.expandHome("~", "/home/you"), "/home/you")
 assert.strictEqual(Model.expandHome("~/Downloads/catch", "/home/you"), "/home/you/Downloads/catch")
@@ -287,10 +287,10 @@ assert.strictEqual(scheduled.sched_hold, true)
 assert.strictEqual(scheduled.priority, 2)
 assert.strictEqual(scheduled.speed, 123)
 assert.strictEqual(scheduled.eta, 4)
-assert.strictEqual(Model.statusLabelFor(scheduled), "Scheduled")
+assert.strictEqual(Model.statusLabelFor(scheduled), "Waiting")
 assert.strictEqual(Model.statusLabelFor({ status: "queued" }), "Queued", "no flag means an ordinary queued row")
 assert.strictEqual(Model.statusLabelFor({ status: "downloading" }), "Downloading")
-assert.strictEqual(Model.rowMeta(scheduled), "BIN · Scheduled")
+assert.strictEqual(Model.rowMeta(scheduled), "BIN · Waiting")
 
 // A transfer that is still moving never reads 100%: only a done row does.
 const moving = Model.statusText(Model.parse(JSON.stringify({
@@ -299,5 +299,74 @@ const moving = Model.statusText(Model.parse(JSON.stringify({
 })))
 assert.ok(moving.includes("99%"), "moving transfers cap at 99%: " + moving)
 assert.ok(!moving.includes("100%"), "moving transfers never read 100%: " + moving)
+
+
+// ---- scheduler helpers ----------------------------------------------------
+
+// Time-of-day parsing and window math mirror the backend, including the
+// start-inclusive/stop-exclusive edges and overnight wrap.
+assert.strictEqual(Model.parseClock("02:00"), 120)
+assert.strictEqual(Model.parseClock("23:59"), 1439)
+assert.strictEqual(Model.parseClock("24:00"), null)
+assert.strictEqual(Model.parseClock("2:00"), null)
+assert.strictEqual(Model.clockText(125), "02:05")
+assert.strictEqual(Model.clockText(1439), "23:59")
+
+assert.strictEqual(Model.windowOpen(600, 600, 720), true, "start is inclusive")
+assert.strictEqual(Model.windowOpen(720, 600, 720), false, "stop is exclusive")
+assert.strictEqual(Model.windowOpen(0, 1320, 360), true, "overnight wraps midnight")
+assert.strictEqual(Model.windowOpen(600, 1320, 360), false)
+assert.strictEqual(Model.windowOpen(600, 120, 120), true, "equal means whole day")
+assert.deepStrictEqual(Model.windowFlip(660, 600, 720), { open: false, minutes: 60 })
+assert.deepStrictEqual(Model.windowFlip(600, 1320, 360), { open: true, minutes: 720 })
+assert.strictEqual(Model.windowFlip(600, 600, 600), null)
+assert.strictEqual(Model.windowSummary("02:00", "06:00", true), "02:00–06:00")
+assert.strictEqual(Model.windowSummary("22:00", "06:00", true), "22:00–06:00 (overnight)")
+assert.strictEqual(Model.windowSummary("02:00", "02:00", true), "Whole day")
+assert.strictEqual(Model.windowSummary("", "", true), "Invalid times")
+assert.strictEqual(Model.windowSummary("02:00", "06:00", false), "Any time")
+
+// Local date/time -> Unix seconds. Past and impossible inputs are refused
+// before they ever reach the backend.
+const nowMs = new Date(2026, 5, 15, 10, 0, 0).getTime()
+const future = Math.floor(new Date(2026, 5, 15, 12, 30, 0).getTime() / 1000)
+assert.strictEqual(Model.scheduleStamp("2026-06-15", "12:30", nowMs), future)
+assert.strictEqual(Model.scheduleStamp("2026-06-15", "09:00", nowMs), null, "past")
+assert.strictEqual(Model.scheduleStamp("2026-02-30", "10:00", nowMs), null, "no such date")
+assert.strictEqual(Model.scheduleStamp("2026-06-15", "2:00", nowMs), null, "strict clock shape")
+assert.deepStrictEqual(Model.stampInputs(future), { date: "2026-06-15", time: "12:30" })
+assert.deepStrictEqual(Model.nextHourInputs(nowMs), { date: "2026-06-15", time: "11:00" })
+
+// Pending one-time rows only: a failed row keeps its error, never a fake
+// "waiting for a time" state.
+const timed = Model.parse(JSON.stringify({
+  version: 1,
+  downloads: [
+    { id: "b", url: "u", filename: "b.bin", status: "queued", scheduled_at: 2000 },
+    { id: "a", url: "u", filename: "a.bin", status: "queued", scheduled_at: 1000 },
+    { id: "done", url: "u", filename: "d.bin", status: "done", scheduled_at: 1500 },
+    { id: "fail", url: "u", filename: "f.bin", status: "error", scheduled_at: 1600 },
+    { id: "ready", url: "u", filename: "r.bin", status: "queued", scheduled_at: 0 },
+  ],
+}))
+assert.deepStrictEqual(Model.scheduledRows(timed).map(function (d) { return d.id }), ["a", "b"])
+assert.strictEqual(Model.nextDue(timed, 500), 1000)
+assert.strictEqual(Model.nextDue(timed, 1000), 2000)
+assert.strictEqual(Model.nextDue(timed, 2001), 0)
+assert.strictEqual(Model.untilText(1300, 1000), "in 5m")
+assert.strictEqual(Model.untilText(1000, 1000), "now")
+assert.strictEqual(Model.untilText(1000 + 7200, 1000), "in 2h")
+assert.strictEqual(Model.untilText(1000 + 90000, 1000), "in 1d 1h")
+assert.strictEqual(Model.whenShort(future, Math.floor(nowMs / 1000)), "12:30")
+assert.strictEqual(Model.whenShort(future + 86400, Math.floor(nowMs / 1000)), "16/06 12:30")
+
+assert.strictEqual(Model.statusLabelFor({ status: "queued", scheduled_at: 9999 }, 1000), "Scheduled")
+assert.strictEqual(Model.statusLabelFor({ status: "paused", sched_hold: true }, 1000), "Scheduled")
+assert.strictEqual(Model.statusLabelFor({ status: "queued", scheduled_at: 9999 }, 10000), "Queued")
+const soon = Model.parse(JSON.stringify({
+  version: 1,
+  downloads: [{ id: "a", url: "u", filename: "a.bin", status: "queued", scheduled_at: 1999999999 }],
+})).downloads[0]
+assert.ok(Model.rowMeta(soon).indexOf("starts ") >= 0, Model.rowMeta(soon))
 
 console.log("model.test.js: ok")

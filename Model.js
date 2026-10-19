@@ -62,6 +62,10 @@ function parse(text) {
       priority: Number(d.priority) || 0,
       attempts: Number(d.attempts) || 0,
       sched_hold: d.sched_hold === true || d.sched_hold === "true",
+      // One-time delay in Unix seconds (0 = none) and the per-entry
+      // destination chosen when it was queued ("" = the default folder).
+      scheduled_at: Number(d.scheduled_at) || 0,
+      dir: String(d.dir || ""),
       segments: (d.segments && typeof d.segments === "object") ? d.segments : null
     })
   }
@@ -205,12 +209,159 @@ function statusLabel(status) {
 }
 
 // Same badge, but scheduler-aware: a queued row the window is holding back
-// says so instead of looking stuck in the queue.
-function statusLabelFor(d) {
+// says so instead of looking stuck in the queue, and a one-time delay says
+// "Scheduled" instead of implying it is waiting for a free slot.
+function statusLabelFor(d, nowSec) {
   if (!d) return "Queued"
   var status = String(d.status || "")
-  if (status === "queued" && d.sched_hold === true) return "Scheduled"
+  var now = Number(nowSec) || Math.floor(Date.now() / 1000)
+  if ((status === "queued" || status === "paused") && Number(d.scheduled_at) > now) return "Scheduled"
+  if (status === "paused" && d.sched_hold === true) return "Scheduled"
+  if (status === "queued" && d.sched_hold === true) return "Waiting"
   return statusLabel(status)
+}
+
+// ----- scheduler helpers (the backend still owns the actual decisions) -----
+
+function pad2(n) {
+  n = Math.floor(Number(n) || 0)
+  return (n < 10 ? "0" : "") + n
+}
+
+// "HH:MM" -> minute of day, or null. Same strict shape the backend and the
+// panel's save action use.
+function parseClock(text) {
+  var m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(text || "").trim())
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null
+}
+
+function clockText(min) {
+  var m = ((Math.floor(Number(min) || 0) % 1440) + 1440) % 1440
+  return pad2(Math.floor(m / 60)) + ":" + pad2(m % 60)
+}
+
+// Start inclusive, stop exclusive; equal times mean the whole day. Mirrors
+// crates/catch/src/schedule.rs so the panel can explain state without asking
+// the backend on every repaint (the backend is still the enforcer).
+function windowOpen(nowMin, startMin, stopMin) {
+  if (startMin === stopMin) return true
+  if (startMin < stopMin) return nowMin >= startMin && nowMin < stopMin
+  return nowMin >= startMin || nowMin < stopMin
+}
+
+// Next open/close: {open: bool, minutes: n} or null for a whole-day window.
+function windowFlip(nowMin, startMin, stopMin) {
+  if (startMin === stopMin) return null
+  var open = windowOpen(nowMin, startMin, stopMin)
+  var target = open ? stopMin : startMin
+  var minutes = target > nowMin ? target - nowMin : target + 1440 - nowMin
+  return { open: !open, minutes: minutes }
+}
+
+// One line for the settings summary: "02:00–06:00 (overnight)", "Any time".
+function windowSummary(startText, stopText, enabled) {
+  if (!enabled) return "Any time"
+  var start = parseClock(startText)
+  var stop = parseClock(stopText)
+  if (start === null || stop === null) return "Invalid times"
+  if (start === stop) return "Whole day"
+  return clockText(start) + "–" + clockText(stop) + (start > stop ? " (overnight)" : "")
+}
+
+function parseDateInput(text) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(text || "").trim())
+  if (!m) return null
+  var y = Number(m[1]), mo = Number(m[2]), d = Number(m[3])
+  var probe = new Date(y, mo - 1, d)
+  if (probe.getFullYear() !== y || probe.getMonth() !== mo - 1 || probe.getDate() !== d) return null
+  return { y: y, m: mo, d: d }
+}
+
+// Local date + time fields -> Unix seconds, or null when invalid/past. A
+// daylight-saving gap normalizes in JS and fails the component check; an
+// ambiguous hour takes the first occurrence, matching the backend.
+function scheduleStamp(dateText, timeText, nowMs) {
+  var date = parseDateInput(dateText)
+  var min = parseClock(timeText)
+  if (!date || min === null) return null
+  var h = Math.floor(min / 60), mi = min % 60
+  var dt = new Date(date.y, date.m - 1, date.d, h, mi, 0, 0)
+  if (dt.getFullYear() !== date.y || dt.getMonth() !== date.m - 1 || dt.getDate() !== date.d) return null
+  if (dt.getHours() !== h || dt.getMinutes() !== mi) return null
+  var sec = Math.floor(dt.getTime() / 1000)
+  if (sec <= Math.floor((Number(nowMs) || Date.now()) / 1000)) return null
+  return sec
+}
+
+function stampInputs(ts) {
+  var dt = new Date((Number(ts) || 0) * 1000)
+  return {
+    date: dt.getFullYear() + "-" + pad2(dt.getMonth() + 1) + "-" + pad2(dt.getDate()),
+    time: pad2(dt.getHours()) + ":" + pad2(dt.getMinutes()),
+  }
+}
+
+// A sensible default for the schedule form: the next full hour.
+function nextHourInputs(nowMs) {
+  var dt = new Date(Number(nowMs) || Date.now())
+  dt.setMinutes(0, 0, 0)
+  dt.setHours(dt.getHours() + 1)
+  return stampInputs(Math.floor(dt.getTime() / 1000))
+}
+
+// Pending one-time rows, soonest first. Failed/done rows never look as if
+// they are waiting for a time; the queue row shows their real error.
+function scheduledRows(state) {
+  var list = (state && state.downloads) || []
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    var d = list[i]
+    if (!d) continue
+    var status = String(d.status || "")
+    if ((status === "queued" || status === "paused") && Number(d.scheduled_at) > 0) out.push(d)
+  }
+  out.sort(function (a, b) { return Number(a.scheduled_at) - Number(b.scheduled_at) })
+  return out
+}
+
+// Earliest one-time time still ahead, for a precisely timed local tick while
+// the shell is running (the systemd timer covers the rest). 0 = none.
+function nextDue(state, nowSec) {
+  var list = (state && state.downloads) || []
+  var now = Number(nowSec) || Math.floor(Date.now() / 1000)
+  var next = 0
+  for (var i = 0; i < list.length; i++) {
+    var d = list[i]
+    if (!d) continue
+    var status = String(d.status || "")
+    if (status !== "queued" && status !== "paused") continue
+    var at = Number(d.scheduled_at) || 0
+    if (at > now && (next === 0 || at < next)) next = at
+  }
+  return next
+}
+
+// "in 2h 5m", "in 12m", "now". Kept short: the list has one line.
+function untilText(ts, nowSec) {
+  var secs = Math.floor(Number(ts) || 0) - (Number(nowSec) || Math.floor(Date.now() / 1000))
+  if (secs <= 0) return "now"
+  if (secs < 60) return "in <1m"
+  var mins = Math.round(secs / 60)
+  if (mins < 60) return "in " + mins + "m"
+  var h = Math.floor(mins / 60), m = mins % 60
+  if (h < 24) return "in " + h + "h" + (m > 0 ? " " + m + "m" : "")
+  var d = Math.floor(h / 24)
+  return "in " + d + "d" + (h % 24 > 0 ? " " + (h % 24) + "h" : "")
+}
+
+// "14:30" today, "20/10 09:00" otherwise.
+function whenShort(ts, nowSec) {
+  var dt = new Date((Number(ts) || 0) * 1000)
+  var now = new Date((Number(nowSec) || Math.floor(Date.now() / 1000)) * 1000)
+  var hm = pad2(dt.getHours()) + ":" + pad2(dt.getMinutes())
+  var sameDay = dt.getFullYear() === now.getFullYear() && dt.getMonth() === now.getMonth() && dt.getDate() === now.getDate()
+  if (sameDay) return hm
+  return pad2(dt.getDate()) + "/" + pad2(dt.getMonth() + 1) + " " + hm
 }
 
 // The type beside the size: the file's own extension, or the kind when the
@@ -236,6 +387,10 @@ function rowMeta(d) {
   if (bytes > 0 && total > bytes) parts.push(formatBytes(bytes) + " / " + formatBytes(total))
   else if (bytes > 0) parts.push(formatBytes(bytes))
   else parts.push(statusLabelFor(d))
+  if ((status === "queued" || status === "paused") && Number(d.scheduled_at) > 0) {
+    var now = Math.floor(Date.now() / 1000)
+    if (Number(d.scheduled_at) > now) parts.push("starts " + whenShort(d.scheduled_at, now))
+  }
   if (d && d.segments && Number(d.segments.total) > 1) {
     var sdone = Number(d.segments.done) || 0
     parts.push(sdone + "/" + d.segments.total + " seg")
