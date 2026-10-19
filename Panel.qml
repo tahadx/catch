@@ -34,6 +34,10 @@ Panel {
   property int cursorIndex: -1
   property var marked: ({})
   property bool showingSettings: false
+  // Row id whose address is being replaced: the URL input switches to
+  // "refresh" mode and the pasted link goes through `catch refresh`, which
+  // verifies the new address before reusing the partial data.
+  property string refreshId: ""
   // The shortcut sheet at the foot of the home page, collapsed by default.
   property bool showShortcuts: false
   // Id of the row whose actions are expanded ("…" on the card).
@@ -287,6 +291,24 @@ Panel {
     if (b !== "") root.writeSetting("schedStop", b)
   }
 
+  // Global bandwidth limit in KB/s; empty clears it. Stored in the widget
+  // settings; the backend reads it on every transfer, so it applies to
+  // running downloads within a few seconds.
+  function saveBwCap(text) {
+    var raw = String(text || "").trim()
+    if (raw === "") {
+      root.writeSetting("bwCapKb", 0)
+      return
+    }
+    var n = Number(raw)
+    if (!isFinite(n) || n < 0) {
+      root.actionError = "Bandwidth limit must be a number of KB/s."
+      errorTimer.restart()
+      return
+    }
+    root.writeSetting("bwCapKb", Math.round(n))
+  }
+
   // Auto-open: a freshly caught download pops the panel; it closes itself
   // after autoCloseMs unless the user engages (hover, click, keys).
   readonly property int autoCloseMs: 7000
@@ -538,7 +560,24 @@ Panel {
   function removeEntry(id) { root.hold(); root.runRow(["remove", id], "Could not remove that download.") }
   // Stop is not remove: it ends the transfer and leaves the row behind as
   // cancelled, so the entry can be re-queued. Remove drops the row instead.
+  // The partial file is kept either way — only remove deletes it.
   function cancelEntry(id) { root.hold(); root.runRow(["cancel", id], "Could not stop that download.") }
+
+  // Replace the address of a failed or stopped row (expired signed links,
+  // login walls): focus the URL input in refresh mode. The CLI probes the
+  // new link and only reuses the partial data when it proves to be the
+  // same file.
+  function startRefresh(d) {
+    if (!d || !root.resumable(d)) return
+    root.refreshId = d.id
+    root.actionError = ""
+    keyCatcher.focusInput()
+  }
+
+  function refreshEntry(id, url) {
+    root.hold()
+    root.runRow(["refresh", id, url], "Could not refresh that address.")
+  }
 
   function resumable(d) {
     return d.status === "paused" || d.status === "error" || d.status === "cancelled"
@@ -1035,6 +1074,10 @@ Panel {
       // queue take their mark with them.
       peaks[d.id] = Math.max(root.peakBytes[d.id] || 0, Number(d.bytes) || 0)
       if (d.status !== "downloading") continue
+      // The backend measures on a monotonic clock and survives a panel
+      // restart; the derived sample below is the fallback for rows it has
+      // not written a rate for yet.
+      var backend = Number(d.speed) || 0
       var prev = root.speedSeen[d.id]
       var sample = -1
       if (prev && now > prev.t) {
@@ -1043,12 +1086,17 @@ Panel {
       var smooth = prev && prev.rate > 0 && sample >= 0 ? prev.rate * 0.65 + sample * 0.35 : sample
       var shown = prev ? prev.shown : ""
       var shownAt = prev ? prev.shownAt : 0
-      if (sample >= 0 && (shown === "" || now - shownAt >= 1000)) {
-        shown = Model.formatBytes(smooth) + "/s"
-        shownAt = now
+      if (shown === "" || now - shownAt >= 1000) {
+        if (backend > 0) {
+          shown = Model.formatBytes(backend) + "/s"
+          shownAt = now
+        } else if (sample >= 0) {
+          shown = Model.formatBytes(smooth) + "/s"
+          shownAt = now
+        }
       }
       if (shown !== "") out[d.id] = shown
-      next[d.id] = { b: d.bytes, t: now, rate: smooth < 0 ? 0 : smooth, shown: shown, shownAt: shownAt }
+      next[d.id] = { b: d.bytes, t: now, rate: backend > 0 ? backend : (smooth < 0 ? 0 : smooth), shown: shown, shownAt: shownAt }
     }
     root.speedSeen = next
     root.speeds = out
@@ -1061,9 +1109,32 @@ Panel {
     return Math.max(Number(d.bytes) || 0, root.peakBytes[d.id] || 0)
   }
 
+  // Bare rate for a live row ("1.2 MB/s"), or "" before the first sample.
+  // liveHead() places it on the row's meta line.
   function speedFor(id) {
-    var s = root.speeds[id]
-    return s ? " · " + s : ""
+    return root.speeds[id] || ""
+  }
+
+  // True while the scheduler is holding this queued row out of hours.
+  // Looked up from the parsed queue state, so no ListModel role changes.
+  function scheduledFor(id) {
+    var q = root.queue
+    if (!q || !q.downloads) return false
+    for (var i = 0; i < q.downloads.length; i++) {
+      if (q.downloads[i].id === id) return q.downloads[i].sched_hold === true
+    }
+    return false
+  }
+
+  // Display percent: an active transfer is capped at 99% so only a row the
+  // backend has finished (and verified) ever reads 100%.
+  function percentFor(d) {
+    if (!d) return 0
+    if (d.status === "done") return 100
+    var total = Number(d.total) || 0
+    if (total <= 0) return 0
+    var pct = Math.floor((root.rowBytes(d) / total) * 100)
+    return Math.max(0, Math.min(99, pct))
   }
 
   // Segments diagnostic for a row, looked up from the parsed queue state
@@ -1078,24 +1149,45 @@ Panel {
   }
 
   // Estimated time remaining for a downloading row, derived from the
-  // smoothed speed. Returns "" when unknown.
+  // smoothed speed. Bare fragment ("8s left") or "" when unknown;
+  // liveHead() places it on the row's meta line.
   function etaFor(id) {
     var d = null
     for (var i = 0; i < root.queue.downloads.length; i++) {
       if (root.queue.downloads[i].id === id) { d = root.queue.downloads[i]; break }
     }
     if (!d || d.status !== "downloading") return ""
-    var total = Number(d.total) || 0
-    var bytes = root.rowBytes(d)
-    if (total <= 0 || bytes >= total) return ""
-    var seen = root.speedSeen[id]
-    var rate = seen ? Number(seen.rate) : 0
-    if (rate <= 0) return ""
-    var secs = (total - bytes) / rate
+    // Backend ETA first (persisted on a monotonic clock), then the local
+    // estimate from the smoothed rate.
+    var secs = Number(d.eta) || 0
+    if (!(secs > 0)) {
+      var total = Number(d.total) || 0
+      var bytes = root.rowBytes(d)
+      if (total <= 0 || bytes >= total) return ""
+      var seen = root.speedSeen[id]
+      var rate = seen ? Number(seen.rate) : 0
+      if (rate <= 0) return ""
+      secs = (total - bytes) / rate
+    }
     if (!isFinite(secs) || secs < 0) return ""
-    if (secs < 60) return " · " + Math.ceil(secs) + "s left"
-    if (secs < 3600) return " · " + Math.floor(secs / 60) + "m " + Math.floor(secs % 60) + "s left"
-    return " · " + Math.floor(secs / 3600) + "h " + Math.floor((secs % 3600) / 60) + "m left"
+    if (secs < 60) return Math.ceil(secs) + "s left"
+    if (secs < 3600) return Math.floor(secs / 60) + "m " + Math.floor(secs % 60) + "s left"
+    return Math.floor(secs / 3600) + "h " + Math.floor((secs % 3600) / 60) + "m left"
+  }
+
+  // Leading block of a row's meta line while its transfer is live: the rate
+  // and the time left, the two numbers a running download is watched by.
+  // They used to trail the line, where the panel's fixed width elided them
+  // first, so a live row never showed its speed. Leading them costs no
+  // width (same fields, same separators) and the static tail still elides.
+  function liveHead(d) {
+    if (!d || d.status !== "downloading") return ""
+    var parts = []
+    var rate = root.speedFor(d.id)
+    if (rate !== "") parts.push(rate)
+    var eta = root.etaFor(d.id)
+    if (eta !== "") parts.push(eta)
+    return parts.length > 0 ? parts.join(" · ") + " · " : ""
   }
 
   FileView {
@@ -1428,6 +1520,13 @@ Panel {
           if (root.pausable(e)) root.pauseEntry(e.id)
           else if (root.resumable(e)) root.resumeEntry(e.id)
         }
+        else if (t === "r" || t === "R") {
+          // Replace the address of a failed or stopped row: expired signed
+          // links come back under a fresh URL. The CLI verifies the new
+          // link before reusing the partial data.
+          var rr = root.queue.downloads[root.cursorIndex]
+          if (rr && root.resumable(rr)) root.startRefresh(rr)
+        }
       }
 
       Flickable {
@@ -1549,11 +1648,14 @@ Panel {
                     horizontalPadding: 0
                     verticalPadding: 0
                     placeholderTextColor: root.dim
-                    placeholderText: "Paste download URL…"
+                    placeholderText: root.refreshId !== ""
+                      ? "New address for this download (paste, Enter)…"
+                      : "Paste download URL…"
                     // The surface above owns the chrome.
                     background: Item {}
                     text: ""
                     Keys.onEscapePressed: function (event) {
+                      root.refreshId = ""
                       keyCatcher.release()
                       event.accepted = true
                     }
@@ -1568,7 +1670,14 @@ Panel {
                       if (activeFocus) root.focusZone = "input"
                     }
                     onAccepted: {
-                      root.catchUrl(linkField.text.trim())
+                      var text = linkField.text.trim()
+                      if (root.refreshId !== "") {
+                        var rid = root.refreshId
+                        root.refreshId = ""
+                        if (text !== "") root.refreshEntry(rid, text)
+                      } else {
+                        root.catchUrl(text)
+                      }
                       linkField.text = ""
                       if (!root.conflict) keyCatcher.release()
                     }
@@ -1582,7 +1691,14 @@ Panel {
                     height: parent.height - root.fieldButtonInset * 2
                     text: "Download ↵"
                     onClicked: {
-                      root.catchUrl(linkField.text.trim())
+                      var text = linkField.text.trim()
+                      if (root.refreshId !== "") {
+                        var rid = root.refreshId
+                        root.refreshId = ""
+                        if (text !== "") root.refreshEntry(rid, text)
+                      } else {
+                        root.catchUrl(text)
+                      }
                       linkField.text = ""
                       if (!root.conflict) keyCatcher.release()
                     }
@@ -1660,7 +1776,8 @@ Panel {
                       status: status,
                       bytes: bytes,
                       total: total,
-                      error: error
+                      error: error,
+                      sched_hold: root.scheduledFor(did)
                     })
                     readonly property bool isCursor: root.cursorIndex === index
                     readonly property bool isMarked: root.isMarked(did)
@@ -1746,14 +1863,35 @@ Panel {
                             elide: Text.ElideMiddle
                           }
 
-                          Text {
+                          // Meta line: a live transfer leads with its rate
+                          // and time left, in the accent; the static tail
+                          // (kind, bytes, segments, percent) follows in the
+                          // dim ink and takes the elide — same fields, same
+                          // separators, so the fixed panel width is intact.
+                          Row {
                             width: parent.width
-                            textFormat: Text.PlainText
-                            text: Model.rowMeta(card.entry) + (function(){ var s = root.segmentsFor(card.entry.id); return (s && Number(s.total) > 1) ? " · " + (Number(s.done)||0) + "/" + s.total + " seg" : "" })() + (card._busy && root.fraction(card.entry) > 0 ? " · " + Math.floor(root.fraction(card.entry) * 100) + "%" : "") + root.speedFor(card.entry.id) + root.etaFor(card.entry.id)
-                            color: root.dim
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.body
-                            elide: Text.ElideRight
+                            spacing: 0
+
+                            Text {
+                              id: cardLive
+                              textFormat: Text.PlainText
+                              text: root.liveHead(card.entry)
+                              color: root.accent
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.body
+                              width: Math.min(implicitWidth, parent.width)
+                              elide: Text.ElideRight
+                            }
+
+                            Text {
+                              width: Math.max(0, parent.width - cardLive.width)
+                              textFormat: Text.PlainText
+                              text: Model.rowMeta(card.entry) + (function(){ var s = root.segmentsFor(card.entry.id); return (s && Number(s.total) > 1) ? " · " + (Number(s.done)||0) + "/" + s.total + " seg" : "" })() + (card._busy && root.percentFor(card.entry) > 0 ? " · " + root.percentFor(card.entry) + "%" : "")
+                              color: root.dim
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.body
+                              elide: Text.ElideRight
+                            }
                           }
                         }
 
@@ -1928,6 +2066,15 @@ Panel {
                         }
 
                         PanelActionButton {
+                          visible: root.resumable(card.entry)
+                          iconText: "󰑐"
+                          tooltipText: "Replace the address (r) — for expired links"
+                          foreground: root.foreground
+                          fontFamily: root.fontFamily
+                          onClicked: root.startRefresh(card.entry)
+                        }
+
+                        PanelActionButton {
                           visible: card.entry.status === "done"
                           iconText: "󰏏"
                           tooltipText: "Open the file"
@@ -2026,7 +2173,8 @@ Panel {
                       { keys: "space", what: "mark a row · a marks all" },
                       { keys: "c", what: "delete marked (files stay)" },
                       { keys: "p", what: "pause or re-queue" },
-                      { keys: "x", what: "stop a download, keep the row" },
+                      { keys: "x", what: "stop a download, keep its data" },
+                      { keys: "r", what: "give a failed row a new address" },
                       { keys: "delete", what: "remove a row, file stays" },
                       { keys: "tab", what: "link field ⇄ rows" },
                       { keys: "ctrl+v", what: "paste a link from anywhere" },
@@ -2242,15 +2390,10 @@ Panel {
                     }
                   }
 
-                  // --------------------------------------------------------- NOT READY YET
-                  // The schedule and the "when out of hours" power action are
-                  // implemented (crates/catch/src/schedule.rs, `catch
-                  // schedule --install`) but not finished: nothing parks a
-                  // transfer outside the window yet, so the controls are
-                  // hidden rather than offering a switch that does not hold.
-                  // Kept here, and out of manifest.json, so the work is not
-                  // lost. To bring them back, drop the `visible: false` on
-                  // the "when out of hours" row and the SCHEDULE section.
+                  // The schedule is enforced by `catch tick` (systemd timer,
+                  // installed by `catch schedule --install`): `drain` refuses
+                  // to start entries while the window is shut, and `tick`
+                  // parks live transfers and releases them when it reopens.
 
                   PanelSectionHeader {
                     width: parent.width
@@ -2444,16 +2587,13 @@ Panel {
                         wrapMode: Text.Wrap
                       }
 
-                      // NOT READY: parking the machine once the queue empties needs the same
-                      // missing piece as the window below.
                       RowLayout {
+                        id: bandwidthRow
                         width: parent.width
-                        height: 0
                         spacing: Style.spacing.xl
-                        visible: false
 
                         Text {
-                          text: "When out of hours"
+                          text: "Bandwidth"
                           color: root.foreground
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.body
@@ -2462,55 +2602,99 @@ Panel {
                         Item { Layout.fillWidth: true; height: 1 }
 
                         PanelDropdown {
-                          id: whenDoneDrop
+                          id: bwModeDrop
+                          spaceItem: contentScroll
+                          spaceHeight: contentScroll.height
                           Layout.preferredWidth: Style.space(140)
                           Layout.preferredHeight: Style.space(30)
                           Layout.alignment: Qt.AlignVCenter
                           foreground: root.foreground
                           accent: root.accent
                           options: [
-                            { value: "nothing", label: "stay on" },
-                            { value: "suspend", label: "suspend" },
-                            { value: "shutdown", label: "shutdown" }
+                            { value: "unlimited", label: "unlimited" },
+                            { value: "balanced", label: "balanced" },
+                            { value: "low", label: "low" }
                           ]
-                          value: String(root.setting("schedWhenDone", "nothing"))
+                          value: String(root.setting("bwMode", "unlimited"))
                           onPopupToggled: function (isOpen) {
-                            root.noteDropdown("whenDone", isOpen, function () { whenDoneDrop.close() })
+                            root.noteDropdown("bwMode", isOpen, function () { bwModeDrop.close() })
                             if (!isOpen) keyCatcher.release()
                           }
-                          onPicked: function (v) { root.writeSetting("schedWhenDone", v) }
+                          onPicked: function (v) { root.writeSetting("bwMode", v) }
                         }
                       }
 
-                      // NOT READY: describes the out-of-hours power action hidden above.
-                      Text {
-                        id: scheduleHint
+                      BorderSurface {
                         width: parent.width
-                        textFormat: Text.PlainText
-                        text: "Suspend sleeps, shutdown powers off once the queue empties."
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        wrapMode: Text.Wrap
-                        visible: false
+                        height: Style.space(40)
+                        radius: root.fieldRadius
+                        clip: true
+                        color: bwCapField.activeFocus
+                          ? Style.focusFillFor(root.foreground, root.accent)
+                          : Style.controlFill(false, false, root.foreground, root.accent)
+                        borderSpec: Border.controlSpec(bwCapField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
+
+                        TextField {
+                          id: bwCapField
+                          anchors.left: parent.left
+                          anchors.leftMargin: Style.spacing.lg + parent.borderLeft
+                          anchors.right: bwCapSave.left
+                          anchors.rightMargin: Style.spacing.sm
+                          anchors.verticalCenter: parent.verticalCenter
+                          height: parent.height - Style.spacing.sm
+                          foreground: root.foreground
+                          accent: root.accent
+                          font.family: root.fontFamily
+                          horizontalPadding: 0
+                          verticalPadding: 0
+                          placeholderTextColor: root.dim
+                          placeholderText: Number(root.setting("bwCapKb", 0)) > 0
+                            ? ("Limit: " + root.setting("bwCapKb", 0) + " KB/s — type a new value, empty clears")
+                            : "Bandwidth limit in KB/s (empty = no limit)"
+                          background: Item {}
+                          text: ""
+                          Keys.onEscapePressed: function (event) {
+                            keyCatcher.release()
+                            event.accepted = true
+                          }
+                          Keys.onPressed: function (event) {
+                            keyCatcher.fieldKey(bwCapField, event)
+                          }
+                          onActiveFocusChanged: keyCatcher.syncEditing()
+                          onAccepted: {
+                            root.saveBwCap(bwCapField.text)
+                            bwCapField.text = ""
+                            keyCatcher.release()
+                          }
+                        }
+
+                        SolidButton {
+                          id: bwCapSave
+                          anchors.right: parent.right
+                          anchors.rightMargin: root.fieldButtonInset + parent.borderRight
+                          anchors.verticalCenter: parent.verticalCenter
+                          height: parent.height - root.fieldButtonInset * 2
+                          text: "Save"
+                          onClicked: {
+                            root.saveBwCap(bwCapField.text)
+                            bwCapField.text = ""
+                            keyCatcher.release()
+                          }
+                        }
                       }
                     }
                   }
 
-                  // NOT READY: the window itself. Hidden with the row above; see the note
-                  // at the top of this view.
                   PanelSectionHeader {
                     width: parent.width
                     text: "SCHEDULE"
                     foreground: root.dim
                     fontFamily: root.fontFamily
-                    visible: false
                   }
 
                   BorderSurface {
                     width: parent.width
                     radius: Style.cornerRadius
-                    visible: false
                     color: Style.normalFillFor(root.foreground, root.accent)
                     borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
                     implicitHeight: windowBody.implicitHeight + Style.spacing.xl * 2

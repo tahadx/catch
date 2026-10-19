@@ -140,13 +140,21 @@ stay in that browser.
 - A YouTube link downloads the video. Paste it into Catch, or send it
   from the browser. `yt-dlp` has to be installed
 - Every row carries its own controls: a tick to mark it, a stop, and a
-  bin. Stop ends a live transfer and keeps the row so you can re-queue
-  it; the bin removes the row and keeps the file. On a downloading row
-  the bin stops the transfer too
+  bin. Stop ends a live transfer and keeps everything it already
+  downloaded — the row stays stopped, and `catch resume` (or `p`) picks
+  the bytes up later. The bin removes the row and keeps the file. On a
+  downloading row the bin stops the transfer too
 - A marked row is tinted, so a mark stays visible after you move on
 - Click a row's buttons, or use keys: `space` marks · `a` all ·
-  `c` deletes marked · `x` stops · `o` opens the download folder ·
-  `s` settings · `esc` closes
+  `c` deletes marked · `x` stops · `p` pauses/re-queues ·
+  `r` replaces the address of a failed row · `o` opens the download
+  folder · `s` settings · `esc` closes
+- A download that fails because its link expired gets a fresh start
+  without losing progress: press `r` (or use the ↻ button) and paste the
+  renewed address. Catch probes it and only reuses the bytes on disk when
+  the new link proves to be the same file — length and validators must
+  match. Add `--force` from the CLI to start over against a link that is
+  genuinely different
 - Enter does nothing on its own. Opening a finished file is the row's own
   button, and the download folder is `o` or the header button — Enter
   never puts a file browser on screen
@@ -167,8 +175,10 @@ stay in that browser.
 
 Downloads land in `~/Downloads/catch`. In the panel, the gear icon or `s`
 opens settings: the download folder, how many transfers run at once (1–10),
-and how many byte-range segments each large download uses (1 disables
-segmented downloading).
+how many byte-range segments each large download uses (1 disables
+segmented downloading), the bandwidth mode (unlimited, balanced, or low)
+with an optional global limit in KB/s, and a schedule window that parks
+transfers outside the hours you pick.
 
 ## Segmented downloads
 
@@ -189,10 +199,11 @@ Eligibility (all must hold):
 - The server exposes an `ETag` or `Last-Modified` validator, so a changed
   representation can be detected instead of being spliced into the file.
 - There is enough connection budget left: Catch divides a global budget
-  (`CATCH_MAX_CONNECTIONS`, default 8) across the active transfers, so
-  three transfers never open 24 connections. Each transfer is capped by
-  the segments setting (1–8, default 4) and by a minimum useful segment
-  size of 8 MiB (`CATCH_SEGMENT_MIN_PIECE`).
+  across the active transfers, so three transfers never open 24
+  connections. The budget is the parallel × segments configuration (or
+  `CATCH_MAX_CONNECTIONS`, or the bandwidth mode — see below). Each
+  transfer is capped by the segments setting (1–8, default 4) and by a
+  minimum useful segment size of 8 MiB (`CATCH_SEGMENT_MIN_PIECE`).
 
 When any of these fails, Catch uses its ordinary sequential downloader for
 that file. A server that ignores `Range` and answers `200 OK`, returns a
@@ -206,15 +217,24 @@ next to the `.part` file records which ranges are durably committed (a
 range is committed only after its bytes are written and synchronized).
 After an interruption or a restart, completed ranges are reused and only
 the missing ones are fetched again. An existing `.part` file from an older
-Catch version, or one with a missing or corrupt manifest, is never
-reinterpreted as a set of segments: both files are discarded and the
-transfer starts over. Removing a download deletes both files.
+Catch version is never reinterpreted as a set of segments: it is set aside
+under a `.quarantined-*` name and the transfer starts over. The same
+happens when the manifest is missing, corrupt, or disagrees with the
+part's length — a preallocated part must never be mistaken for a finished
+file. Removing a download deletes both the part and its manifest.
+
+While a segmented download runs, a connection that finishes its range
+early does not sit idle: Catch hands part of the slowest remaining range
+to it (only ranges larger than the minimum piece are split), so the last
+straggler does not set the finish time alone. The split point is the
+exact byte frontier already written, never a guess.
 
 Diagnostics: while a segmented download is running, the row shows `done/total
-seg`. The manifest is ordinary JSON and can be inspected with
-`cat ~/Downloads/catch/<file>.<id>.part.meta`. A failed segment is named in
-the worker's error message and in the row's error field; the partial data
-stays on disk for a manual retry.
+seg`. `catch why <id>` prints what the transfer is doing and what the
+manifest knows. The manifest is ordinary JSON and can be inspected with
+`cat ~/Downloads/catch/<file>.<id>.part.meta`. A segment that exhausts its
+retries is re-queued once on a fresh connection before the transfer is
+failed; the partial data stays on disk for a manual retry either way.
 
 Environment overrides (all optional):
 
@@ -223,7 +243,10 @@ Environment overrides (all optional):
 | `CATCH_SEGMENTS` | 4 (or the panel setting) | Segments per eligible file (1 disables) |
 | `CATCH_SEGMENT_MIN_BYTES` | 33554432 | Smallest file eligible for segmentation |
 | `CATCH_SEGMENT_MIN_PIECE` | 8388608 | Smallest useful segment size |
-| `CATCH_MAX_CONNECTIONS` | 8 | Global connection budget across transfers |
+| `CATCH_MAX_CONNECTIONS` | parallel × segments, or the traffic mode | Global connection budget across transfers |
+| `CATCH_MAX_PER_HOST` | budget | Per-host connection ceiling |
+| `CATCH_BW_MODE` | `unlimited` | `unlimited`, `balanced`, or `low`: the connection budget the settings add up to, halved, or quartered |
+| `CATCH_BW_CAP_BPS` | none | Global download cap in bytes/second |
 
 ## Requirements
 

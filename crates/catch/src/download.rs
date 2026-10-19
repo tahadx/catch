@@ -302,6 +302,7 @@ pub async fn download_entry(
     let recorded_total = entry.total;
     let recorded_etag = entry.etag.clone();
     let recorded_modified = entry.last_modified.clone();
+    let recorded_attempts = entry.attempts;
     let base = resolve_download_dir(dir_override);
     std::fs::create_dir_all(&base).with_context(|| format!("create {}", base.display()))?;
 
@@ -357,11 +358,7 @@ pub async fn download_entry(
 
     // One client for the whole transfer (connection pool, keep-alive). TLS
     // verification is rustls' default: on.
-    let client = reqwest::Client::builder()
-        .user_agent("catch/0.1 (omarchy download manager)")
-        .connect_timeout(response_timeout())
-        .tcp_keepalive(Duration::from_secs(30))
-        .build()?;
+    let client = client()?;
 
     // Resume offset: bytes already on disk win over the recorded counter.
     let mut progress = Progress {
@@ -372,10 +369,64 @@ pub async fn download_entry(
         etag: recorded_etag,
         last_modified: recorded_modified,
         resumable: true,
+        attempts: recorded_attempts.min(max_attempts()),
+        rate: RateSampler::new(0),
     };
-    let mut attempts = 0u32;
+    progress.rate = RateSampler::new(progress.bytes);
+    // Retry budget continues where the last worker left off (persisted);
+    // `catch resume` is what resets it, so a crash loop fails visibly
+    // instead of retrying for ever.
+    let mut attempts = progress.attempts;
     let mut restarts = 0u32;
     let mut watch = DirectiveWatch::new();
+
+    // Reserve connection capacity before the first request. The budget is
+    // global across workers; stop orders are honored while waiting, and the
+    // reservation is held for the whole life of this worker — retries,
+    // probes and segments all reuse it instead of bypassing the budget.
+    let host = crate::conns::host_of(&url);
+    let mut waiting_noted = false;
+    let mut permits = loop {
+        if let Some(p) = crate::conns::try_acquire(&host) {
+            break p;
+        }
+        if !waiting_noted {
+            set_note(
+                id,
+                &format!(
+                    "waiting for a free connection slot (budget {})",
+                    crate::conns::budget()
+                ),
+            );
+            waiting_noted = true;
+        }
+        match watch.directive(id) {
+            Directive::Keep => {}
+            Directive::StandDown => {
+                note_paused(id, &progress);
+                anyhow::bail!("{id} paused (partial data kept)")
+            }
+            Directive::Abort => {
+                note_stopped(id, progress.bytes);
+                anyhow::bail!("{id} stopped (partial data kept)")
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    // Bandwidth cap: each worker carries its share of the global cap as a
+    // token bucket shared by every connection it opens.
+    let active_downloads = load_state()
+        .map(|s| {
+            s.downloads
+                .iter()
+                .filter(|d| d.status == Status::Downloading)
+                .count()
+        })
+        .unwrap_or(1);
+    let limiter: Option<std::sync::Arc<crate::throttle::RateLimiter>> =
+        crate::throttle::worker_limit(active_downloads)
+            .map(|rate| std::sync::Arc::new(crate::throttle::RateLimiter::new(rate)));
 
     // Segmented resume: if a sidecar manifest exists and is valid, run the
     // segmented downloader instead of the sequential path.
@@ -385,19 +436,32 @@ pub async fn download_entry(
 
     // Recoverable finalization: a previous run may have renamed the part to
     // its destination but crashed before updating queue state. Complete that
-    // update now instead of creating a second copy.
+    // update now — but only when the evidence says the rename actually
+    // happened. The rename is atomic, so "part is gone and dest exists" is
+    // the only proof; a crash that left just the zero-byte destination
+    // reservation must never be read as a finished download.
     let intent_path = PathBuf::from(format!("{}.finalizing", part.display()));
     if intent_path.exists() {
         if let Ok(text) = std::fs::read_to_string(&intent_path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Some(dest_str) = v.get("dest").and_then(|x| x.as_str()) {
                     let dest = PathBuf::from(dest_str);
-                    if dest.is_file() {
+                    let want_total = v
+                        .get("total")
+                        .and_then(|x| x.as_u64())
+                        .or_else(|| (recorded_total > 0).then_some(recorded_total));
+                    let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                    let finished = !part.exists()
+                        && dest.is_file()
+                        && match want_total {
+                            Some(t) => size == t,
+                            None => size > 0,
+                        };
+                    if finished {
                         let final_name = dest
                             .file_name()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
                         let _ = update_state(|state| {
                             if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
                                 if d.status == Status::Downloading {
@@ -408,6 +472,10 @@ pub async fn download_entry(
                                     d.error.clear();
                                     d.pid = 0;
                                     d.claimed_at = 0;
+                                    d.speed = 0;
+                                    d.eta = 0;
+                                    d.next_retry_at = 0;
+                                    d.attempts = 0;
                                 }
                             }
                             crate::state::record_saved(
@@ -422,6 +490,13 @@ pub async fn download_entry(
                         let _ = std::fs::remove_file(&intent_path);
                         crate::state::spawn_drain();
                         return Ok(dest);
+                    }
+                    // Not a completed finalization: the bytes are still in
+                    // the part (or the stranding is external). Drop the stale
+                    // intent and the empty destination reservation if we made
+                    // one; the live copy is preserved either way.
+                    if dest.is_file() && size == 0 {
+                        let _ = std::fs::remove_file(&dest);
                     }
                 }
             }
@@ -454,7 +529,8 @@ pub async fn download_entry(
                     .count()
             })
             .unwrap_or(1);
-        let share = segment::segment_share(active);
+        let want = segment::segment_share(active);
+        let share = permits.grow(want).min(segment::segments_cap());
         let outcome = segment::run_segmented(
             id,
             &url,
@@ -465,6 +541,7 @@ pub async fn download_entry(
             last_modified,
             manifest,
             share,
+            limiter.clone(),
         )
         .await;
         let outcome = match outcome {
@@ -503,10 +580,8 @@ pub async fn download_entry(
                 return Ok(part.clone());
             }
             segment::SegmentedResult::Stopped => {
-                std::fs::remove_file(&part).ok();
-                segment::remove_manifest(&part);
-                eprintln!("catch: {id} stopped");
-                anyhow::bail!("{id} stopped");
+                note_stopped(id, progress.bytes);
+                anyhow::bail!("{id} stopped (partial data kept)")
             }
             segment::SegmentedResult::Fallback(reason) => {
                 eprintln!("catch: {id} segmented download fell back to sequential: {reason}");
@@ -531,10 +606,13 @@ pub async fn download_entry(
                 return Ok(part.clone());
             }
             Directive::Abort => {
-                std::fs::remove_file(&part).ok();
-                segment::remove_manifest(&part);
-                eprintln!("catch: {id} stopped");
-                anyhow::bail!("{id} stopped");
+                // Stop (or removal): keep the partial bytes and the resume
+                // manifest on disk. Stop is not delete — `catch remove` is
+                // the only path that deletes them, after an explicit user
+                // choice. A removal may already have deleted the part; this
+                // path never depends on that.
+                note_stopped(id, progress.bytes);
+                anyhow::bail!("{id} stopped (partial data kept)")
             }
         }
 
@@ -552,6 +630,7 @@ pub async fn download_entry(
             anyhow::bail!("{url}: {msg} (resume to retry)");
         }
         attempts += 1;
+        progress.attempts = attempts;
 
         // Resume offset: bytes already on disk win over the recorded counter,
         // and so they do on every attempt: the part file is the truth about
@@ -623,9 +702,31 @@ pub async fn download_entry(
             if progress.bytes > 0 {
                 // A ranged request is already in flight and its answer is
                 // about the encoded stream: start over from zero.
+                set_note(
+                    id,
+                    "server sent an encoded body; byte ranges cannot resume it — restarting from zero",
+                );
                 restart_from_zero(&part, &mut progress);
                 continue;
             }
+        }
+
+        // A file link that answers HTML is a viewer/login wall — or an
+        // expired signed link — not the file (this once saved release pages
+        // as APKs). Checked before any range/status handling on purpose: the
+        // 200-on-resume path restarts from zero, and the partial bytes must
+        // survive until we know the server is not about to hand us a login
+        // page instead of the file. Either way, nothing is deleted here.
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if content_type.starts_with("text/html") && looks_like_file_url(&url) {
+            let msg = "server returned a page, not the file (login wall or expired link? refresh the address with `catch refresh`)";
+            let _ = mark_error(id, msg);
+            anyhow::bail!("{url}: {msg}");
         }
 
         // A resumed answer must prove it starts exactly where we stopped.
@@ -649,6 +750,10 @@ pub async fn download_entry(
                     // download (resumable state is discarded).
                     progress.resumable = false;
                     if progress.bytes > 0 {
+                        set_note(
+                            id,
+                            "server cannot confirm a length for ranged resumes; downloading as a full file",
+                        );
                         restart_from_zero(&part, &mut progress);
                     }
                     drop(resp);
@@ -668,9 +773,32 @@ pub async fn download_entry(
                     let modified_changed = !progress.last_modified.is_empty()
                         && resp_modified.is_some_and(|lm| lm != progress.last_modified);
                     let size_changed = progress.total > 0 && Some(total) != Some(progress.total);
-                    if progress.bytes > 0 && (etag_changed || modified_changed || size_changed) {
-                        eprintln!(
-                            "catch: {id} remote changed under a resumed transfer; restarting from zero"
+                    // No validators to compare (the server never sent one, or
+                    // the link predates them): the only remaining proof that
+                    // this is still the same representation is a byte count
+                    // that adds up. A ranged answer must promise exactly
+                    // total - offset body bytes; anything else means the file
+                    // changed under us, and the bytes on disk must not be
+                    // spliced with the tail of a different file.
+                    let no_validators =
+                        progress.etag.is_empty() && progress.last_modified.is_empty();
+                    let length_disagrees = no_validators
+                        && resp
+                            .content_length()
+                            .is_some_and(|cl| progress.bytes + cl != total);
+                    if progress.bytes > 0
+                        && (etag_changed || modified_changed || size_changed || length_disagrees)
+                    {
+                        let why = if size_changed || length_disagrees {
+                            "representation size changed"
+                        } else {
+                            "validators changed"
+                        };
+                        set_note(
+                            id,
+                            &format!(
+                                "remote changed under a resumed transfer ({why}); restarting from zero"
+                            ),
                         );
                         restart_from_zero(&part, &mut progress);
                         continue;
@@ -687,7 +815,31 @@ pub async fn download_entry(
         } else if status == reqwest::StatusCode::OK {
             if progress.bytes > 0 {
                 // Server ignored Range (or If-Range changed): start over
-                // rather than appending a whole file to a partial one.
+                // rather than appending a whole file to a partial one. The
+                // response's own validators tell the two cases apart, and the
+                // row note says which one happened — a silent restart from
+                // zero looked like Catch had thrown progress away.
+                let changed = {
+                    let resp_etag = resp
+                        .headers()
+                        .get(reqwest::header::ETAG)
+                        .and_then(|v| v.to_str().ok());
+                    let resp_modified = resp
+                        .headers()
+                        .get(reqwest::header::LAST_MODIFIED)
+                        .and_then(|v| v.to_str().ok());
+                    (!progress.etag.is_empty() && resp_etag.is_some_and(|e| e != progress.etag))
+                        || (!progress.last_modified.is_empty()
+                            && resp_modified.is_some_and(|lm| lm != progress.last_modified))
+                };
+                set_note(
+                    id,
+                    if changed {
+                        "remote changed under a resumed transfer; restarting from zero"
+                    } else {
+                        "server ignored the range request; restarting from zero"
+                    },
+                );
                 restart_from_zero(&part, &mut progress);
             }
         } else if progress.bytes > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
@@ -724,6 +876,7 @@ pub async fn download_entry(
                 let _ = mark_error(id, &msg);
                 anyhow::bail!("{url}: {msg}");
             }
+            set_note(id, "server refused the resumed range; restarting from zero");
             restarts += 1;
             restart_from_zero(&part, &mut progress);
             continue;
@@ -752,19 +905,6 @@ pub async fn download_entry(
         progress.capture_validators(resp.headers());
         if was_probe {
             probe_pending = false;
-        }
-
-        // A file link that answers HTML is a viewer/login wall, not the
-        // file (this once saved release pages as APKs). Refuse loudly.
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        if content_type.starts_with("text/html") && looks_like_file_url(&url) {
-            let _ = mark_error(id, "server returned a page, not the file (login wall?)");
-            anyhow::bail!("{url}: server returned a page, not the file");
         }
 
         // Adopt a server-advertised filename when ours is generic (query
@@ -811,11 +951,16 @@ pub async fn download_entry(
                         .count()
                 })
                 .unwrap_or(1);
-            let share = segment::segment_share(active);
+            let want = segment::segment_share(active);
+            let share = permits.grow(want).min(segment::segments_cap());
             if segment::eligible(total, share)
                 && (!progress.etag.is_empty() || !progress.last_modified.is_empty())
             {
-                // Preallocate the part file and write the manifest.
+                // Manifest before preallocation: the manifest is the only
+                // record that the part is a preallocated (not yet written)
+                // range set. A crash between the two steps must leave a
+                // recoverable pair or nothing — never a full-size part with
+                // no manifest, which used to read as "already complete".
                 let n = segment::segment_count(total, share);
                 let boundaries = segment::segment_ranges(total, n);
                 let manifest = segment::SegmentManifest {
@@ -828,18 +973,27 @@ pub async fn download_entry(
                     created_at: crate::state::now_secs(),
                     updated_at: crate::state::now_secs(),
                 };
-                if let Err(e) = (|| -> Result<()> {
+                let preparing = (|| -> Result<()> {
+                    // Create (or clear) the file first, write the manifest,
+                    // then preallocate: a crash at any point leaves either
+                    // no manifest (part empty, harmless) or a consistent
+                    // manifest+length pair.
                     let pf = std::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
                         .truncate(true)
                         .open(&part)?;
+                    segment::save_manifest_atomic(&part, &manifest)?;
                     pf.set_len(total)?;
                     Ok(())
-                })() {
-                    eprintln!("catch: {id} cannot preallocate part: {e:#}");
+                })();
+                if let Err(e) = preparing {
+                    eprintln!("catch: {id} cannot prepare the segmented part: {e:#}");
+                    // A manifest without a matching part is a lie; drop it
+                    // and fall through to the sequential path.
+                    segment::remove_manifest(&part);
                 } else {
-                    if segment::save_manifest_atomic(&part, &manifest).is_ok() {
+                    {
                         update_state(|state| {
                             if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
                                 d.total = total;
@@ -859,6 +1013,7 @@ pub async fn download_entry(
                             progress.last_modified.clone(),
                             manifest,
                             share,
+                            limiter.clone(),
                         )
                         .await;
                         let outcome = match outcome {
@@ -898,14 +1053,15 @@ pub async fn download_entry(
                                 return Ok(part.clone());
                             }
                             segment::SegmentedResult::Stopped => {
-                                std::fs::remove_file(&part).ok();
-                                segment::remove_manifest(&part);
-                                eprintln!("catch: {id} stopped");
-                                anyhow::bail!("{id} stopped");
+                                note_stopped(id, progress.bytes);
+                                anyhow::bail!("{id} stopped (partial data kept)")
                             }
                             segment::SegmentedResult::Fallback(reason) => {
-                                eprintln!(
-                                    "catch: {id} segmented download fell back to sequential: {reason}"
+                                set_note(
+                                    id,
+                                    &format!(
+                                        "segmented download fell back to sequential: {reason}"
+                                    ),
                                 );
                                 segment::remove_manifest(&part);
                                 let _ = std::fs::remove_file(&part);
@@ -969,6 +1125,7 @@ pub async fn download_entry(
             &mut stream,
             &mut progress,
             &mut watch,
+            limiter.as_deref(),
         )
         .await
         {
@@ -995,10 +1152,10 @@ pub async fn download_entry(
                 return Ok(part.clone());
             }
             StreamEnd::Aborted => {
-                std::fs::remove_file(&part).ok();
-                segment::remove_manifest(&part);
-                eprintln!("catch: {id} stopped");
-                anyhow::bail!("{id} stopped");
+                // Stop keeps the partial data: the row stays resumable, the
+                // bytes are the user's until they explicitly remove them.
+                note_stopped(id, progress.bytes);
+                anyhow::bail!("{id} stopped (partial data kept)")
             }
             StreamEnd::Interrupted(why) => {
                 progress.last_error = why.clone();
@@ -1061,16 +1218,26 @@ fn note_retry(
     progress: &mut Progress,
 ) -> Result<()> {
     progress.last_error = why.to_string();
+    progress.attempts = attempts;
     let note = format!(
         "attempt {attempts}/{} failed: {why}; retrying in {:.1}s",
         max_attempts(),
         wait.as_secs_f64()
     );
     eprintln!("catch: {id} {note}");
+    let due = crate::state::now_secs() + wait.as_secs().max(1);
     update_state(|state| {
         if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
             if d.status == Status::Downloading {
                 d.error = note.clone();
+                // Persisted retry state: a worker that dies mid-backoff
+                // leaves the count behind, so a restart cannot reset the
+                // budget to zero and retry for ever; `resume` resets it on
+                // purpose. `next_retry_at` lets `catch why` say when.
+                d.attempts = attempts;
+                d.next_retry_at = due;
+                d.speed = 0;
+                d.eta = 0;
             }
         }
         Ok(())
@@ -1079,6 +1246,38 @@ fn note_retry(
 
 fn note_paused(id: &str, progress: &Progress) {
     eprintln!("catch: {id} paused at {} bytes", progress.bytes);
+    let _ = update_state(|state| {
+        if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
+            if d.status == Status::Paused {
+                d.speed = 0;
+                d.eta = 0;
+                d.next_retry_at = 0;
+            }
+        }
+        Ok(())
+    });
+}
+
+/// A stop was honored. The partial bytes stay on disk — say so, because the
+/// log line is the evidence for "stop kept my data".
+fn note_stopped(id: &str, bytes: u64) {
+    eprintln!("catch: {id} stopped at {bytes} bytes (partial data kept)");
+}
+
+/// Put a user-visible reason on the row without failing it: why segmentation
+/// fell back, why a restart from zero happened, why a resume was refused.
+/// A worker's stderr is discarded when the queue spawned it (drain runs with
+/// null stdio), so the row note is the only channel that reaches the user.
+fn set_note(id: &str, note: &str) {
+    eprintln!("catch: {id} {note}");
+    let _ = update_state(|state| {
+        if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
+            if d.status == Status::Downloading {
+                d.error = note.to_string();
+            }
+        }
+        Ok(())
+    });
 }
 
 /// Live counters for one transfer, shared across reconnects.
@@ -1092,6 +1291,83 @@ struct Progress {
     /// False when byte offsets cannot be trusted across connections
     /// (a content-encoded body): never resume such a transfer.
     resumable: bool,
+    /// Connection attempts used so far; seeded from the persisted row so a
+    /// crash-restart does not silently reset the retry budget.
+    attempts: u32,
+    rate: RateSampler,
+}
+
+/// A rate sample: current smoothed rate, session average, and ETA, all in
+/// bytes (or seconds) per the row schema. 0 means "unknown".
+pub(crate) struct RateSample {
+    pub speed: u64,
+    pub avg: u64,
+    pub eta: u64,
+}
+
+/// Monotonic rate sampling shared by the sequential and segmented engines.
+/// Only body bytes that were actually kept count: retried-and-discarded
+/// attempts and probe requests never advance the counter, so progress and
+/// aggregate speeds cannot double-count a retry.
+pub(crate) struct RateSampler {
+    sample_at: Instant,
+    sample_bytes: u64,
+    speed: f64,
+    session_started: Instant,
+    session_start_bytes: u64,
+}
+
+impl RateSampler {
+    pub(crate) fn new(bytes: u64) -> RateSampler {
+        RateSampler {
+            sample_at: Instant::now(),
+            sample_bytes: bytes,
+            speed: 0.0,
+            session_started: Instant::now(),
+            session_start_bytes: bytes,
+        }
+    }
+
+    pub(crate) fn sample(&mut self, bytes: u64, total: u64) -> RateSample {
+        let now = Instant::now();
+        let dt = now.duration_since(self.sample_at).as_secs_f64();
+        if dt >= 0.4 {
+            let inst = bytes.saturating_sub(self.sample_bytes) as f64 / dt;
+            self.speed = if self.speed < 1.0 {
+                inst
+            } else {
+                0.65 * self.speed + 0.35 * inst
+            };
+            self.sample_at = now;
+            self.sample_bytes = bytes;
+        }
+        let elapsed = now
+            .duration_since(self.session_started)
+            .as_secs_f64()
+            .max(0.001);
+        let avg = bytes.saturating_sub(self.session_start_bytes) as f64 / elapsed;
+        let eta = if self.speed >= 1.0 && total > bytes {
+            ((total - bytes) as f64 / self.speed).round() as u64
+        } else {
+            0
+        };
+        RateSample {
+            speed: self.speed.max(0.0) as u64,
+            avg: avg.max(0.0) as u64,
+            eta,
+        }
+    }
+}
+
+/// "2.4 MiB/s" / "312 KiB/s" / "0 B/s" for logs; the row stores raw bytes/s.
+pub(crate) fn fmt_rate(bps: u64) -> String {
+    if bps >= 1024 * 1024 {
+        format!("{:.1} MiB/s", bps as f64 / (1024.0 * 1024.0))
+    } else if bps >= 1024 {
+        format!("{} KiB/s", bps / 1024)
+    } else {
+        format!("{bps} B/s")
+    }
 }
 
 /// Throw away the partial file and every resume validator: the server
@@ -1147,13 +1423,32 @@ impl Progress {
 /// Write live counters to the row and translate its status into an order.
 /// One locked read-modify-write also makes this the stop-order check for a
 /// transfer that is busily moving bytes. `Ok(None)` means keep going.
-async fn flush_progress(id: &str, progress: &mut Progress) -> Result<Option<StreamEnd>> {
+async fn flush_progress(
+    id: &str,
+    progress: &mut Progress,
+    limiter: Option<&crate::throttle::RateLimiter>,
+) -> Result<Option<StreamEnd>> {
+    let rate = progress.rate.sample(progress.bytes, progress.total);
     let mut directive = Directive::Keep;
+    let mut active = 1usize;
     update_state(|state| {
+        active = state
+            .downloads
+            .iter()
+            .filter(|d| d.status == Status::Downloading)
+            .count()
+            .max(1);
         directive = match state.downloads.iter_mut().find(|d| d.id == id) {
             Some(d) if d.status == Status::Downloading => {
                 d.bytes = progress.bytes;
                 d.total = progress.total;
+                // Rate on a monotonic clock, persisted so the panel can show
+                // it without sampling and so `catch why` sees the last figure.
+                d.speed = rate.speed;
+                d.avg_speed = rate.avg;
+                d.eta = rate.eta;
+                d.attempts = progress.attempts;
+                d.next_retry_at = 0;
                 Directive::Keep
             }
             Some(d) if d.status == Status::Paused => Directive::StandDown,
@@ -1162,16 +1457,27 @@ async fn flush_progress(id: &str, progress: &mut Progress) -> Result<Option<Stre
         Ok(())
     })
     .unwrap_or(());
+    // The cap is global: this worker's share is the cap divided by the
+    // transfers running right now, refreshed as the queue changes.
+    if let (Some(l), Some(share)) = (limiter, crate::throttle::worker_limit(active)) {
+        l.set_rate(share);
+    }
     if progress.total > 0 {
         eprintln!(
-            "catch: {} {}% ({}/{})",
+            "catch: {} {}% ({}/{}) {}",
             id,
             progress.percent(),
             progress.bytes,
-            progress.total
+            progress.total,
+            fmt_rate(rate.speed)
         );
     } else {
-        eprintln!("catch: {} {} bytes", id, progress.bytes);
+        eprintln!(
+            "catch: {} {} bytes {}",
+            id,
+            progress.bytes,
+            fmt_rate(rate.speed)
+        );
     }
     Ok(match directive {
         Directive::Keep => None,
@@ -1194,6 +1500,7 @@ async fn stream_one_connection(
     stream: &mut (impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin),
     progress: &mut Progress,
     watch: &mut DirectiveWatch,
+    limiter: Option<&crate::throttle::RateLimiter>,
 ) -> Result<StreamEnd> {
     use tokio::io::AsyncWriteExt;
     // Reading the stop order loads and parses the whole state file: every
@@ -1261,7 +1568,7 @@ async fn stream_one_connection(
             None => {
                 order_due = true;
                 if progress.last_flush.elapsed() >= FLUSH_EVERY {
-                    if let Some(end) = flush_progress(id, progress).await? {
+                    if let Some(end) = flush_progress(id, progress, limiter).await? {
                         return Ok(end);
                     }
                 }
@@ -1286,6 +1593,11 @@ async fn stream_one_connection(
                 return Ok(StreamEnd::Finished);
             }
         };
+        if let Some(l) = limiter {
+            // Throttle before the write: waiting here pauses the body read,
+            // which is exactly the backpressure the cap wants.
+            l.acquire(chunk.len() as u64).await;
+        }
         file.write_all(&chunk)
             .await
             .with_context(|| format!("write {}", part.display()))?;
@@ -1297,7 +1609,7 @@ async fn stream_one_connection(
         // updated once per 100 MiB, and a chunked response with no
         // Content-Length never updated at all (its percent is constant).
         if progress.last_flush.elapsed() >= FLUSH_EVERY {
-            if let Some(end) = flush_progress(id, progress).await? {
+            if let Some(end) = flush_progress(id, progress, limiter).await? {
                 return Ok(end);
             }
         }
@@ -1338,17 +1650,19 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
     } = f;
 
     // Race safety: if the row is already cancelled or removed, do not publish
-    // a final file. Remove the part and bail.
-    let alive_result = crate::state::with_lock(|| {
+    // a final file. Remove the part and bail. The row also carries the
+    // user-pinned checksum, read here so the check is one locked snapshot.
+    let owned_result = crate::state::with_lock(|| {
         let state = crate::state::load_state()?;
         Ok(state
             .downloads
             .iter()
-            .any(|d| d.id == id && d.status == Status::Downloading))
+            .find(|d| d.id == id && d.status == Status::Downloading)
+            .map(|d| d.expected_sha256.clone()))
     });
-    match alive_result {
-        Ok(true) => {}
-        Ok(false) => {
+    let expected_sha256 = match owned_result {
+        Ok(Some(sha)) => sha,
+        Ok(None) => {
             let _ = std::fs::remove_file(part);
             segment::remove_manifest(part);
             anyhow::bail!("{id} stopped");
@@ -1357,7 +1671,7 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
             // State unreadable: preserve partial data and report.
             anyhow::bail!("{id}: could not verify ownership: {e:#}");
         }
-    }
+    };
 
     let held = std::fs::metadata(part)
         .map(|m| m.len())
@@ -1372,6 +1686,21 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
     }
     if held != bytes {
         eprintln!("catch: {id} note: {bytes} streamed, {held} on disk");
+    }
+    // A user-pinned checksum is verified over the part before anything is
+    // published. On mismatch the bytes are removed and reported: keeping them
+    // would only let a later resume finish the same wrong file.
+    if !expected_sha256.is_empty() {
+        let actual = sha256_file(part).await?;
+        if !actual.eq_ignore_ascii_case(&expected_sha256) {
+            segment::remove_manifest(part);
+            let _ = std::fs::remove_file(part);
+            let msg = format!(
+                "checksum mismatch: expected {expected_sha256}, got {actual} (wrong bytes removed; resume to fetch again)"
+            );
+            let _ = mark_error(id, &msg);
+            anyhow::bail!("{msg}");
+        }
     }
     // Atomically allocate the final path so two workers finishing at the
     // same time cannot both rename to the same destination (which would
@@ -1394,12 +1723,21 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
             Ok(candidate)
         })?
     };
-    // Intent record for recoverable finalization: written before the rename.
+    // Intent record for recoverable finalization: written (and synced)
+    // before the rename, carrying the intended total so recovery can tell a
+    // completed rename from a crash that left only the empty reservation.
     let intent_path = PathBuf::from(format!("{}.finalizing", part.display()));
-    let _ = std::fs::write(
-        &intent_path,
-        serde_json::json!({"dest": dest.display().to_string(), "url": url}).to_string(),
-    );
+    let intent = serde_json::json!({
+        "dest": dest.display().to_string(),
+        "url": url,
+        "total": total,
+    })
+    .to_string();
+    if std::fs::write(&intent_path, &intent).is_ok() {
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&intent_path) {
+            let _ = f.sync_data();
+        }
+    }
 
     if let Err(e) = tokio::fs::rename(part, &dest).await {
         // Remove the reservation file we created so it does not linger.
@@ -1427,6 +1765,10 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
                 d.error.clear();
                 d.pid = 0;
                 d.claimed_at = 0;
+                d.speed = 0;
+                d.eta = 0;
+                d.next_retry_at = 0;
+                d.attempts = 0;
             } else {
                 lost = true;
             }
@@ -1452,6 +1794,115 @@ pub(crate) async fn finish(f: Finish<'_>) -> Result<PathBuf> {
     eprintln!("catch: done {} -> {}", id, dest.display());
     crate::state::spawn_drain();
     Ok(dest)
+}
+
+/// Streaming SHA-256 of a file (1 MiB chunks): files are never read whole
+/// into memory, and the hash covers the exact bytes on disk.
+pub(crate) async fn sha256_file(path: &std::path::Path) -> Result<String> {
+    use sha2::Digest;
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Shared HTTP client. One per transfer for connection pooling and
+/// keep-alive; TLS verification is rustls' default: on.
+pub(crate) fn client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent("catch/0.1 (omarchy download manager)")
+        .connect_timeout(response_timeout())
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()?)
+}
+
+/// What a probe of a URL says about the file it serves.
+pub(crate) struct RemoteInfo {
+    pub total: Option<u64>,
+    pub etag: String,
+    pub last_modified: String,
+}
+
+/// Ask a URL for its identity without downloading it: a one-byte ranged GET
+/// (some servers refuse HEAD) with the body dropped. Errors name the reason,
+/// so "expired link" and "wrong URL" stay distinguishable.
+pub(crate) async fn probe_remote(url: &str) -> Result<RemoteInfo> {
+    let client = client()?;
+    let req = client
+        .get(url)
+        .header("Range", "bytes=0-0")
+        .header(reqwest::header::ACCEPT_ENCODING, "identity");
+    let resp = tokio::time::timeout(response_timeout(), req.send())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "{url}: no response headers within {}s",
+                response_timeout().as_secs()
+            )
+        })?
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    if !status.is_success() && status != reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        let msg = match status.as_u16() {
+            401 | 403 => format!("{status} — the link is expired or requires sign-in"),
+            404 | 410 => format!("{status} — nothing is served at this address"),
+            _ => format!("{status}"),
+        };
+        anyhow::bail!("{url}: {msg}");
+    }
+    let total = if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        resp.headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().strip_prefix("bytes */"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    } else {
+        resp.headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_range)
+            .and_then(|(_, _, total)| total)
+            .or_else(|| resp.content_length())
+    };
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let last_modified = resp
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if content_type.starts_with("text/html") && looks_like_file_url(url) {
+        anyhow::bail!("{url}: that address serves a web page, not a file (login wall?)");
+    }
+    Ok(RemoteInfo {
+        total,
+        etag,
+        last_modified,
+    })
 }
 
 #[cfg(test)]

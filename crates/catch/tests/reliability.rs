@@ -6,6 +6,7 @@ mod support;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use support::{
@@ -719,7 +720,7 @@ fn malformed_state_is_quarantined_and_the_cli_still_works() {
 }
 
 #[test]
-fn cancel_during_io_removes_the_part_and_stays_cancelled() {
+fn cancel_keeps_the_part_and_a_resume_finishes_byte_exact() {
     let sb = Sandbox::new("cancel-io");
     let body = patterned(5000, 101);
     sb.seed(vec![row(
@@ -729,13 +730,22 @@ fn cancel_during_io_removes_the_part_and_stays_cancelled() {
         "queued",
     )]);
     let serve = body.clone();
-    let server = Server::start(move |_req, _n| {
-        let mut r = Reply::new(200);
-        r.body = Body::Chunked(vec![
-            (serve[..100].to_vec(), Duration::ZERO),
-            (serve[100..].to_vec(), Duration::from_secs(5)),
-        ]);
-        r
+    let server = Server::start(move |req, _n| {
+        if let Some(start) = req.range_start() {
+            // The resume asks for the bytes already on disk.
+            let start = (start as usize).min(serve.len());
+            Reply::partial(serve[start..].to_vec(), start as u64, serve.len() as u64)
+        } else {
+            let mut r = Reply::new(200);
+            // The chunk format delays *after* each chunk, so stall on the
+            // first one: 100 bytes, a long gap (the cancel lands here), then
+            // the rest.
+            r.body = Body::Chunked(vec![
+                (serve[..100].to_vec(), Duration::from_secs(5)),
+                (serve[100..].to_vec(), Duration::ZERO),
+            ]);
+            r
+        }
     });
     let url = server.url("file.bin");
     let mut state = sb.state();
@@ -758,10 +768,30 @@ fn cancel_during_io_removes_the_part_and_stays_cancelled() {
     let out = child.join().expect("download thread");
     assert!(!out.status.success(), "the worker must stop on cancel");
     assert_eq!(sb.status("cancel").as_deref(), Some("cancelled"));
-    wait_until("the part file to disappear", Duration::from_secs(5), || {
-        !sb.part("cancel", "file.bin").exists()
-    });
+
+    // Stop is not remove: the partial file and its progress survive so the
+    // same URL can be resumed (or refreshed) later — only `remove` deletes.
+    let part = sb.part("cancel", "file.bin");
+    assert!(part.is_file(), "stop must keep the partial data");
+    assert!(part.metadata().unwrap().len() > 0);
     assert!(!sb.base().join("file.bin").exists());
+
+    // Resume against the same link: `resume` re-queues the row and wakes the
+    // drainer, which asks for the bytes already on disk and finishes
+    // byte-for-byte.
+    run_args(&sb, &["resume", "cancel"], Duration::from_secs(10));
+    wait_until(
+        "the resumed transfer to finish",
+        Duration::from_secs(20),
+        || sb.status("cancel").as_deref() == Some("done"),
+    );
+    assert_eq!(
+        sb.status("cancel").as_deref(),
+        Some("done"),
+        "the background drainer must finish the resume"
+    );
+    assert_eq!(std::fs::read(sb.base().join("file.bin")).unwrap(), body);
+    assert!(!part.exists(), "the part is gone once published");
 }
 
 #[test]
@@ -1286,4 +1316,414 @@ fn replace_cannot_delete_outside_download_dir() {
         "replace must not delete a file outside the download dir"
     );
     assert_eq!(std::fs::read(&outside).unwrap(), b"secret");
+}
+
+// Byte-range serving shared by the segmented tests: a ranged request gets
+// exactly the asked slice as a 206 with validators, anything else the full
+// representation. The one-byte probe (bytes=0-0) is answered the same way.
+fn range_reply(body: &[u8], req: &support::Request) -> Reply {
+    let total = body.len() as u64;
+    let mut reply = if let Some(raw) = req.header("range") {
+        let rest = raw.strip_prefix("bytes=").unwrap_or("");
+        let mut parts = rest.split('-');
+        let start: u64 = parts
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let end: u64 = parts
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(total - 1)
+            .min(total - 1);
+        if start > end || start >= total {
+            return Reply::new(416);
+        }
+        Reply::partial(body[start as usize..=end as usize].to_vec(), start, total)
+    } else {
+        Reply::ok(body.to_vec())
+    };
+    reply.headers.push(("ETag".into(), "\"seg-v1\"".into()));
+    reply.headers.push(("Accept-Ranges".into(), "bytes".into()));
+    reply
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let out = sha2::Sha256::digest(bytes);
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn segmented_download_is_byte_exact_across_connections() {
+    let sb = Sandbox::new("seg-e2e");
+    let body = patterned(300_000, 41);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let server = Server::start({
+        let body = body.clone();
+        move |req, _n| {
+            record.lock().unwrap().push(req.clone());
+            range_reply(&body, &req)
+        }
+    });
+    let url = server.url("file.bin");
+    let mut cmd = sb.cmd();
+    cmd.env("CATCH_SEGMENT_MIN_BYTES", "1024")
+        .env("CATCH_SEGMENT_MIN_PIECE", "256")
+        .env("CATCH_SEGMENTS", "4")
+        .args(["add", &url, "--dir", &dir(&sb)]);
+    let out = run(cmd, Duration::from_secs(30));
+    assert!(
+        out.status.success(),
+        "segmented add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let row = sb.row_for_url(&url).expect("row");
+    assert_eq!(row["status"], "done");
+    assert_eq!(std::fs::read(sb.base().join("file.bin")).unwrap(), body);
+
+    let id = row["id"].as_str().unwrap().to_string();
+    let part = sb.part(&id, "file.bin");
+    assert!(!part.exists(), "the part is gone once published");
+    assert!(
+        !std::path::PathBuf::from(format!("{}.meta", part.display())).exists(),
+        "the manifest is cleaned up with it"
+    );
+    let requests = seen.lock().unwrap();
+    let offsets: Vec<u64> = requests
+        .iter()
+        .filter_map(|r| r.range_start())
+        .filter(|s| *s > 0)
+        .collect();
+    assert!(
+        !offsets.is_empty(),
+        "the transfer must fan out to real segment offsets: {requests:?}"
+    );
+}
+
+// The runner hands a straggler's tail to an idle slot by marking the victim's
+// frontier. The victim only obeys the mark at its next poll, so a final chunk
+// that completes the range can land after the mark was set and finish the
+// work outright. That attempt is done — it must run the durable commit, not
+// report a handoff: a handoff with nothing left looks like "finished, no
+// remainder" while the segment stays unmarked, the queue drains, and the
+// transfer fails with "segment N did not complete" with every byte of it on
+// disk.
+#[test]
+fn split_mark_outrun_by_the_last_chunk_still_commits() {
+    let sb = Sandbox::new("seg-split-commit");
+    let body = patterned(300_000, 43);
+    let server = Server::start({
+        let body = body.clone();
+        move |req, _n| {
+            let mut reply = range_reply(&body, &req);
+            let bytes = match std::mem::replace(&mut reply.body, Body::Empty) {
+                Body::Bytes(b) => b,
+                other => {
+                    reply.body = other;
+                    return reply;
+                }
+            };
+            match req.range_start() {
+                // Second half [150000, 299999]: a small first chunk, the bulk
+                // of the tail, then the last 8 KiB after a pause. The pause is
+                // where the idle slot marks this segment; the last piece then
+                // completes the whole work, outrunning the mark.
+                Some(150_000) => {
+                    let cut = bytes.len() - 8192;
+                    reply.declared_length = None;
+                    reply.body = Body::Chunked(vec![
+                        (bytes[..4096].to_vec(), Duration::from_millis(100)),
+                        (bytes[4096..cut].to_vec(), Duration::from_millis(150)),
+                        (bytes[cut..].to_vec(), Duration::ZERO),
+                    ]);
+                }
+                // First half [0, 149999]: all but the last kilobyte at once,
+                // then the last kilobyte 150 ms later, so this slot frees
+                // between the two tail chunks above. (The capability probe
+                // 0-1023 is too small to match.)
+                Some(0) if bytes.len() > 4096 => {
+                    let cut = bytes.len() - 1024;
+                    reply.declared_length = None;
+                    reply.body = Body::Chunked(vec![
+                        (bytes[..cut].to_vec(), Duration::from_millis(150)),
+                        (bytes[cut..].to_vec(), Duration::ZERO),
+                    ]);
+                }
+                _ => reply.body = Body::Bytes(bytes),
+            }
+            reply
+        }
+    });
+    let url = server.url("file.bin");
+    let mut cmd = sb.cmd();
+    cmd.env("CATCH_SEGMENT_MIN_BYTES", "1024")
+        .env("CATCH_SEGMENT_MIN_PIECE", "256")
+        .env("CATCH_SEGMENTS", "2")
+        .env("CATCH_MAX_CONNECTIONS", "2")
+        .args(["add", &url, "--dir", &dir(&sb)]);
+    let out = run(cmd, Duration::from_secs(30));
+    assert!(
+        out.status.success(),
+        "a split mark the last chunk outran left the segment uncommitted: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let row = sb.row_for_url(&url).expect("row");
+    assert_eq!(row["status"], "done");
+    assert_eq!(std::fs::read(sb.base().join("file.bin")).unwrap(), body);
+    let id = row["id"].as_str().unwrap().to_string();
+    let part = sb.part(&id, "file.bin");
+    assert!(!part.exists(), "the part is gone once published");
+    assert!(
+        !std::path::PathBuf::from(format!("{}.meta", part.display())).exists(),
+        "the manifest is cleaned up with it"
+    );
+}
+
+#[test]
+fn segmented_pause_keeps_the_manifest_and_resume_finishes() {
+    let sb = Sandbox::new("seg-pause");
+    let body = patterned(300_000, 77);
+    let served = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&served);
+    let server = Server::start({
+        let body = body.clone();
+        move |req, _n| {
+            let n = count.fetch_add(1, Ordering::SeqCst);
+            let mut reply = range_reply(&body, &req);
+            // The first handful of full-size responses arrive in two halves
+            // with a long gap: long enough for a pause to land mid-transfer,
+            // and only for the first run — the resumed segments are fast.
+            if (1..6).contains(&n) {
+                reply.body = match std::mem::replace(&mut reply.body, Body::Empty) {
+                    Body::Bytes(bytes) if bytes.len() > 1000 => {
+                        let half = bytes.len() / 2;
+                        reply.declared_length = None;
+                        // The delay comes after each chunk, so the gap must
+                        // sit on the first half: bytes, pause, then the rest.
+                        Body::Chunked(vec![
+                            (bytes[..half].to_vec(), Duration::from_secs(4)),
+                            (bytes[half..].to_vec(), Duration::ZERO),
+                        ])
+                    }
+                    other => other,
+                };
+            }
+            reply
+        }
+    });
+    let url = server.url("file.bin");
+    let mut cmd = sb.cmd();
+    cmd.env("CATCH_SEGMENT_MIN_BYTES", "1024")
+        .env("CATCH_SEGMENT_MIN_PIECE", "256")
+        .env("CATCH_SEGMENTS", "4")
+        .args(["add", &url, "--dir", &dir(&sb)]);
+    let child = std::thread::spawn(move || run(cmd, Duration::from_secs(60)));
+    wait_until(
+        "the segmented transfer to show progress",
+        Duration::from_secs(10),
+        || {
+            sb.row_for_url(&url)
+                .map(|d| d["bytes"].as_u64().unwrap_or(0) > 0)
+                .unwrap_or(false)
+        },
+    );
+    let id = sb.row_for_url(&url).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    run_args(&sb, &["pause", &id], Duration::from_secs(10));
+    let _ = child.join();
+
+    assert_eq!(sb.status(&id).as_deref(), Some("paused"));
+    let part = sb.part(&id, "file.bin");
+    let meta = std::path::PathBuf::from(format!("{}.meta", part.display()));
+    assert!(
+        part.is_file() && meta.is_file(),
+        "pause keeps part + manifest"
+    );
+    assert_eq!(
+        part.metadata().unwrap().len(),
+        body.len() as u64,
+        "the part stays preallocated to the full length"
+    );
+
+    // Resume: the manifest drives the same segment ranges and the same
+    // segment connections, and the output must be byte-for-byte correct even
+    // though the first run died mid-segment. `resume` wakes the drainer.
+    run_args(&sb, &["resume", &id], Duration::from_secs(10));
+    wait_until(
+        "the segmented resume to finish",
+        Duration::from_secs(30),
+        || sb.status(&id).as_deref() == Some("done"),
+    );
+    assert_eq!(
+        sb.status(&id).as_deref(),
+        Some("done"),
+        "the background drainer must finish the segmented resume"
+    );
+    assert_eq!(std::fs::read(sb.base().join("file.bin")).unwrap(), body);
+    assert!(!part.exists() && !meta.exists());
+}
+
+#[test]
+fn corrupt_manifest_quarantines_the_part_and_refetches() {
+    let sb = Sandbox::new("bad-manifest");
+    let body = patterned(5000, 13);
+    let server = Server::start({
+        let body = body.clone();
+        move |_req, _n| Reply::ok(body.clone())
+    });
+    let url = server.url("file.bin");
+
+    // A preallocated part whose manifest is garbage. This used to read as "no
+    // manifest, part holds N complete bytes" and could publish a file of
+    // holes; the part must be set aside and the file fetched again.
+    let part = sb.part("bad-meta", "file.bin");
+    std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+    std::fs::write(&part, vec![0xAAu8; body.len()]).unwrap();
+    std::fs::write(format!("{}.meta", part.display()), b"{ not json").unwrap();
+    sb.seed(vec![row("bad-meta", &url, "file.bin", "queued")]);
+
+    let mut cmd = sb.cmd();
+    cmd.args(["download", "bad-meta", "--dir", &dir(&sb)]);
+    let out = run(cmd, Duration::from_secs(20));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "recovery failed: {stderr}");
+    assert!(
+        stderr.contains("corrupt manifest"),
+        "no quarantine notice: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(sb.base().join("file.bin")).unwrap(),
+        body,
+        "a part no manifest can vouch for is never published"
+    );
+    let quarantined = std::fs::read_dir(sb.base())
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().contains("quarantined"));
+    assert!(quarantined, "the suspect part is kept aside, not reused");
+}
+
+#[test]
+fn a_wrong_checksum_removes_the_bytes_and_reports_it() {
+    let sb = Sandbox::new("checksum");
+    let good = patterned(4000, 5);
+    let bad = patterned(4000, 6);
+    let expected = hex_sha256(&good);
+    let server = Server::start({
+        let good = good.clone();
+        let bad = bad.clone();
+        move |req, _n| {
+            if req.target.contains("bad.bin") {
+                Reply::ok(bad.clone())
+            } else {
+                Reply::ok(good.clone())
+            }
+        }
+    });
+
+    let good_url = server.url("good.bin");
+    let mut cmd = sb.cmd();
+    cmd.args(["add", &good_url, "--dir", &dir(&sb), "--sha256", &expected]);
+    let out = run(cmd, Duration::from_secs(20));
+    assert!(
+        out.status.success(),
+        "verified download failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(sb.base().join("good.bin")).unwrap(), good);
+    assert_eq!(sb.row_for_url(&good_url).unwrap()["status"], "done");
+
+    let bad_url = server.url("bad.bin");
+    let mut cmd = sb.cmd();
+    cmd.args(["add", &bad_url, "--dir", &dir(&sb), "--sha256", &expected]);
+    let out = run(cmd, Duration::from_secs(20));
+    assert!(
+        !out.status.success(),
+        "a checksum mismatch must not report success"
+    );
+    let row = sb.row_for_url(&bad_url).expect("row");
+    assert_eq!(row["status"], "error");
+    assert!(
+        row["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("checksum mismatch"),
+        "the error names the check: {row:?}"
+    );
+    let id = row["id"].as_str().unwrap().to_string();
+    assert!(
+        !sb.base().join("bad.bin").exists(),
+        "wrong bytes are never published"
+    );
+    assert!(
+        !sb.part(&id, "bad.bin").exists(),
+        "wrong bytes are removed, not resumed"
+    );
+}
+
+#[test]
+fn connection_budget_is_enforced_across_workers() {
+    let sb = Sandbox::new("conn-budget");
+    // Three transfers share a global budget of two. Each held request lasts
+    // 400 ms, so the third worker can only leave after one of the first two
+    // has finished — its request must arrive visibly later.
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&arrivals);
+    let server = Server::start(move |_req, _n| {
+        seen.lock().unwrap().push(Instant::now());
+        let mut reply = Reply::new(200);
+        // The bytes arrive immediately, the terminal chunk 400 ms later, so
+        // the connection (and its permit) is held for that long.
+        reply.body = Body::Chunked(vec![(vec![7u8; 4096], Duration::from_millis(400))]);
+        reply
+    });
+
+    let mut cmds = Vec::new();
+    for name in ["one.bin", "two.bin", "three.bin"] {
+        let url = server.url(name);
+        let mut cmd = sb.cmd();
+        cmd.env("CATCH_MAX_CONNECTIONS", "2")
+            .env("CATCH_SEGMENTS", "1")
+            .args(["add", &url, "--dir", &dir(&sb)]);
+        cmds.push(cmd);
+    }
+    let outs: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = cmds
+            .into_iter()
+            .map(|cmd| s.spawn(move || run(cmd, Duration::from_secs(30))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("add thread"))
+            .collect()
+    });
+    for out in &outs {
+        assert!(
+            out.status.success(),
+            "add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for name in ["one.bin", "two.bin", "three.bin"] {
+        assert_eq!(
+            std::fs::read(sb.base().join(name)).unwrap().len(),
+            4096,
+            "{name} must be written completely"
+        );
+    }
+
+    let arrivals = arrivals.lock().unwrap();
+    assert_eq!(
+        arrivals.len(),
+        3,
+        "one request per transfer with segments=1 (no probes): {arrivals:?}"
+    );
+    let spread = arrivals[2] - arrivals[0];
+    assert!(
+        spread >= Duration::from_millis(300),
+        "the third worker must wait for a free permit, arrived after {spread:?}"
+    );
 }

@@ -50,6 +50,61 @@
         ],
         "defaultValue": 3,
         "description": "How many files download at once; the rest wait queued."
+      },
+      {
+        "key": "segments",
+        "type": "enum",
+        "label": "Connections per file",
+        "options": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "defaultValue": 4,
+        "description": "Byte-range connections used for large files; 1 disables segmented downloads. Total connections are shared across transfers."
+      },
+      {
+        "key": "bwMode",
+        "type": "enum",
+        "label": "Bandwidth mode",
+        "options": [
+          "unlimited",
+          "balanced",
+          "low"
+        ],
+        "defaultValue": "unlimited",
+        "description": "Connection default: unlimited uses what the parallel and segment settings add up to, balanced halves it, low quarters it. An explicit limit below always wins."
+      },
+      {
+        "key": "bwCapKb",
+        "type": "number",
+        "label": "Bandwidth limit (KB/s, 0 = none)",
+        "defaultValue": 0,
+        "description": "Global download rate cap, shared by every running transfer."
+      },
+      {
+        "key": "schedEnabled",
+        "type": "enum",
+        "label": "Schedule",
+        "options": [
+          "off",
+          "on"
+        ],
+        "defaultValue": "off",
+        "description": "Off means anytime; on parks transfers outside the window."
+      },
+      {
+        "key": "schedStart",
+        "type": "string",
+        "label": "Window start (HH:MM)",
+        "defaultValue": "02:00"
+      },
+      {
+        "key": "schedStop",
+        "type": "string",
+        "label": "Window end (HH:MM)",
+        "defaultValue": "06:00"
       }
     ]
   }
