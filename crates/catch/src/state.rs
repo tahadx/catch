@@ -70,6 +70,23 @@ pub struct Download {
     /// Parked by the scheduler (not by the user): the scheduler may resume it.
     #[serde(default)]
     pub sched_hold: bool,
+    /// Unix seconds when this entry becomes eligible (0 = no one-time
+    /// delay). A one-time delay, not a second window: once it is due the row
+    /// obeys the daily window, the parallel limit and every other rule.
+    /// Older state files have no field and load as 0.
+    #[serde(default)]
+    pub scheduled_at: u64,
+    /// True while a transfer was started by the drainer rather than by a
+    /// manual `catch download`. Only these are parked when the daily window
+    /// closes, so a hand-started transfer and a user pause are never
+    /// overridden by the scheduler.
+    #[serde(default)]
+    pub sched_owned: bool,
+    /// Per-entry destination override (absolute after enqueue, empty = the
+    /// configured download folder). A scheduled job keeps the folder chosen
+    /// when it was queued even if the default changes later.
+    #[serde(default)]
+    pub dir: String,
     /// yt-dlp bestaudio extraction for video entries.
     #[serde(default)]
     pub audio_only: bool,
@@ -1562,6 +1579,9 @@ mod tests {
             pid,
             claimed_at: 0,
             sched_hold: false,
+            scheduled_at: 0,
+            sched_owned: false,
+            dir: String::new(),
             audio_only: false,
             etag: String::new(),
             last_modified: String::new(),
@@ -1882,6 +1902,9 @@ mod dedup_tests {
             pid: 0,
             claimed_at: 0,
             sched_hold: false,
+            scheduled_at: 0,
+            sched_owned: false,
+            dir: String::new(),
             audio_only: false,
             etag: String::new(),
             last_modified: String::new(),
@@ -2103,6 +2126,9 @@ mod saved_tests {
             pid: 0,
             claimed_at: 0,
             sched_hold: false,
+            scheduled_at: 0,
+            sched_owned: false,
+            dir: String::new(),
             audio_only: false,
             etag: String::new(),
             last_modified: String::new(),

@@ -6,6 +6,7 @@ mod support;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +33,86 @@ fn run_args(sb: &Sandbox, args: &[&str], limit: Duration) -> std::process::Outpu
     let mut cmd = sb.cmd();
     cmd.args(args);
     run_ok(cmd, limit)
+}
+
+// ---------------------------------------------------------------- scheduler
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Local minute-of-day from `date`, so window tests use the same clock as the
+/// backend without duplicating timezone conversion in the test crate.
+fn local_minutes() -> u16 {
+    let out = std::process::Command::new("date")
+        .arg("+%H:%M")
+        .output()
+        .expect("date");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (h, m) = text.trim().split_once(':').expect("HH:MM");
+    h.parse::<u16>().unwrap() * 60 + m.parse::<u16>().unwrap()
+}
+
+fn hhmm(min: u16) -> String {
+    let m = min % (24 * 60);
+    format!("{:02}:{:02}", m / 60, m % 60)
+}
+
+/// Write the widget entry the scheduler reads, with a daily window. The temp
+/// HOME keeps this entirely inside the test.
+fn set_window(sb: &Sandbox, enabled: bool, start: &str, stop: &str) {
+    let path = sb.home.join(".config/omarchy/shell.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let shell = json!({
+        "bar": {
+            "layout": {
+                "right": [{
+                    "id": "io.github.tahadx.catch",
+                    "schedEnabled": if enabled { "on" } else { "off" },
+                    "schedStart": start,
+                    "schedStop": stop,
+                }]
+            }
+        }
+    });
+    std::fs::write(path, serde_json::to_string_pretty(&shell).unwrap()).unwrap();
+}
+
+fn scheduled_row(id: &str, url: &str, filename: &str, status: &str, at: u64) -> Value {
+    let mut r = row(id, url, filename, status);
+    r["scheduled_at"] = json!(at);
+    r
+}
+
+/// A fake `systemctl --user` that reports a healthy timer. Tests must never
+/// touch the developer's real user manager.
+fn fake_systemctl_ok(sb: &Sandbox) {
+    use std::os::unix::fs::PermissionsExt;
+    let script =
+        "#!/bin/sh\ncase \"$2\" in\n  is-enabled|is-active) echo active; exit 0;;\nesac\nexit 0\n";
+    let path = sb.bin.join("systemctl");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn sched_run(sb: &Sandbox, program: &Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = sb.cmd();
+    cmd.env("CATCH_SYSTEMCTL", program).args(args);
+    run(cmd, Duration::from_secs(20))
+}
+
+fn sched_ok(sb: &Sandbox, args: &[&str]) -> std::process::Output {
+    let out = sched_run(sb, &sb.bin.join("systemctl"), args);
+    assert!(
+        out.status.success(),
+        "scheduler command failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
 }
 
 #[test]
@@ -1791,4 +1872,446 @@ fn connection_budget_is_enforced_across_workers() {
         spread >= Duration::from_millis(300),
         "the third worker must wait for a free permit, arrived after {spread:?}"
     );
+}
+
+// --------------------------------------------------------------------------
+// Scheduler: daily window + one-time entry scheduling.
+// --------------------------------------------------------------------------
+
+#[test]
+fn future_one_time_download_waits_for_its_time() {
+    let sb = Sandbox::new("sched-future");
+    let server = Server::start(|_req, _n| Reply::ok(patterned(1024, 9)));
+    let url = server.url("/future.bin");
+    let at = unix_now() + 3600;
+    sb.seed(vec![scheduled_row(
+        "future",
+        &url,
+        "future.bin",
+        "queued",
+        at,
+    )]);
+
+    // Both a manual drain and a scheduler tick must leave it alone: no
+    // worker, no request, and the chosen time still recorded.
+    run_args(&sb, &["drain"], Duration::from_secs(10));
+    run_args(&sb, &["tick"], Duration::from_secs(10));
+    let r = sb.row("future").expect("row");
+    assert_eq!(r["status"], "queued", "future row must stay queued");
+    assert_eq!(r["scheduled_at"].as_u64(), Some(at));
+    assert_eq!(r["pid"].as_u64(), Some(0), "no worker may be reserved");
+    assert_eq!(server.hits(), 0, "nothing may be fetched early");
+
+    // Once due, the same row starts normally and consumes its one-time
+    // delay, so a failure cannot send it back to the old time.
+    let mut due = r;
+    due["scheduled_at"] = json!(unix_now().saturating_sub(1));
+    sb.seed(vec![due]);
+    run_args(&sb, &["drain"], Duration::from_secs(10));
+    wait_until("the due transfer starts", Duration::from_secs(10), || {
+        server.hits() > 0 || sb.status("future").as_deref() != Some("queued")
+    });
+    let r = sb.row("future").expect("row");
+    assert_ne!(r["status"], "queued", "a due row must be eligible");
+    assert_eq!(r["scheduled_at"].as_u64(), Some(0));
+    let _ = std::fs::remove_file(sb.state_path());
+}
+
+#[test]
+fn daily_window_holds_due_work_until_it_opens() {
+    let sb = Sandbox::new("sched-window");
+    let server = Server::start(|_req, _n| Reply::ok(patterned(512, 2)));
+    let now_min = local_minutes();
+    // Starts two hours from now: guaranteed closed regardless of wrap.
+    set_window(&sb, true, &hhmm(now_min + 120), &hhmm(now_min + 180));
+    sb.seed(vec![scheduled_row(
+        "due",
+        &server.url("/due.bin"),
+        "due.bin",
+        "queued",
+        unix_now().saturating_sub(1),
+    )]);
+
+    run_args(&sb, &["drain"], Duration::from_secs(10));
+    let r = sb.row("due").expect("row");
+    assert_eq!(r["status"], "queued", "outside the window nothing starts");
+    assert_eq!(r["sched_hold"], true, "the panel can explain the wait");
+    assert_eq!(server.hits(), 0);
+
+    // A manual drain and a tick cannot bypass the window either.
+    run_args(&sb, &["drain"], Duration::from_secs(10));
+    run_args(&sb, &["tick"], Duration::from_secs(10));
+    assert_eq!(sb.status("due").as_deref(), Some("queued"));
+    assert_eq!(server.hits(), 0);
+
+    // Open a window around now: the held row is released and starts.
+    set_window(
+        &sb,
+        true,
+        &hhmm(now_min.saturating_sub(30)),
+        &hhmm(now_min + 30),
+    );
+    run_args(&sb, &["tick"], Duration::from_secs(10));
+    wait_until(
+        "the released transfer starts",
+        Duration::from_secs(10),
+        || server.hits() > 0,
+    );
+    let r = sb.row("due").expect("row");
+    assert_eq!(r["sched_hold"], false);
+    assert_ne!(r["status"], "paused");
+}
+
+#[test]
+fn the_scheduler_resumes_only_its_own_pause() {
+    let sb = Sandbox::new("sched-pause");
+    let server = Server::start(|_req, _n| Reply::ok(patterned(256, 4)));
+    let mut manual = scheduled_row(
+        "manual",
+        &server.url("/manual.bin"),
+        "manual.bin",
+        "paused",
+        0,
+    );
+    manual["sched_hold"] = json!(false);
+    let mut parked = scheduled_row(
+        "parked",
+        &server.url("/parked.bin"),
+        "parked.bin",
+        "paused",
+        0,
+    );
+    parked["sched_hold"] = json!(true);
+    sb.seed(vec![manual, parked]);
+
+    // Window off means open: tick releases the scheduler's pause but must
+    // leave the user's pause exactly where the user put it.
+    run_args(&sb, &["tick"], Duration::from_secs(10));
+    assert_eq!(sb.status("manual").as_deref(), Some("paused"));
+    let r = sb.row("parked").expect("row");
+    assert_eq!(r["sched_hold"], false);
+    assert_ne!(r["status"], "paused", "scheduler-owned pause resumes");
+}
+
+#[test]
+fn schedule_command_sets_clears_and_starts_a_one_time_job() {
+    let sb = Sandbox::new("sched-cli");
+    fake_systemctl_ok(&sb);
+    sb.seed(vec![
+        row("job", "http://127.0.0.1:9/job.bin", "job.bin", "paused"),
+        row("job2", "http://127.0.0.1:9/job2.bin", "job2.bin", "paused"),
+    ]);
+
+    let at = unix_now() + 3600;
+    let out = sched_ok(&sb, &["schedule", "at", "job", &at.to_string()]);
+    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    assert!(text.contains("starts"), "{text}");
+    let r = sb.row("job").expect("row");
+    assert_eq!(r["scheduled_at"].as_u64(), Some(at));
+    assert_eq!(r["status"], "queued", "scheduling queues the row");
+    assert_eq!(r["sched_hold"], false);
+
+    // A one-time job depends on a real timer; install wrote and verified it
+    // through the injected systemctl. No wall-clock wake claims.
+    let timer = sb.config_home.join("systemd/user/catch-schedule.timer");
+    assert!(timer.is_file(), "the timer unit is installed");
+    let unit = std::fs::read_to_string(&timer).unwrap();
+    assert!(unit.contains("AccuracySec=1s"), "{unit}");
+    assert!(unit.contains("OnCalendar=*-*-* *:*:00"), "{unit}");
+    assert!(!unit.contains("WakeSystem"), "sleep/wake is not promised");
+
+    let listing = sched_ok(&sb, &["schedule", "list"]);
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.contains("job.bin"), "{listing}");
+
+    // Cancel keeps the queued download but drops the delay; it becomes
+    // eligible immediately, so the drainer may already be starting it.
+    sched_ok(&sb, &["schedule", "clear", "job"]);
+    let r = sb.row("job").expect("row");
+    assert_eq!(r["scheduled_at"].as_u64(), Some(0));
+    assert_ne!(r["status"], "paused");
+
+    // Start now also clears a re-added delay. The drainer may already have
+    // picked the row up by the time this process exits, so only the cleared
+    // time and "not paused" are guaranteed.
+    sched_ok(&sb, &["schedule", "at", "job2", &at.to_string()]);
+    sched_ok(&sb, &["schedule", "now", "job2"]);
+    let r = sb.row("job2").expect("row");
+    assert_eq!(r["scheduled_at"].as_u64(), Some(0));
+    assert_ne!(r["status"], "paused");
+
+    // A past time is refused and leaves the persisted row untouched.
+    let past = (unix_now() - 60).to_string();
+    let out = sched_run(
+        &sb,
+        &sb.bin.join("systemctl"),
+        &["schedule", "at", "job", &past],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(err.contains("past"), "{err}");
+    assert_eq!(sb.row("job").unwrap()["scheduled_at"].as_u64(), Some(0));
+}
+
+#[test]
+fn enqueue_at_keeps_time_and_destination_without_starting() {
+    let sb = Sandbox::new("sched-enqueue");
+    fake_systemctl_ok(&sb);
+    let at = unix_now() + 3600;
+    let chosen = sb.root.join("chosen-folder");
+    let url = "http://127.0.0.1:9/at.bin";
+    sched_ok(
+        &sb,
+        &[
+            "enqueue",
+            url,
+            "--at",
+            &at.to_string(),
+            "--dir",
+            &chosen.to_string_lossy(),
+        ],
+    );
+    let r = sb.row_for_url(url).expect("row");
+    assert_eq!(r["scheduled_at"].as_u64(), Some(at));
+    assert_eq!(r["dir"].as_str(), Some(chosen.to_string_lossy().as_ref()));
+    assert_eq!(r["status"], "queued");
+
+    // Parse failure happens before anything is queued.
+    let before = sb.downloads().len();
+    let bad = sched_run(
+        &sb,
+        &sb.bin.join("systemctl"),
+        &["enqueue", "http://127.0.0.1:9/past.bin", "--at", "1"],
+    );
+    assert!(!bad.status.success());
+    assert_eq!(sb.downloads().len(), before, "no half-queued batch");
+}
+
+#[test]
+fn status_json_reports_window_waiting_counts_and_timer_state() {
+    let sb = Sandbox::new("sched-status");
+    let now_min = local_minutes();
+    set_window(&sb, true, &hhmm(now_min + 120), &hhmm(now_min + 180));
+    let now = unix_now();
+    sb.seed(vec![
+        scheduled_row(
+            "due",
+            "http://127.0.0.1:9/due.bin",
+            "due.bin",
+            "queued",
+            now.saturating_sub(1),
+        ),
+        scheduled_row(
+            "later",
+            "http://127.0.0.1:9/later.bin",
+            "later.bin",
+            "queued",
+            now + 3600,
+        ),
+    ]);
+    // /bin/false simulates a user manager that cannot answer: systemctl ran,
+    // so it is available, but the timer is neither enabled nor active.
+    let out = sched_run(
+        &sb,
+        Path::new("/bin/false"),
+        &["schedule", "status", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("status JSON");
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["valid"], true);
+    assert_eq!(v["open"], false);
+    assert_eq!(
+        v["waiting_window"], 1,
+        "only the due row waits for the window"
+    );
+    assert_eq!(v["waiting_time"], 1, "the future row waits for its time");
+    assert_eq!(v["timer_active"], false);
+    assert_eq!(v["timer_available"], true);
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("waiting for the window"), "{message}");
+    assert!(message.contains("timer is not active"), "{message}");
+
+    // Invalid saved times are reported, not silently treated as off.
+    set_window(&sb, true, "nope", "06:00");
+    let out = sched_run(
+        &sb,
+        Path::new("/bin/false"),
+        &["schedule", "status", "--json"],
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["valid"], false);
+    assert!(v["error"].as_str().unwrap().contains("HH:MM"));
+}
+
+#[test]
+fn timer_install_failure_is_reported_not_hidden() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new("sched-timer-fail");
+    let fail = sb.bin.join("systemctl-fail");
+    std::fs::write(
+        &fail,
+        "#!/bin/sh\necho 'Failed to connect to user scope bus: simulated' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fail, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = sched_run(&sb, &fail, &["schedule", "install"]);
+    assert!(!out.status.success(), "installation failure must surface");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("simulated"), "{err}");
+
+    // Status still works and says the timer is not running, so the panel
+    // never shows a healthy schedule that cannot fire.
+    let out = sched_run(&sb, &fail, &["schedule", "status", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["timer_active"], false);
+}
+
+#[test]
+fn concurrent_ticks_start_one_worker() {
+    let sb = Sandbox::new("sched-concurrent");
+    let server = Server::start(|_req, _n| Reply::ok(patterned(64, 1)));
+    sb.seed(vec![scheduled_row(
+        "one",
+        &server.url("/one.bin"),
+        "one.bin",
+        "queued",
+        unix_now().saturating_sub(1),
+    )]);
+    let outs = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let mut cmd = sb.cmd();
+                cmd.args(["tick"]);
+                s.spawn(move || run(cmd, Duration::from_secs(15)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for out in &outs {
+        assert!(
+            out.status.success(),
+            "tick failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    wait_until(
+        "the scheduled transfer completes",
+        Duration::from_secs(10),
+        || sb.status("one").as_deref() == Some("done") || server.hits() > 0,
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(server.hits(), 1, "exactly one worker fetched the entry");
+    assert_eq!(sb.downloads().len(), 1, "no duplicate rows");
+}
+
+#[test]
+fn a_scheduler_started_transfer_parks_when_the_window_closes() {
+    let sb = Sandbox::new("sched-park-live");
+    // Slow enough that the transfer is still live when the window flips.
+    let server = Server::start(|_req, _n| {
+        let mut r = Reply::new(200);
+        let chunks: Vec<(Vec<u8>, Duration)> = (0..8)
+            .map(|i| (patterned(2048, i as u8), Duration::from_millis(250)))
+            .collect();
+        r.body = Body::Chunked(chunks);
+        r
+    });
+    let now_min = local_minutes();
+    // Open now (a narrow window around the current minute).
+    set_window(&sb, true, &hhmm(now_min + 1439), &hhmm(now_min + 1));
+    sb.seed(vec![scheduled_row(
+        "live",
+        &server.url("/live.bin"),
+        "live.bin",
+        "queued",
+        unix_now().saturating_sub(1),
+    )]);
+    run_args(&sb, &["drain"], Duration::from_secs(10));
+    wait_until(
+        "the drain starts the transfer",
+        Duration::from_secs(10),
+        || sb.status("live").as_deref() == Some("downloading"),
+    );
+
+    // Close the window and let one pass run: the scheduler owns this
+    // transfer, so it must park with its partial data intact.
+    set_window(&sb, true, &hhmm(now_min + 120), &hhmm(now_min + 180));
+    run_args(&sb, &["tick"], Duration::from_secs(10));
+    wait_until("the live transfer parks", Duration::from_secs(10), || {
+        sb.row("live")
+            .map(|r| r["status"] == "paused" && r["sched_hold"] == true)
+            .unwrap_or(false)
+    });
+    let parked = sb.row("live").expect("row");
+    assert_eq!(parked["status"], "paused");
+    assert_eq!(parked["sched_hold"], true, "the scheduler may resume it");
+
+    // Reopen: the park is released without a manual Resume.
+    set_window(&sb, true, &hhmm(now_min + 1439), &hhmm(now_min + 1));
+    run_args(&sb, &["tick"], Duration::from_secs(10));
+    wait_until("the transfer resumes", Duration::from_secs(10), || {
+        sb.row("live")
+            .map(|r| r["sched_hold"] == false)
+            .unwrap_or(false)
+    });
+}
+
+#[test]
+fn a_manual_transfer_is_never_parked_by_the_window() {
+    let sb = Sandbox::new("sched-manual-live");
+    let server = Server::start(|_req, _n| {
+        let mut r = Reply::new(200);
+        let chunks: Vec<(Vec<u8>, Duration)> = (0..6)
+            .map(|i| (patterned(2048, i as u8), Duration::from_millis(300)))
+            .collect();
+        r.body = Body::Chunked(chunks);
+        r
+    });
+    // Closed window: starts two hours from now.
+    let now_min = local_minutes();
+    set_window(&sb, true, &hhmm(now_min + 120), &hhmm(now_min + 180));
+    let url = server.url("/manual.bin");
+    sb.seed(vec![row("manual", &url, "manual.bin", "queued")]);
+
+    let mut cmd = sb.cmd();
+    cmd.args(["download", "manual", "--dir", &dir(&sb)]);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = cmd.spawn().expect("spawn manual download");
+    wait_until(
+        "the manual transfer starts",
+        Duration::from_secs(10),
+        || sb.status("manual").as_deref() == Some("downloading"),
+    );
+    // The tick must not touch a transfer the user started by hand, even
+    // though the window is closed.
+    run_args(&sb, &["tick"], Duration::from_secs(10));
+    let live = sb.row("manual").expect("row");
+    assert_eq!(
+        live["status"], "downloading",
+        "manual transfer must keep running"
+    );
+    assert_eq!(live["sched_hold"], false);
+
+    let out = child.wait_with_output().expect("manual download exits");
+    assert!(
+        out.status.success(),
+        "manual download failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(sb.base().join("manual.bin").is_file());
+    assert_eq!(sb.status("manual").as_deref(), Some("done"));
 }

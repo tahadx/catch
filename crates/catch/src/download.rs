@@ -303,7 +303,15 @@ pub async fn download_entry(
     let recorded_etag = entry.etag.clone();
     let recorded_modified = entry.last_modified.clone();
     let recorded_attempts = entry.attempts;
-    let base = resolve_download_dir(dir_override);
+    // A scheduled job carries the folder chosen when it was queued; an
+    // explicit --dir wins over it, and an empty value means the configured
+    // download folder.
+    let entry_dir = if entry.dir.trim().is_empty() {
+        None
+    } else {
+        Some(entry.dir.as_str())
+    };
+    let base = resolve_download_dir(dir_override.or(entry_dir));
     std::fs::create_dir_all(&base).with_context(|| format!("create {}", base.display()))?;
 
     // One transfer per entry, enforced across processes: the row's pid is

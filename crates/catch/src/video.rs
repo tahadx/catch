@@ -76,7 +76,14 @@ pub async fn download_video(
         anyhow::bail!("download {id} is already {}", entry.status);
     }
     let url = entry.url.clone();
-    let base = resolve_download_dir(dir_override);
+    // A scheduled row keeps the folder chosen at enqueue time; an explicit
+    // --dir still wins.
+    let entry_dir = if entry.dir.trim().is_empty() {
+        None
+    } else {
+        Some(entry.dir.as_str())
+    };
+    let base = resolve_download_dir(dir_override.or(entry_dir));
     std::fs::create_dir_all(&base).with_context(|| format!("create {}", base.display()))?;
     // Videos sort into the video folder when categories are on.
     let dir = video_dir(&base);

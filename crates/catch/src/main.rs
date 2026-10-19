@@ -10,6 +10,7 @@ mod throttle;
 mod video;
 
 use anyhow::{Context, Result};
+use chrono::Local;
 use clap::{Parser, Subcommand};
 use state::{filename_for_url, load_state, new_id, Download, DownloadKind, Status};
 use std::path::PathBuf;
@@ -67,12 +68,26 @@ enum Command {
         /// Only valid with a single URL.
         #[arg(long, value_name = "HEX")]
         sha256: Option<String>,
+        /// Start at a local time instead of now: HH:MM, YYYY-MM-DD HH:MM,
+        /// +30m / +2h / +1d, or 10+ digits of Unix seconds. Every queued link
+        /// gets the same one-time delay and still obeys the daily window.
+        #[arg(long, value_name = "WHEN")]
+        at: Option<String>,
+        /// Destination folder for these entries (default: the configured
+        /// download folder). Stored with the row, so a scheduled job keeps
+        /// the folder chosen when it was queued.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<String>,
     },
     /// Download one queued entry by id (blocking).
     Download {
         id: String,
         #[arg(long)]
         dir: Option<String>,
+        /// Set by the drainer's spawn: the transfer is scheduler-owned, so
+        /// a window close may park it. Omitted by a manual invocation.
+        #[arg(long, hide = true)]
+        scheduler: bool,
     },
     /// Fetch one queued entry with yt-dlp by id (blocking).
     Video {
@@ -82,6 +97,9 @@ enum Command {
         /// Best-audio stream instead of the full video.
         #[arg(long)]
         audio: bool,
+        /// See `download --scheduler`.
+        #[arg(long, hide = true)]
+        scheduler: bool,
     },
     /// List the queue. `--json` prints the raw state file.
     List {
@@ -94,17 +112,20 @@ enum Command {
         #[arg(long)]
         max: Option<usize>,
     },
-    /// One scheduler pass (run every minute by the systemd timer).
-    /// NOT READY: the timer runs, but transfers are never held back outside
-    /// the window yet. See crates/catch/src/schedule.rs.
+    /// One scheduler pass (run every minute by the systemd timer and on
+    /// demand from the panel): release or park scheduler-owned transfers at
+    /// the window boundary, then start whatever is due and allowed.
     Tick {},
-    /// Manage the scheduler timer (every minute, wakes the system).
-    /// With no flags, shows scheduler status. NOT READY — the panel hides
-    /// this; it is only reachable from the terminal for now.
+    /// Manage the scheduler: status, the per-user timer, and one-time entry
+    /// schedules. With no subcommand, shows status.
     Schedule {
-        #[arg(long)]
+        #[command(subcommand)]
+        action: Option<ScheduleAction>,
+        /// Deprecated alias for `schedule install`.
+        #[arg(long, hide = true)]
         install: bool,
-        #[arg(long)]
+        /// Deprecated alias for `schedule remove`.
+        #[arg(long, hide = true)]
         remove: bool,
     },
     /// Write native host manifests for every Chromium + Firefox browser.
@@ -199,6 +220,34 @@ enum Command {
     NativeHost {},
 }
 
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// Show the daily window and timer state. `--json` is what the panel reads.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install and start the per-user systemd timer.
+    Install,
+    /// Stop and remove the per-user systemd timer.
+    Remove,
+    /// Schedule a queued entry: HH:MM, YYYY-MM-DD HH:MM, +30m, or Unix seconds.
+    At {
+        id: String,
+        when: String,
+        /// Destination for this entry (empty = the configured folder). The
+        /// folder is stored with the row, so it survives later changes.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<String>,
+    },
+    /// Cancel an entry's one-time delay. The download stays queued.
+    Clear { id: String },
+    /// Start a scheduled entry now, clearing its one-time delay.
+    Now { id: String },
+    /// List entries that carry a one-time schedule.
+    List,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse first: `--version` and `--help` must not touch the user's home,
@@ -234,6 +283,8 @@ async fn main() -> Result<()> {
             audio,
             again,
             sha256,
+            at,
+            dir,
         } => {
             if let Some(hex) = &sha256 {
                 validate_sha256(hex)?;
@@ -241,8 +292,15 @@ async fn main() -> Result<()> {
             if urls.len() > 1 && sha256.is_some() {
                 anyhow::bail!("--sha256 pins one URL at a time");
             }
+            // Parse once, before queueing anything: a bad time must not
+            // leave half a batch queued with no schedule.
+            let when = match &at {
+                Some(raw) => Some(schedule::parse_when(raw, Local::now())?),
+                None => None,
+            };
             let single = urls.len() == 1;
             let mut queued = 0usize;
+            let mut scheduled = 0usize;
             let mut touched = 0usize;
             let mut asked = 0usize;
             for raw in &urls {
@@ -299,6 +357,15 @@ async fn main() -> Result<()> {
                 if let Some(hex) = &sha256 {
                     set_checksum(&id, hex)?;
                 }
+                // Only a fresh row is configured: an existing catch keeps its
+                // own timing and folder rather than being silently rewritten
+                // by a pasted duplicate.
+                if fresh && (when.is_some() || dir.is_some()) {
+                    schedule::configure_row(&id, when, dir.as_deref())?;
+                    if when.is_some() {
+                        scheduled += 1;
+                    }
+                }
                 if fresh {
                     println!("queued {id}");
                     queued += 1;
@@ -313,6 +380,21 @@ async fn main() -> Result<()> {
                 // One wake-up for the whole batch: the drainer claims slots
                 // for the new rows and leaves the rest queued.
                 state::spawn_drain();
+            }
+            if let Some(ts) = when {
+                if scheduled > 0 {
+                    // Persisted rows still wait only for the panel or a
+                    // manual tick when no timer exists; say so instead of
+                    // pretending the schedule is protected.
+                    if let Err(e) = schedule::ensure_timer() {
+                        eprintln!("catch: warning: {e:#}");
+                    }
+                    println!(
+                        "scheduled {scheduled} of {} link(s) for {}",
+                        urls.len(),
+                        schedule::format_local(ts)
+                    );
+                }
             }
             if !single {
                 println!("queued {queued} of {} link(s)", urls.len());
@@ -332,14 +414,25 @@ async fn main() -> Result<()> {
                 rename_one(&id, &raw)?;
             }
         }
-        Command::Download { id, dir } => {
+        Command::Download { id, dir, scheduler } => {
+            if !scheduler {
+                mark_manual(&id)?;
+            }
             let outcome = download::download_entry(&id, dir.as_deref(), false).await;
             // Always wake the drainer: a slot freed up whatever happened.
             state::spawn_drain();
             let dest = outcome?;
             println!("{}", dest.display());
         }
-        Command::Video { id, dir, audio } => {
+        Command::Video {
+            id,
+            dir,
+            audio,
+            scheduler,
+        } => {
+            if !scheduler {
+                mark_manual(&id)?;
+            }
             let outcome = video::download_video(&id, dir.as_deref(), audio, false).await;
             state::spawn_drain();
             let dest = outcome?;
@@ -467,15 +560,71 @@ async fn main() -> Result<()> {
         Command::Tick {} => {
             schedule::tick()?;
         }
-        Command::Schedule { install, remove } => {
-            if install {
+        Command::Schedule {
+            action,
+            install,
+            remove,
+        } => match (action, install, remove) {
+            (Some(ScheduleAction::Install), _, _) | (None, true, _) => {
                 schedule::install()?;
-            } else if remove {
+                println!("scheduler timer installed (checks every minute)");
+            }
+            (Some(ScheduleAction::Remove), _, _) | (None, _, true) => {
                 schedule::remove()?;
-            } else {
+                println!("scheduler timer removed");
+            }
+            (None, false, false) | (Some(ScheduleAction::Status { json: false }), _, _) => {
                 schedule::status()?;
             }
-        }
+            (Some(ScheduleAction::Status { json: true }), _, _) => {
+                println!("{}", serde_json::to_string(&schedule::status_report()?)?);
+            }
+            (Some(ScheduleAction::At { id, when, dir }), _, _) => {
+                let ts = schedule::parse_when(&when, Local::now())?;
+                println!("{}", schedule::plan(&id, schedule::PlanAction::At(ts))?);
+                if let Some(folder) = dir {
+                    schedule::configure_row(&id, None, Some(&folder))?;
+                }
+                // The row is already persisted. If the timer cannot be
+                // installed, say so loudly: status will keep reporting it
+                // inactive and the panel shows the same fact.
+                if let Err(e) = schedule::ensure_timer() {
+                    eprintln!("catch: warning: {e:#}");
+                }
+            }
+            (Some(ScheduleAction::Now { id }), _, _) => {
+                println!("{}", schedule::plan(&id, schedule::PlanAction::Now)?);
+            }
+            (Some(ScheduleAction::Clear { id }), _, _) => {
+                println!("{}", schedule::plan(&id, schedule::PlanAction::Clear)?);
+            }
+            (Some(ScheduleAction::List), _, _) => {
+                let state = load_state()?;
+                let now = state::now_secs();
+                let mut rows: Vec<&Download> = state
+                    .downloads
+                    .iter()
+                    .filter(|d| {
+                        d.scheduled_at > 0 && matches!(d.status, Status::Queued | Status::Paused)
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    println!("no scheduled downloads");
+                } else {
+                    rows.sort_by_key(|d| d.scheduled_at);
+                    for d in rows {
+                        let due = if d.scheduled_at <= now { " (due)" } else { "" };
+                        println!(
+                            "{}  {}  {}{}",
+                            schedule::format_local(d.scheduled_at),
+                            d.id,
+                            d.filename,
+                            due
+                        );
+                    }
+                }
+            }
+        },
         Command::InstallHosts { host } => {
             install::install_hosts(host)?;
         }
@@ -688,6 +837,20 @@ fn newest_row_for(url: &str) -> Result<String> {
         .with_context(|| format!("no download row for {url}"))
 }
 
+/// A manual `catch download` is not scheduler-owned: it must keep running
+/// when the daily window closes. It also starts *now*, so a one-time delay
+/// it still carried is consumed rather than applied later.
+fn mark_manual(id: &str) -> Result<()> {
+    state::update_state(|state| {
+        if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
+            d.sched_owned = false;
+            d.scheduled_at = 0;
+            d.sched_hold = false;
+        }
+        Ok(())
+    })
+}
+
 /// Enqueue a URL. One live row per link: a link already queued or
 /// transferring is reused (retry floods used to stack duplicate rows).
 /// A link Catch already saved is *not* reused — it gets a fresh row and
@@ -730,6 +893,9 @@ fn enqueue_kind(
             pid: if claim { owner } else { 0 },
             claimed_at: crate::state::now_secs(),
             sched_hold: false,
+            scheduled_at: 0,
+            sched_owned: false,
+            dir: String::new(),
             audio_only,
             title: String::new(),
             extra: serde_json::Map::new(),
@@ -1278,6 +1444,10 @@ async fn refresh_one(id: &str, new_url: &str, force: bool) -> Result<String> {
             d.speed = 0;
             d.eta = 0;
             d.sched_hold = false;
+            // A manual refresh is an explicit \"start now\": do not let an old
+            // one-time delay hold it until later.
+            d.scheduled_at = 0;
+            d.sched_owned = false;
             if reset {
                 d.bytes = 0;
                 d.total = 0;
@@ -1473,6 +1643,9 @@ mod cli_tests {
             pid: 0,
             claimed_at: crate::state::now_secs(),
             sched_hold: false,
+            scheduled_at: 0,
+            sched_owned: false,
+            dir: String::new(),
             audio_only: false,
             etag: String::new(),
             last_modified: String::new(),

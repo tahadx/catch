@@ -26,11 +26,19 @@ pub fn drain(max: usize) -> Result<()> {
     }
     let _guard = DrainGuard;
     let max = max.clamp(1, 10);
+    let now = crate::state::now_secs();
     let ids: Vec<(String, bool, bool)> = with_lock(|| {
         let mut state = crate::state::load_state()?;
         // Free slots held by dead workers first: an entry stuck at 100%
         // (or anywhere) with no process behind it goes back to queued.
         let freed = crate::state::reap_orphans(&mut state);
+        // Apply the window on every drain, not only on a timer tick: a
+        // parked transfer must resume and a held row must be released even
+        // if the timer is missing and only a worker completion (or the
+        // panel) triggers this pass.
+        let open = crate::schedule::window_closed() != Some(true);
+        let window = crate::schedule::apply_window(&mut state, open);
+        let changed = freed > 0 || window.released > 0 || window.parked > 0;
         let active = state
             .downloads
             .iter()
@@ -39,11 +47,14 @@ pub fn drain(max: usize) -> Result<()> {
         if freed > 0 {
             eprintln!("catch: requeued {freed} orphaned download(s)");
         }
+        if window.parked > 0 {
+            eprintln!("catch: window closed, parked {window}");
+        }
         if active >= max {
-            // Nothing to start: save only if reaping changed something,
-            // otherwise every drain rewrites the file and retriggers every
-            // watcher into a hot loop.
-            if freed > 0 {
+            // Nothing to start: save only if reaping/window work changed
+            // something, otherwise every drain rewrites the file and
+            // retriggers every watcher into a hot loop.
+            if changed {
                 crate::state::save_state(&state)?;
             }
             return Ok(Vec::new());
@@ -51,25 +62,32 @@ pub fn drain(max: usize) -> Result<()> {
         // Schedule: outside the window nothing new starts. Entries stay
         // queued — marked so the UI can say why — and the next in-window
         // tick releases them. Transfers already live are parked by tick.
-        if crate::schedule::window_closed() == Some(true) {
+        // A future one-time entry is not marked as window-held: its own
+        // time has not arrived, which the panel reports separately.
+        if !open {
             let mut marked = 0;
             for d in state.downloads.iter_mut() {
-                if d.status == Status::Queued && !d.sched_hold {
+                if d.status == Status::Queued
+                    && !d.sched_hold
+                    && crate::schedule::one_time_ready(d, now)
+                {
                     d.sched_hold = true;
                     marked += 1;
                 }
             }
-            if freed > 0 || marked > 0 {
+            if changed || marked > 0 {
                 crate::state::save_state(&state)?;
             }
             return Ok(Vec::new());
         }
         // Priority first (higher runs first), FIFO inside a priority level:
-        // the queue order is the tiebreaker, and sort_by is stable.
+        // the queue order is the tiebreaker, and sort_by is stable. A
+        // one-time delay is a hard gate: neither the timer, the panel, a
+        // manual `catch drain` nor a worker completion may start it early.
         let mut queued: Vec<&crate::state::Download> = state
             .downloads
             .iter()
-            .filter(|d| d.status == Status::Queued)
+            .filter(|d| d.status == Status::Queued && crate::schedule::one_time_ready(d, now))
             .collect();
         queued.sort_by_key(|d| std::cmp::Reverse(d.priority));
         let ids: Vec<(String, bool, bool)> = queued
@@ -97,6 +115,12 @@ pub fn drain(max: usize) -> Result<()> {
                     d.pid = holder;
                     d.claimed_at = claimed;
                     d.sched_hold = false;
+                    // Consume the one-time delay: a failure/requeue after
+                    // this point must run now, not wait for the old time
+                    // again. sched_owned marks this transfer as started by
+                    // the scheduler so a window close may park it later.
+                    d.scheduled_at = 0;
+                    d.sched_owned = true;
                     d.next_retry_at = 0;
                 }
             }
@@ -118,6 +142,9 @@ pub fn drain(max: usize) -> Result<()> {
         }
         let spawned = cmd
             .arg(id)
+            // Tells the worker a scheduler pass owns this transfer, so the
+            // window may park it. A manual `catch download` omits it.
+            .arg("--scheduler")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
