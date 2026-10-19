@@ -3,8 +3,8 @@ use anyhow::{Context, Result};
 use crate::state::{max_parallel, update_state, Status};
 
 // Overnight-friendly schedule read from the widget settings in shell.json:
-// schedEnabled ("on"/"off"), schedStart/schedStop ("HH:MM", overnight wrap
-// allowed), schedWhenDone ("nothing"/"suspend"/"shutdown").
+// schedEnabled ("on"/"off") and schedStart/schedStop ("HH:MM", overnight
+// wrap allowed).
 //
 // The window is enforced in two places: `drain` refuses to start queued
 // entries while the window is shut (marking them `sched_hold`, which the
@@ -13,7 +13,6 @@ use crate::state::{max_parallel, update_state, Status};
 pub struct Schedule {
     pub start_min: u16,
     pub stop_min: u16,
-    pub when_done: String,
 }
 
 fn widget_settings() -> Option<serde_json::Value> {
@@ -42,7 +41,7 @@ fn parse_hhmm(s: &str) -> Option<u16> {
     Some(h * 60 + m)
 }
 
-use chrono::{Datelike, Timelike};
+use chrono::Timelike;
 
 fn now_minutes() -> u16 {
     let now = chrono::Local::now();
@@ -67,21 +66,10 @@ pub fn read_schedule() -> Option<Schedule> {
     }
     let start = parse_hhmm(e.get("schedStart")?.as_str()?)?;
     let stop = parse_hhmm(e.get("schedStop")?.as_str()?)?;
-    let when_done = e
-        .get("schedWhenDone")
-        .and_then(|v| v.as_str())
-        .unwrap_or("nothing")
-        .to_string();
     Some(Schedule {
         start_min: start,
         stop_min: stop,
-        when_done,
     })
-}
-
-fn today_marker() -> std::path::PathBuf {
-    let day = chrono::Local::now().date_naive().num_days_from_ce();
-    crate::state::state_dir().join(format!("done-{day}"))
 }
 
 /// None when the scheduler is off or misconfigured; Some(true) when the
@@ -93,8 +81,7 @@ pub fn window_closed() -> Option<bool> {
 
 /// One scheduler pass, run every minute by the systemd timer:
 /// inside the window, release parked entries and drain; outside it,
-/// park live transfers. When the queue runs dry out of hours, run the
-/// configured when-done action once per day.
+/// park live transfers.
 pub fn tick() -> Result<()> {
     let Some(sched) = read_schedule() else {
         // Scheduler off: plain drain (manual mode untouched).
@@ -118,8 +105,6 @@ pub fn tick() -> Result<()> {
         if released > 0 {
             eprintln!("catch: window open, released {released} parked download(s)");
         }
-        // A fresh day resets the when-done marker.
-        let _ = std::fs::remove_file(today_marker());
         return crate::drain::drain(max_parallel());
     }
     let mut parked = 0;
@@ -135,28 +120,6 @@ pub fn tick() -> Result<()> {
     })?;
     if parked > 0 {
         eprintln!("catch: window closed, parked {parked} download(s)");
-    }
-    // Queue dry outside hours: fire the when-done action once per day.
-    let state = crate::state::load_state()?;
-    let busy = state
-        .downloads
-        .iter()
-        .any(|d| matches!(d.status, Status::Downloading | Status::Queued));
-    if !busy && sched.when_done != "nothing" && !today_marker().exists() {
-        std::fs::create_dir_all(crate::state::state_dir())?;
-        let _ = std::fs::write(today_marker(), "fired");
-        eprintln!("catch: queue dry, running when-done: {}", sched.when_done);
-        let target = match sched.when_done.as_str() {
-            "suspend" => "suspend",
-            "shutdown" => "poweroff",
-            _ => return Ok(()),
-        };
-        let _ = std::process::Command::new("systemctl")
-            .arg(target)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
     }
     Ok(())
 }
@@ -208,12 +171,11 @@ pub fn remove() -> Result<()> {
 pub fn status() -> Result<()> {
     match read_schedule() {
         Some(s) => println!(
-            "schedule on {:02}:{:02}–{:02}:{:02}, when-done: {}",
+            "schedule on {:02}:{:02}–{:02}:{:02}",
             s.start_min / 60,
             s.start_min % 60,
             s.stop_min / 60,
-            s.stop_min % 60,
-            s.when_done
+            s.stop_min % 60
         ),
         None => println!("schedule off (or invalid times)"),
     }
