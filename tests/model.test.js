@@ -10,7 +10,7 @@ const path = require("node:path")
 const src = fs
   .readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library\s*$/m, "")
-const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath }")()
+const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath }")()
 
 assert.strictEqual(Model.expandHome("~", "/home/you"), "/home/you")
 assert.strictEqual(Model.expandHome("~/Downloads/catch", "/home/you"), "/home/you/Downloads/catch")
@@ -137,6 +137,28 @@ assert.strictEqual(Model.clipboardLink(""), "")
 assert.strictEqual(Model.clipboardLink("   \n "), "")
 assert.strictEqual(Model.clipboardLink("no link here"), "")
 assert.strictEqual(Model.clipboardLink("ftp://x.test/a"), "")
+
+// A pasted block queues every link, in order and once. Prose around them —
+// one per line, numbered, or a sentence — contributes nothing else.
+assert.deepStrictEqual(
+  Model.clipboardLinks("https://a.test/1\nhttps://b.test/2\nhttps://c.test/3"),
+  ["https://a.test/1", "https://b.test/2", "https://c.test/3"],
+)
+assert.deepStrictEqual(
+  Model.clipboardLinks("see https://a.test/1, then https://b.test/2."),
+  ["https://a.test/1", "https://b.test/2"],
+)
+assert.deepStrictEqual(
+  Model.clipboardLinks("1) https://a.test/1\n2) https://b.test/2"),
+  ["https://a.test/1", "https://b.test/2"],
+)
+assert.deepStrictEqual(Model.clipboardLinks("https://a.test/1 https://a.test/1"), ["https://a.test/1"])
+assert.deepStrictEqual(Model.clipboardLinks("  https://a.test/x  "), ["https://a.test/x"])
+assert.deepStrictEqual(Model.clipboardLinks("no links here"), [])
+assert.deepStrictEqual(Model.clipboardLinks("ftp://a.test/x"), [])
+assert.deepStrictEqual(Model.clipboardLinks(""), [])
+// The single-value path (refresh) takes the first link of a block.
+assert.strictEqual(Model.clipboardLink("https://a.test/1\nhttps://b.test/2"), "https://a.test/1")
 
 // The saved index is what still knows a link after the queue is cleared.
 const withSaved = Model.parse(JSON.stringify({

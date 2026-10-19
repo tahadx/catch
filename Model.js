@@ -291,18 +291,28 @@ function savedFor(queue, url) {
   }
 }
 
-// The link a clipboard paste should put in the input: the whole text when
-// it is already a link, otherwise the first http(s) link inside it, so
-// pasting a line of chat around the URL still catches that URL. Empty when
-// there is nothing to catch.
+// Every http(s) link in a pasted block, in order and without duplicates.
+// One link, one per line, or a paragraph of prose around them all work: the
+// text is scanned rather than split, so a pasted chat message contributes
+// its links and nothing else. Empty when there is nothing to catch.
+function clipboardLinks(text) {
+  var raw = String(text || "")
+  var found = raw.match(/https?:\/\/[^\s<>"'()\[\]]+/gi) || []
+  var out = []
+  for (var i = 0; i < found.length; i++) {
+    // Trailing punctuation picked up from prose, not part of the link.
+    var link = found[i].replace(/[.,;:!?]+$/, "")
+    if (link === "" || out.indexOf(link) !== -1) continue
+    out.push(link)
+  }
+  return out
+}
+
+// The one link a single-value field should take (the refresh address): the
+// first http(s) link in the pasted text. Empty when there is none.
 function clipboardLink(text) {
-  var raw = String(text || "").trim()
-  if (raw === "") return ""
-  if (/^https?:\/\/\S+$/i.test(raw)) return raw
-  var found = raw.match(/https?:\/\/[^\s<>"'()\[\]]+/i)
-  if (!found) return ""
-  // Trailing punctuation picked up from prose, not part of the link.
-  return found[0].replace(/[.,;:!?]+$/, "")
+  var links = clipboardLinks(text)
+  return links.length > 0 ? links[0] : ""
 }
 
 // Changes only when the *scheduling* shape of the queue changes: which rows

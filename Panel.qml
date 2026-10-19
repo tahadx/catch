@@ -95,8 +95,11 @@ Panel {
   // from root scope (see textEditing above).
   function catchUrl(url) {
     root.hold()
-    var link = String(url || "").trim()
-    if (!/^https?:\/\//i.test(link)) {
+    // One link or a pasted block: every http(s) link in the input becomes
+    // its own row, in order, so a list pasted from a chat or a page is one
+    // Enter away. The backend validates each again.
+    var links = Model.clipboardLinks(String(url || ""))
+    if (links.length === 0) {
       root.actionError = "Links start with http(s)://"
       errorTimer.restart()
       return
@@ -107,9 +110,15 @@ Panel {
     root.ignoringAsk = ""
     // enqueue, not add: `add` blocks on the transfer, which held the panel's
     // single runner for the whole download and left every later command
-    // waiting behind it. enqueue writes the row and returns, like a browser
-    // hand-off does.
-    root.runCatch(["enqueue", link], "Could not catch that link.")
+    // waiting behind it. enqueue writes the rows and returns, like a browser
+    // hand-off does; the drainer starts as many as the parallel setting
+    // allows and keeps the rest queued.
+    root.runCatch(
+      ["enqueue"].concat(links),
+      links.length === 1
+        ? "Could not catch that link."
+        : "Could not queue those " + links.length + " links."
+    )
   }
 
   function firstAsk() {
@@ -1394,9 +1403,13 @@ Panel {
 
       // Paste clipboard text into `field`, at the cursor. Qt binds Ctrl+V
       // natively but nothing binds Super+V, and the two paths disagree, so
-      // both combos land here and paste exactly once.
-      function pasteIntoField(field) {
-        var text = Model.clipboardLink(String(Quickshell.clipboardText || ""))
+      // both combos land here and paste exactly once. `multiple` is for the
+      // link field: a clipboard block puts every link in the field, spaced,
+      // ready for Enter; single-value fields (refresh) take the first one.
+      function pasteIntoField(field, multiple) {
+        var text = multiple
+          ? Model.clipboardLinks(String(Quickshell.clipboardText || "")).join(" ")
+          : Model.clipboardLink(String(Quickshell.clipboardText || ""))
         if (text === "") {
           root.actionError = "Clipboard holds no link."
           errorTimer.restart()
@@ -1420,7 +1433,7 @@ Panel {
           return
         }
         if (event.key === Qt.Key_V && (event.modifiers & (Qt.ControlModifier | Qt.MetaModifier))) {
-          pasteIntoField(field)
+          pasteIntoField(field, field === linkField && root.refreshId === "")
           event.accepted = true
         }
       }
@@ -1431,7 +1444,7 @@ Panel {
       function pasteIntoInput() {
         if (root.showingSettings || root.conflict !== null) return
         focusInput()
-        pasteIntoField(linkField)
+        pasteIntoField(linkField, root.refreshId === "")
       }
 
       // Hover counts as attention: NoButton so clicks and wheel pass
@@ -1650,7 +1663,7 @@ Panel {
                     placeholderTextColor: root.dim
                     placeholderText: root.refreshId !== ""
                       ? "New address for this download (paste, Enter)…"
-                      : "Paste download URL…"
+                      : "Paste one or more links…"
                     // The surface above owns the chrome.
                     background: Item {}
                     text: ""
@@ -2177,7 +2190,7 @@ Panel {
                       { keys: "r", what: "give a failed row a new address" },
                       { keys: "delete", what: "remove a row, file stays" },
                       { keys: "tab", what: "link field ⇄ rows" },
-                      { keys: "ctrl+v", what: "paste a link from anywhere" },
+                      { keys: "ctrl+v", what: "paste link(s) from anywhere" },
                       { keys: "o", what: "open the download folder" },
                       { keys: "s", what: "settings" },
                       { keys: "esc", what: "back, then close" }
