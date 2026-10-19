@@ -181,8 +181,63 @@ Downloads land in `~/Downloads/catch`. In the panel, the gear icon or `s`
 opens settings: the download folder, how many transfers run at once (1–10),
 how many byte-range segments each large download uses (1 disables
 segmented downloading), the bandwidth mode (unlimited, balanced, or low)
-with an optional global limit in KB/s, and a schedule window that parks
-transfers outside the hours you pick.
+with an optional global limit in KB/s, and the daily download window. The
+clock icon or `t` opens the scheduler: the live window/timer state, a
+one-time schedule form, and every row that is waiting for a time.
+
+## Scheduling
+
+There are two independent controls, both enforced by the backend:
+
+- **The daily window** (`schedEnabled`/`schedStart`/`schedStop`) says when
+  the queue may start work. Outside it, Catch parks transfers it started and
+  leaves them queued; when the window opens they resume. Start is inclusive,
+  end is exclusive, and equal times mean the whole day. Overnight windows
+  (22:00–06:00) wrap past midnight. A transfer you started by hand with
+  `catch download` is never parked, and a manual pause is never resumed by
+  the scheduler.
+- **A one-time time** (`scheduled_at` on one row) delays that entry until a
+  local date and time. Once it is due it obeys the window, the parallel
+  limit, priorities, and every other queue rule — it is not a second window.
+  Start now skips only that entry's own delay.
+
+From the panel: the row's `…` menu has **Schedule…**, and the scheduler page
+can reschedule, start now, or remove any pending row. A destination typed in
+the form is stored with the entry, so a later change to the default download
+folder does not move a job that was already scheduled.
+
+From the terminal:
+
+```sh
+catch enqueue URL --at "+2h"                 # relative: +30m, +2h, +1d
+catch enqueue URL --at "2026-10-20 03:00"    # local date and time
+catch enqueue URL --at "03:00"               # next occurrence of that time
+catch schedule at ID "+1h"                   # reschedule a queued row
+catch schedule list                         # what is waiting for a time
+catch schedule now ID                       # start it now, clear the delay
+catch schedule clear ID                     # cancel the delay, keep the row
+catch schedule status [--json]              # window + timer state
+```
+
+The daily window and one-time times need a per-user systemd timer
+(`catch schedule install`, "Install timer" in the scheduler page). It runs
+`catch tick` every minute with `AccuracySec=1s` and `Persistent=true`, so it
+catches up after the machine was off; it does not promise to wake a sleeping
+machine. While the Omarchy shell is running, the plugin's service also arms
+a one-shot timer for the next exact one-time start, so the minute boundary
+stays close even without the systemd timer. Scheduled rows are persisted
+regardless; without either timer they start on the next drain — opening
+Catch, sending another link, or a running transfer finishing. `catch
+schedule status` and the scheduler page say "timer is not active" instead of
+pretending the schedule is protected. Turning the daily window off does not
+remove the timer, because one-time schedules still use it; removal is an
+explicit action.
+
+Saved settings win over guesses: an unreadable or out-of-range window time
+is reported as invalid and treated as open, so a typo cannot freeze the
+whole queue. Every one-time time is validated before it is stored; past
+times are rejected, and the backend parses the value again instead of
+trusting the panel.
 
 ## Segmented downloads
 
