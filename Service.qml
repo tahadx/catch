@@ -27,6 +27,9 @@ Item {
   // Last scheduling shape seen (queued/downloading rows). Only a change here
   // needs a drainer; a byte counter moving does not.
   property string lastSchedule: ""
+  // Parsed state, only for the next one-time due time. The backend still
+  // decides whether a row may start.
+  property var queue: Model.empty()
   // True once backend configuration (binary links, host manifests) has
   // completed. Drains must not run before that.
   property bool configured: false
@@ -47,10 +50,38 @@ Item {
   // would cause.
   function evaluate() {
     if (!root.configured) return
-    var next = Model.scheduleSignature(Model.parse(root.stateText))
+    root.queue = Model.parse(root.stateText)
+    root.armDue()
+    var next = Model.scheduleSignature(root.queue)
     if (next === root.lastSchedule) return
     root.lastSchedule = next
     root.maybeDrain()
+  }
+
+  // The systemd timer checks every minute; while the shell is running this
+  // timer makes a one-time start land on its minute instead of up to a
+  // minute late. It fires `tick`, never a start of its own: the window,
+  // parallel limit and pause rules stay in the backend.
+  function armDue() {
+    dueTimer.stop()
+    var now = Math.floor(Date.now() / 1000)
+    var due = Model.nextDue(root.queue, now)
+    if (!due) return
+    var ms = Math.max(250, (due - now) * 1000)
+    // QML timers take a 32-bit millisecond interval; one-time times further
+    // out than ~24 days re-arm when they fire early.
+    dueTimer.interval = Math.min(ms, 2147483000)
+    dueTimer.start()
+  }
+
+  function dueFired() {
+    if (drainProcess.running) {
+      root.drainPending = true
+      return
+    }
+    root.drainPending = false
+    drainProcess.command = ["catch", "tick"]
+    drainProcess.running = true
   }
 
   // Force one scheduling evaluation, ignoring the last signature. Used after
@@ -79,6 +110,12 @@ Item {
     onTriggered: root.evaluate()
   }
 
+  Timer {
+    id: dueTimer
+    repeat: false
+    onTriggered: root.dueFired()
+  }
+
   FileView {
     id: watcher
     path: root.statePath
@@ -89,11 +126,14 @@ Item {
       root.stateText = watcher.text()
       if (root.configured) {
         if (!evaluateTimer.running) evaluateTimer.start()
+        root.armDue()
       }
     }
     onLoadFailed: {
       root.stateText = ""
       root.lastSchedule = ""
+      root.queue = Model.empty()
+      dueTimer.stop()
     }
   }
 
@@ -112,6 +152,10 @@ Item {
     id: drainProcess
     running: false
     onExited: {
+      // A capped timer (a one-time time more than ~24 days out) fired early;
+      // re-arm for what is still ahead. The state watcher also re-arms when
+      // the tick changed the queue.
+      root.armDue()
       if (root.drainPending) root.maybeDrain()
     }
   }
