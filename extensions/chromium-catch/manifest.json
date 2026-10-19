@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Catch",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Send downloads to the native Catch download manager.",
   "permissions": [
     "activeTab",

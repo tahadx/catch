@@ -211,23 +211,43 @@ const SCRAPERS = {
     return out;
   },
   selected: () => {
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return [];
-    const range = sel.getRangeAt(0);
     const out = [];
-    const take = (el, url) => {
-      try {
-        if (url && range.intersectsNode(el)) out.push(url);
-      } catch (e) {}
+    const addText = (text) => {
+      const links = String(text || "").match(/https?:\/\/[^\s<>"'()\[\]]+/gi) || [];
+      for (const link of links) out.push(link.replace(/[.,;:!?]+$/, ""));
     };
-    for (const a of document.links || []) take(a, a.href);
-    for (const img of document.images || []) {
-      take(img, img.currentSrc);
-      take(img, img.src);
+    // A text box keeps its own selection, so the page selection can be
+    // collapsed while a list of URLs is highlighted in an input.
+    const active = document.activeElement;
+    if (active && (active.tagName === "TEXTAREA" ||
+        (active.tagName === "INPUT" && active.type !== "password"))) {
+      const start = active.selectionStart;
+      const end = active.selectionEnd;
+      if (typeof start === "number" && typeof end === "number" && end > start) {
+        addText(String(active.value || "").slice(start, end));
+      }
     }
-    for (const m of document.querySelectorAll("video, audio")) {
-      take(m, m.currentSrc || m.src);
-      for (const s of m.querySelectorAll("source")) take(s, s.src);
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
+      const range = sel.getRangeAt(0);
+      const take = (el, url) => {
+        try {
+          if (url && range.intersectsNode(el)) out.push(url);
+        } catch (e) {}
+      };
+      for (const a of document.links || []) take(a, a.href);
+      for (const img of document.images || []) {
+        take(img, img.currentSrc);
+        take(img, img.src);
+      }
+      for (const m of document.querySelectorAll("video, audio")) {
+        take(m, m.currentSrc || m.src);
+        for (const s of m.querySelectorAll("source")) take(s, s.src);
+      }
+      // Plain-text links too: a selection can be a chat line, a numbered
+      // list of URLs, or a text box. Anchors above cover real links; this
+      // keeps typed ones from being lost. sendAll() removes repeats.
+      addText(sel.toString());
     }
     return out;
   }
