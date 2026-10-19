@@ -42,13 +42,16 @@ enum Command {
         #[arg(long, value_name = "HEX")]
         sha256: Option<String>,
     },
-    /// Add a URL to the queue and return at once (non-blocking). The row
-    /// appears immediately and the transfer runs in the background, exactly
-    /// like a browser hand-off. `add` blocks on the download, which is what a
-    /// terminal wants and what a panel must not do: a caller that serializes
-    /// its commands would stall behind the whole transfer.
+    /// Add one or more URLs to the queue and return at once (non-blocking).
+    /// Every row appears immediately and the transfers run in the background,
+    /// exactly like a browser hand-off. `add` blocks on the download, which is
+    /// what a terminal wants and what a panel must not do: a caller that
+    /// serializes its commands would stall behind the whole transfer.
     Enqueue {
-        url: String,
+        /// URLs to queue, in order. Each link is handled on its own, so one
+        /// bad or already-saved link does not discard the rest of the batch.
+        #[arg(required = true)]
+        urls: Vec<String>,
         /// Fetch with yt-dlp (video pages) instead of a plain download.
         #[arg(long)]
         video: bool,
@@ -61,6 +64,7 @@ enum Command {
         #[arg(long)]
         again: bool,
         /// Expected SHA-256 of the finished file (64 hex characters).
+        /// Only valid with a single URL.
         #[arg(long, value_name = "HEX")]
         sha256: Option<String>,
     },
@@ -225,7 +229,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Enqueue {
-            url,
+            urls,
             video,
             audio,
             again,
@@ -234,54 +238,84 @@ async fn main() -> Result<()> {
             if let Some(hex) = &sha256 {
                 validate_sha256(hex)?;
             }
-            // `--again` forces a fresh, independent download (used by
-            // "Download again anyway"): it clears any pending duplicate
-            // question and never reuses the active row.
-            if again {
-                clear_one_ask(&url)?;
-            } else {
-                // The same duplicate rule `add` applies: a link whose file is
-                // already saved becomes a question for the panel instead of a
-                // quiet second copy. Without this the panel's add path saved
-                // duplicates without ever asking.
-                if raise_ask(&url, "")?.is_some() {
-                    println!("already downloading or saved; open Catch to choose");
-                    return Ok(());
+            if urls.len() > 1 && sha256.is_some() {
+                anyhow::bail!("--sha256 pins one URL at a time");
+            }
+            let single = urls.len() == 1;
+            let mut queued = 0usize;
+            let mut touched = 0usize;
+            let mut asked = 0usize;
+            for raw in &urls {
+                let url = raw.trim().to_string();
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    // A batch is forgiving: the bad entry is reported and the
+                    // other links still queue. A lone URL keeps the old error.
+                    if single {
+                        anyhow::bail!("only http(s) URLs can be caught: {url}");
+                    }
+                    eprintln!("catch: skipped {url}: only http(s) URLs can be caught");
+                    continue;
+                }
+                // `--again` forces a fresh, independent download (used by
+                // "Download again anyway"): it clears any pending duplicate
+                // question and never reuses the active row.
+                if again {
+                    clear_one_ask(&url)?;
+                } else {
+                    // The same duplicate rule `add` applies: a link whose file is
+                    // already saved becomes a question for the panel instead of a
+                    // quiet second copy. Without this the panel's add path saved
+                    // duplicates without ever asking. One asked link must not
+                    // discard the rest of the batch.
+                    if raise_ask(&url, "")?.is_some() {
+                        if single {
+                            println!("already downloading or saved; open Catch to choose");
+                        } else {
+                            println!("already downloading or saved: {url}");
+                        }
+                        asked += 1;
+                        continue;
+                    }
+                }
+                let video = video || state::looks_like_video_page(&url);
+                // claim = false: the row waits as Queued with no pid, and the
+                // drainer claims a slot for it. Claiming here would stamp this
+                // short-lived process as the holder of a row nobody is fetching,
+                // and every later drain would count that phantom as an active
+                // transfer — eating parallel slots until nothing started at all.
+                // This is exactly what a browser hand-off does.
+                let (id, fresh) = enqueue_kind(
+                    &url,
+                    if video {
+                        DownloadKind::Video
+                    } else {
+                        DownloadKind::File
+                    },
+                    audio,
+                    false,
+                    !again,
+                )?;
+                touched += 1;
+                if let Some(hex) = &sha256 {
+                    set_checksum(&id, hex)?;
+                }
+                if fresh {
+                    println!("queued {id}");
+                    queued += 1;
+                } else {
+                    println!("already catching {id}");
                 }
             }
-            // catch_now up to the point where it would block: same row, same
-            // rules, but the transfer is left to the drainer so the caller's
-            // next command is free to run.
-            let url = url.trim().to_string();
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                anyhow::bail!("only http(s) URLs can be caught: {url}");
+            if touched == 0 && asked == 0 {
+                anyhow::bail!("no link could be queued");
             }
-            let video = video || state::looks_like_video_page(&url);
-            // claim = false: the row waits as Queued with no pid, and the
-            // drainer claims a slot for it. Claiming here would stamp this
-            // short-lived process as the holder of a row nobody is fetching,
-            // and every later drain would count that phantom as an active
-            // transfer — eating parallel slots until nothing started at all.
-            // This is exactly what a browser hand-off does.
-            let (id, fresh) = enqueue_kind(
-                &url,
-                if video {
-                    DownloadKind::Video
-                } else {
-                    DownloadKind::File
-                },
-                audio,
-                false,
-                !again,
-            )?;
-            if let Some(hex) = &sha256 {
-                set_checksum(&id, hex)?;
+            if touched > 0 {
+                // One wake-up for the whole batch: the drainer claims slots
+                // for the new rows and leaves the rest queued.
+                state::spawn_drain();
             }
-            state::spawn_drain();
-            if fresh {
-                println!("queued {id}");
-            } else {
-                println!("already catching {id}");
+            if !single {
+                println!("queued {queued} of {} link(s)", urls.len());
             }
         }
         Command::Copy { url, title } => {

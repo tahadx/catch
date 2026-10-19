@@ -686,6 +686,71 @@ fn simultaneous_enqueues_never_lose_rows() {
 }
 
 #[test]
+fn enqueue_batch_queues_every_link() {
+    let sb = Sandbox::new("enqueue-batch");
+    let urls = [
+        "http://127.0.0.1:9/batch-a.bin",
+        "http://127.0.0.1:9/batch-b.bin",
+        "http://127.0.0.1:9/batch-c.bin",
+    ];
+    let mut cmd = sb.cmd();
+    cmd.env("CATCH_MAX_ATTEMPTS", "1")
+        .env("CATCH_RESPONSE_SECS", "1")
+        .arg("enqueue")
+        .args(urls);
+    let out = run(cmd, Duration::from_secs(20));
+    assert!(
+        out.status.success(),
+        "enqueue failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows = sb.downloads();
+    let queued: Vec<&str> = rows.iter().filter_map(|d| d["url"].as_str()).collect();
+    assert_eq!(queued.len(), urls.len(), "one row per link");
+    for url in urls {
+        assert!(queued.contains(&url), "missing {url} in {queued:?}");
+    }
+    let ids: Vec<&str> = rows.iter().filter_map(|d| d["id"].as_str()).collect();
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "ids are unique");
+    let _ = std::fs::remove_file(sb.state_path());
+}
+
+#[test]
+fn enqueue_batch_keeps_the_good_links_when_one_is_bad() {
+    let sb = Sandbox::new("enqueue-batch-bad");
+    let good = "http://127.0.0.1:9/batch-good.bin";
+    let mut cmd = sb.cmd();
+    cmd.env("CATCH_MAX_ATTEMPTS", "1")
+        .env("CATCH_RESPONSE_SECS", "1")
+        .args(["enqueue", "not-a-url", good]);
+    let out = run(cmd, Duration::from_secs(20));
+    assert!(
+        out.status.success(),
+        "the good link must still queue: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows = sb.downloads();
+    assert_eq!(rows.len(), 1, "only the valid link queues");
+    assert_eq!(rows[0]["url"].as_str(), Some(good));
+
+    // A lone bad URL is still an error, not a silent no-op.
+    let mut one = sb.cmd();
+    one.args(["enqueue", "not-a-url"]);
+    let bad = run(one, Duration::from_secs(10));
+    assert!(!bad.status.success(), "a single bad URL must fail");
+
+    // A batch made only of bad links fails too: nothing was accepted.
+    let mut all = sb.cmd();
+    all.args(["enqueue", "not-a-url", "also-not-a-url"]);
+    let none = run(all, Duration::from_secs(10));
+    assert!(!none.status.success(), "an all-bad batch must fail");
+    let _ = std::fs::remove_file(sb.state_path());
+}
+
+#[test]
 fn malformed_state_is_quarantined_and_the_cli_still_works() {
     let sb = Sandbox::new("bad-state");
     std::fs::create_dir_all(sb.state_path().parent().unwrap()).unwrap();
