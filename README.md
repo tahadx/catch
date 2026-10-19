@@ -137,6 +137,9 @@ stay in that browser.
 ## Use it
 
 - Left-click the bar icon or Super+D: open Catch
+- Paste one link or a whole list into the input: every http(s) link in the
+  paste becomes its own row, in order. The queue starts as many at once as
+  the parallel setting allows and keeps the rest queued
 - A YouTube link downloads the video. Paste it into Catch, or send it
   from the browser. `yt-dlp` has to be installed
 - Every row carries its own controls: a tick to mark it, a stop, and a
@@ -169,9 +172,10 @@ stay in that browser.
 - Right-click the icon: open the download folder
 - Browser, once that browser's extension is loaded: right-click → Catch
   menu (this link, as video, audio only, all links/images/videos/media/files
-  on the page, selected links, browser download, open folder, copy page
-  URL). Plain left-clicks on files go to Catch; **Catch this** sends one
-  deliberately.
+  on the page, selected links — every link the selection touches plus any
+  URLs in the selected text, queued together — browser download, open
+  folder, copy page URL). Plain left-clicks on files go to Catch;
+  **Catch this** sends one deliberately.
 
 Downloads land in `~/Downloads/catch`. In the panel, the gear icon or `s`
 opens settings: the download folder, how many transfers run at once (1–10),
