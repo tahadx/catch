@@ -10,7 +10,7 @@ const path = require("node:path")
 const src = fs
   .readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library\s*$/m, "")
-const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath, bulkPausePlan }")()
+const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath, bulkPausePlan, deleteTargets }")()
 
 assert.strictEqual(Model.expandHome("~", "/home/you"), "/home/you")
 assert.strictEqual(Model.expandHome("~/Downloads/catch", "/home/you"), "/home/you/Downloads/catch")
@@ -319,5 +319,17 @@ assert.deepStrictEqual(Model.bulkPausePlan(rows, { f: true }), null, "a done-onl
 assert.deepStrictEqual(Model.bulkPausePlan(rows, {}), null, "no marks means no selection")
 assert.deepStrictEqual(Model.bulkPausePlan([], allMarked), null, "an empty queue has nothing to do")
 assert.deepStrictEqual(Model.bulkPausePlan(rows, { zzz: true }), null, "marks that name no row are ignored")
+
+// "d" deletes bytes from disk, so it asks first. The confirm names what it
+// will delete: the marked rows in queue order, or the row under the cursor
+// when nothing is marked, so a bare "d" still has a sensible target.
+assert.deepStrictEqual(Model.deleteTargets(rows, allMarked, 0), ["a", "b", "c", "d", "e", "f"], "every marked row, in queue order")
+assert.deepStrictEqual(Model.deleteTargets(rows, { d: true, a: true }, 5), ["a", "d"], "marks win over the cursor")
+assert.deepStrictEqual(Model.deleteTargets(rows, { f: true }, 0), ["f"], "a single marked row")
+assert.deepStrictEqual(Model.deleteTargets(rows, {}, 2), ["c"], "no marks falls back to the cursor row")
+assert.deepStrictEqual(Model.deleteTargets(rows, {}, -1), [], "no cursor and no marks deletes nothing")
+assert.deepStrictEqual(Model.deleteTargets([], allMarked, 0), [], "an empty queue has nothing to delete")
+assert.deepStrictEqual(Model.deleteTargets(rows, { zzz: true }, 1), ["b"], "a stale mark falls back to the cursor")
+assert.deepStrictEqual(Model.deleteTargets(rows, { zzz: true }, 99), [], "a stale mark and no cursor deletes nothing")
 
 console.log("model.test.js: ok")

@@ -58,6 +58,10 @@ Panel {
   property string ignoringAsk: ""
   // Link waiting on the destructive-replace confirmation.
   property string replacePending: ""
+  // Full delete (queue rows and the bytes on disk) is destructive, so it
+  // waits here for an explicit answer.
+  property bool deletePending: false
+  property var deleteIds: []
   // True briefly after the conflict dialog closes, so the keys that
   // dismissed it cannot activate the row behind it.
   // Last close timestamp: clicks landing in the fade-out window must not
@@ -389,6 +393,36 @@ Panel {
     for (var i = 0; i < ids.length; i++) root.removeEntry(ids[i])
   }
 
+  // Full delete: the queue row and the bytes on disk. Destructive, so it
+  // asks first — Enter approves, Esc cancels. With nothing marked it targets
+  // the row under the cursor, so a bare `d` still has a sensible subject.
+  function askDeleteFiles() {
+    if (root.showingSettings) return
+    root.hold()
+    var ids = Model.deleteTargets(root.queue.downloads, root.marked, root.cursorIndex)
+    if (ids.length === 0) return
+    root.deleteIds = ids
+    root.deletePending = true
+  }
+
+  function cancelDeleteFiles() {
+    root.deletePending = false
+    root.deleteIds = []
+  }
+
+  function confirmDeleteFiles() {
+    root.hold()
+    var ids = root.deleteIds
+    root.deletePending = false
+    root.deleteIds = []
+    root.marked = ({})
+    for (var i = 0; i < ids.length; i++) {
+      // --delete-file drops the published file as well as the partial data.
+      // The backend only removes paths inside the download root.
+      root.runRow(["remove", ids[i], "--delete-file"], "Could not delete that file.")
+    }
+  }
+
   function toggleAllMarks() {
     root.hold()
     var all = true
@@ -452,6 +486,8 @@ Panel {
     root.conflict = null
     root.conflictFromAsk = false
     root.replacePending = ""
+    root.deletePending = false
+    root.deleteIds = []
     root.closeDropdowns()
     root.autoOpened = false
     root.userHolding = false
@@ -1369,7 +1405,7 @@ Panel {
       // This is the PanelKeyCatcher contract — blocked hands ALL keys to
       // descendants, so gating it on showingSettings made settings a
       // keyboard dead-end (s/h/esc/tab all swallowed).
-      blocked: root.textEditing || root.conflict !== null || root.replacePending !== "" || root.anyDropdownOpen()
+      blocked: root.textEditing || root.conflict !== null || root.replacePending !== "" || root.deletePending || root.anyDropdownOpen()
 
       // Hand the keyboard back to the panel. Every field calls this when it
       // commits: setting `field.focus = false` does NOT give up active
@@ -1539,6 +1575,7 @@ Panel {
         if (t === "c" || t === "C") {
           if (root.markedCount() > 0) root.deleteMarked()
         }
+        else if (t === "d" || t === "D") root.askDeleteFiles()
         else if (t === "a" || t === "A") root.toggleAllMarks()
         else if (t === "o" || t === "O") root.openFolder()
         else if (t === "x" || t === "X") {
@@ -2210,6 +2247,7 @@ Panel {
                       { keys: "↑ ↓ / j k", what: "move between rows" },
                       { keys: "space", what: "mark a row · a marks all" },
                       { keys: "c", what: "delete marked (files stay)" },
+                      { keys: "d", what: "delete marked files from disk" },
                       { keys: "p", what: "pause or re-queue (all marked)" },
                       { keys: "x", what: "stop a download, keep its data" },
                       { keys: "r", what: "give a failed row a new address" },
@@ -2995,6 +3033,110 @@ Panel {
                         text: "Replace"
                         marked: replaceShade.choice === 1
                         onClicked: root.confirmReplace()
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            // Full delete (queue rows and the bytes on disk) asks first.
+            // Enter approves, Esc cancels, Left/Right/Tab switch, and the
+            // buttons do the same, matching the replace confirm above.
+            Item {
+              id: deleteShade
+              anchors.fill: parent
+              visible: root.deletePending
+              focus: visible
+              // 1 is Delete, the destructive choice: Enter approves.
+              property int choice: 1
+
+              function targetCount() {
+                return root.deleteIds.length
+              }
+
+              onVisibleChanged: {
+                if (visible) choice = 1
+                else keyCatcher.release()
+              }
+
+              function choose() {
+                if (choice === 0) root.cancelDeleteFiles()
+                else root.confirmDeleteFiles()
+              }
+
+              Keys.priority: Keys.BeforeItem
+              Keys.onPressed: function (event) {
+                if (event.key === Qt.Key_Escape) {
+                  root.cancelDeleteFiles()
+                  event.accepted = true
+                } else if (event.key === Qt.Key_Left || event.key === Qt.Key_Right
+                           || event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+                  choice = choice === 0 ? 1 : 0
+                  event.accepted = true
+                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                  choose()
+                  event.accepted = true
+                }
+              }
+
+              Rectangle {
+                anchors.fill: parent
+                color: Util.alpha(Commons.Color.background, 0.7)
+
+                MouseArea { anchors.fill: parent; onClicked: root.cancelDeleteFiles() }
+
+                BorderSurface {
+                  anchors.centerIn: parent
+                  width: Math.min(parent.width - Style.space(32), Style.space(370))
+                  radius: root.fieldRadius
+                  color: Commons.Color.background
+                  borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+                  implicitHeight: deleteBody.implicitHeight + Style.spacing.xl * 2
+
+                  MouseArea { anchors.fill: parent; onClicked: {} }
+
+                  Column {
+                    id: deleteBody
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Style.spacing.xl
+                    spacing: Style.spacing.lg
+
+                    Text {
+                      width: parent.width
+                      textFormat: Text.PlainText
+                      text: "Delete " + deleteShade.targetCount()
+                        + (deleteShade.targetCount() === 1 ? " file" : " files")
+                        + " from disk?\n\nThe queue rows and their downloaded files are removed. This cannot be undone."
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.title
+                      wrapMode: Text.Wrap
+                    }
+
+                    Row {
+                      anchors.right: parent.right
+                      spacing: Style.spacing.sm
+
+                      Button {
+                        text: "Cancel"
+                        radius: root.fieldButtonRadius
+                        bordered: true
+                        hasCursor: deleteShade.choice === 0
+                        foreground: root.foreground
+                        accent: root.accent
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.subtitle
+                        focusable: true
+                        onClicked: root.cancelDeleteFiles()
+                      }
+
+                      SolidButton {
+                        text: "Delete"
+                        marked: deleteShade.choice === 1
+                        onClicked: root.confirmDeleteFiles()
                       }
                     }
                   }

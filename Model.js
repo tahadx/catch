@@ -312,6 +312,22 @@ function bulkPausePlan(downloads, marked) {
   return null
 }
 
+// The ids a full delete acts on: every marked row, in queue order, or the
+// row under the cursor when nothing is marked. Marks that name no live row
+// are ignored, and an empty queue has no targets. The panel confirms before
+// anything is removed; this only decides what the confirm is about.
+function deleteTargets(downloads, marked, cursorIndex) {
+  var list = downloads || []
+  var markedIds = []
+  for (var i = 0; i < list.length; i++) {
+    var d = list[i]
+    if (d && d.id && marked && marked[d.id]) markedIds.push(d.id)
+  }
+  if (markedIds.length > 0) return markedIds
+  var row = list[cursorIndex]
+  return row && row.id ? [row.id] : []
+}
+
 // Every http(s) link in a pasted block, in order and without duplicates.
 // One link, one per line, or a paragraph of prose around them all work: the
 // text is scanned rather than split, so a pasted chat message contributes
