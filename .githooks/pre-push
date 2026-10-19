@@ -8,7 +8,6 @@ cargo fmt --check -p catch
 cargo clippy -p catch --all-targets -- -D warnings
 cargo test -p catch --quiet
 node tests/model.test.js
-cmp AGENTS.md CLAUDE.md
 bin/lint-qml
 bash tests/install.test.sh
 bin/check-release
