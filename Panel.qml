@@ -1568,6 +1568,12 @@ Panel {
           if (!root.typing()) root.toggleSettings()
           return
         }
+        // `q` closes the panel outright, matching the shell's other panels;
+        // Esc still steps back one level first (settings → queue).
+        if (t === "q" || t === "Q") {
+          if (!root.typing()) root.close()
+          return
+        }
         // Queue actions stay off while settings are up or a field is
         // typing — a stray "c" must not clear marks from another screen.
         if (root.typing() || root.showingSettings) return
@@ -2256,7 +2262,8 @@ Panel {
                       { keys: "ctrl+v", what: "paste link(s) from anywhere" },
                       { keys: "o", what: "open the download folder" },
                       { keys: "s", what: "settings" },
-                      { keys: "esc", what: "back, then close" }
+                      { keys: "esc", what: "back, then close" },
+                      { keys: "q", what: "close" }
                     ]
 
                     RowLayout {
