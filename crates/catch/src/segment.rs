@@ -1014,13 +1014,21 @@ async fn run_one_segment(
                     in_seg += attempt_bytes;
                     written[i].fetch_max(base_off + in_seg, Ordering::Relaxed);
                     // Stopped for the runner's split: report now so the tail
-                    // can go to a fresh connection.
-                    let stop = split_at[i].load(Ordering::Relaxed);
-                    if stop != u64::MAX && work.start + in_seg >= stop {
-                        return Ok(TaskEnd::Finished {
-                            work,
-                            covered: in_seg,
-                        });
+                    // can go to a fresh connection. Only while a tail is
+                    // left, though — an attempt that already completed the
+                    // work must fall through to the commit below. Reporting
+                    // it as a handoff would look like "finished, no
+                    // remainder" with the segment still unmarked, and the
+                    // transfer would end in "segment N did not complete"
+                    // with every byte of it on disk.
+                    if in_seg < seg_len {
+                        let stop = split_at[i].load(Ordering::Relaxed);
+                        if stop != u64::MAX && work.start + in_seg >= stop {
+                            return Ok(TaskEnd::Finished {
+                                work,
+                                covered: in_seg,
+                            });
+                        }
                     }
                 }
                 Err(SegError::Interrupted(why)) => {

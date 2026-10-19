@@ -1401,6 +1401,85 @@ fn segmented_download_is_byte_exact_across_connections() {
     );
 }
 
+// The runner hands a straggler's tail to an idle slot by marking the victim's
+// frontier. The victim only obeys the mark at its next poll, so a final chunk
+// that completes the range can land after the mark was set and finish the
+// work outright. That attempt is done — it must run the durable commit, not
+// report a handoff: a handoff with nothing left looks like "finished, no
+// remainder" while the segment stays unmarked, the queue drains, and the
+// transfer fails with "segment N did not complete" with every byte of it on
+// disk.
+#[test]
+fn split_mark_outrun_by_the_last_chunk_still_commits() {
+    let sb = Sandbox::new("seg-split-commit");
+    let body = patterned(300_000, 43);
+    let server = Server::start({
+        let body = body.clone();
+        move |req, _n| {
+            let mut reply = range_reply(&body, &req);
+            let bytes = match std::mem::replace(&mut reply.body, Body::Empty) {
+                Body::Bytes(b) => b,
+                other => {
+                    reply.body = other;
+                    return reply;
+                }
+            };
+            match req.range_start() {
+                // Second half [150000, 299999]: a small first chunk, the bulk
+                // of the tail, then the last 8 KiB after a pause. The pause is
+                // where the idle slot marks this segment; the last piece then
+                // completes the whole work, outrunning the mark.
+                Some(150_000) => {
+                    let cut = bytes.len() - 8192;
+                    reply.declared_length = None;
+                    reply.body = Body::Chunked(vec![
+                        (bytes[..4096].to_vec(), Duration::from_millis(100)),
+                        (bytes[4096..cut].to_vec(), Duration::from_millis(150)),
+                        (bytes[cut..].to_vec(), Duration::ZERO),
+                    ]);
+                }
+                // First half [0, 149999]: all but the last kilobyte at once,
+                // then the last kilobyte 150 ms later, so this slot frees
+                // between the two tail chunks above. (The capability probe
+                // 0-1023 is too small to match.)
+                Some(0) if bytes.len() > 4096 => {
+                    let cut = bytes.len() - 1024;
+                    reply.declared_length = None;
+                    reply.body = Body::Chunked(vec![
+                        (bytes[..cut].to_vec(), Duration::from_millis(150)),
+                        (bytes[cut..].to_vec(), Duration::ZERO),
+                    ]);
+                }
+                _ => reply.body = Body::Bytes(bytes),
+            }
+            reply
+        }
+    });
+    let url = server.url("file.bin");
+    let mut cmd = sb.cmd();
+    cmd.env("CATCH_SEGMENT_MIN_BYTES", "1024")
+        .env("CATCH_SEGMENT_MIN_PIECE", "256")
+        .env("CATCH_SEGMENTS", "2")
+        .env("CATCH_MAX_CONNECTIONS", "2")
+        .args(["add", &url, "--dir", &dir(&sb)]);
+    let out = run(cmd, Duration::from_secs(30));
+    assert!(
+        out.status.success(),
+        "a split mark the last chunk outran left the segment uncommitted: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let row = sb.row_for_url(&url).expect("row");
+    assert_eq!(row["status"], "done");
+    assert_eq!(std::fs::read(sb.base().join("file.bin")).unwrap(), body);
+    let id = row["id"].as_str().unwrap().to_string();
+    let part = sb.part(&id, "file.bin");
+    assert!(!part.exists(), "the part is gone once published");
+    assert!(
+        !std::path::PathBuf::from(format!("{}.meta", part.display())).exists(),
+        "the manifest is cleaned up with it"
+    );
+}
+
 #[test]
 fn segmented_pause_keeps_the_manifest_and_resume_finishes() {
     let sb = Sandbox::new("seg-pause");
