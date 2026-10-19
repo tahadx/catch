@@ -291,6 +291,27 @@ function savedFor(queue, url) {
   }
 }
 
+// What `p` should do to a selection of marked rows. It mirrors the single
+// row toggle: stand every marked row down when any of them is queued or
+// transferring, otherwise re-queue the marked rows that are paused, errored,
+// or stopped. Returns null when the selection has nothing to act on, so the
+// panel can fall back to the cursor row.
+function bulkPausePlan(downloads, marked) {
+  var list = downloads || []
+  var pause = []
+  var resume = []
+  for (var i = 0; i < list.length; i++) {
+    var d = list[i]
+    if (!d || !marked || !marked[d.id]) continue
+    var status = String(d.status || "")
+    if (status === "queued" || status === "downloading") pause.push(d.id)
+    else if (status === "paused" || status === "error" || status === "cancelled") resume.push(d.id)
+  }
+  if (pause.length > 0) return { action: "pause", ids: pause }
+  if (resume.length > 0) return { action: "resume", ids: resume }
+  return null
+}
+
 // Every http(s) link in a pasted block, in order and without duplicates.
 // One link, one per line, or a paragraph of prose around them all work: the
 // text is scanned rather than split, so a pasted chat message contributes

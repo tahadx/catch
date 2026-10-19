@@ -572,6 +572,20 @@ Panel {
   // The partial file is kept either way — only remove deletes it.
   function cancelEntry(id) { root.hold(); root.runRow(["cancel", id], "Could not stop that download.") }
 
+  // `p` with rows marked acts on the whole selection: stand every marked row
+  // down when any of them is queued or transferring, otherwise re-queue the
+  // marked rows that stopped. With nothing marked it falls back to the cursor
+  // row, so a bare `p` still toggles the row under the cursor.
+  function pauseMarked() {
+    root.hold()
+    var plan = Model.bulkPausePlan(root.queue.downloads, root.marked)
+    if (!plan) return
+    var complaint = plan.action === "pause"
+      ? "Could not pause those downloads."
+      : "Could not re-queue those downloads."
+    for (var i = 0; i < plan.ids.length; i++) root.runRow([plan.action, plan.ids[i]], complaint)
+  }
+
   // Replace the address of a failed or stopped row (expired signed links,
   // login walls): focus the URL input in refresh mode. The CLI probes the
   // new link and only reuses the partial data when it proves to be the
@@ -1258,10 +1272,12 @@ Panel {
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color accent: Commons.Color.accent
-  // Muted is the palette's own "quiet text" role, so dim labels follow the
-  // theme instead of being a hardcoded darkening of the foreground (which
-  // went muddy on light themes).
-  readonly property color dim: Commons.Color.muted
+  // Quiet text is the theme foreground faded toward the surface. The
+  // palette's `muted` role (for example #666666 on a near-black panel) sat
+  // below a readable contrast on many themes, so captions, hints, and the
+  // waiting badge vanished. A foreground blend keeps the same hierarchy on
+  // light and dark themes.
+  readonly property color dim: Util.alpha(root.foreground, 0.7)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   // sRGB relative luminance, for picking theme ink that reads on a fill.
@@ -1290,11 +1306,14 @@ Panel {
   readonly property int fieldButtonInset: Math.max(Style.spacing.md, Math.round(fieldRadius * 0.35))
   readonly property int fieldButtonRadius: Math.max(Style.space(2), fieldRadius - Style.space(2))
 
-  // Badge colour per status: progress and completion read as the accent,
-  // failures as urgent, everything else stays quiet.
+  // Badge colour per status. The accent already drives progress fills and
+  // the cursor, so giving "downloading" the same colour made active and
+  // finished rows read alike; downloading now uses the foreground, done
+  // keeps the accent, failures take urgent, and waiting stays quiet.
   function badgeColor(status) {
     if (status === "error") return root.urgent
-    if (status === "downloading" || status === "done") return root.accent
+    if (status === "done") return root.accent
+    if (status === "downloading") return root.foreground
     return root.dim
   }
 
@@ -1528,6 +1547,12 @@ Panel {
           if (s && root.stoppable(s)) root.cancelEntry(s.id)
         }
         else if (t === "p" || t === "P") {
+          // A selection takes the toggle; with nothing marked it stays the
+          // row under the cursor.
+          if (root.markedCount() > 0) {
+            root.pauseMarked()
+            return
+          }
           var e = root.queue.downloads[root.cursorIndex]
           if (!e) return
           if (root.pausable(e)) root.pauseEntry(e.id)
@@ -2185,7 +2210,7 @@ Panel {
                       { keys: "↑ ↓ / j k", what: "move between rows" },
                       { keys: "space", what: "mark a row · a marks all" },
                       { keys: "c", what: "delete marked (files stay)" },
-                      { keys: "p", what: "pause or re-queue" },
+                      { keys: "p", what: "pause or re-queue (all marked)" },
                       { keys: "x", what: "stop a download, keep its data" },
                       { keys: "r", what: "give a failed row a new address" },
                       { keys: "delete", what: "remove a row, file stays" },

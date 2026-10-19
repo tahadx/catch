@@ -10,7 +10,7 @@ const path = require("node:path")
 const src = fs
   .readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library\s*$/m, "")
-const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath }")()
+const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath, bulkPausePlan }")()
 
 assert.strictEqual(Model.expandHome("~", "/home/you"), "/home/you")
 assert.strictEqual(Model.expandHome("~/Downloads/catch", "/home/you"), "/home/you/Downloads/catch")
@@ -299,5 +299,25 @@ const moving = Model.statusText(Model.parse(JSON.stringify({
 })))
 assert.ok(moving.includes("99%"), "moving transfers cap at 99%: " + moving)
 assert.ok(!moving.includes("100%"), "moving transfers never read 100%: " + moving)
+
+// "p" on a selection is the single-row toggle applied to every marked row:
+// stand them all down when any is queued or transferring, otherwise re-queue
+// the marked rows that are paused, errored, or stopped.
+const rows = [
+  { id: "a", status: "downloading" },
+  { id: "b", status: "queued" },
+  { id: "c", status: "paused" },
+  { id: "d", status: "error" },
+  { id: "e", status: "cancelled" },
+  { id: "f", status: "done" },
+]
+const allMarked = { a: true, b: true, c: true, d: true, e: true, f: true }
+assert.deepStrictEqual(Model.bulkPausePlan(rows, allMarked), { action: "pause", ids: ["a", "b"] }, "anything active pauses the active marked rows")
+assert.deepStrictEqual(Model.bulkPausePlan(rows, { c: true, d: true, e: true }), { action: "resume", ids: ["c", "d", "e"] }, "nothing active re-queues the stopped marked rows")
+assert.deepStrictEqual(Model.bulkPausePlan(rows, { a: true, c: true }), { action: "pause", ids: ["a"] }, "pause wins over resume and leaves paused rows alone")
+assert.deepStrictEqual(Model.bulkPausePlan(rows, { f: true }), null, "a done-only selection has nothing to do")
+assert.deepStrictEqual(Model.bulkPausePlan(rows, {}), null, "no marks means no selection")
+assert.deepStrictEqual(Model.bulkPausePlan([], allMarked), null, "an empty queue has nothing to do")
+assert.deepStrictEqual(Model.bulkPausePlan(rows, { zzz: true }), null, "marks that name no row are ignored")
 
 console.log("model.test.js: ok")
