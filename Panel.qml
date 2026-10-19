@@ -2153,11 +2153,6 @@ Panel {
                     anchors.verticalCenter: parent.verticalCenter
                     height: parent.height - root.fieldButtonInset * 2
                     text: "Schedule…"
-                    bordered: true
-                    foreground: root.dim
-                    accent: root.dim
-                    fontFamily: root.fontFamily
-                    focusable: true
                     onClicked: {
                       var text = linkField.text.trim()
                       linkField.text = ""
@@ -3387,11 +3382,6 @@ Panel {
 
                         SolidButton {
                           text: "Scheduler…"
-                          bordered: true
-                          foreground: root.dim
-                          accent: root.dim
-                          fontFamily: root.fontFamily
-                          focusable: true
                           onClicked: root.toggleScheduler()
                         }
                       }
@@ -3543,11 +3533,6 @@ Panel {
 
                         SolidButton {
                           text: root.sched("timer_active", false) === true ? "Remove timer" : "Install timer"
-                          bordered: true
-                          foreground: root.foreground
-                          accent: root.accent
-                          fontFamily: root.fontFamily
-                          focusable: true
                           onClicked: {
                             if (root.sched("timer_active", false) === true) root.removeSchedulerTimer()
                             else root.installSchedulerTimer()
@@ -3763,20 +3748,10 @@ Panel {
 
                         SolidButton {
                           text: "Any time"
-                          bordered: true
-                          foreground: root.dim
-                          accent: root.dim
-                          fontFamily: root.fontFamily
-                          focusable: true
                           onClicked: root.setWindowEnabled(false)
                         }
                         SolidButton {
                           text: "Nights 02:00–06:00"
-                          bordered: true
-                          foreground: root.dim
-                          accent: root.dim
-                          fontFamily: root.fontFamily
-                          focusable: true
                           onClicked: {
                             schedWinStartField.text = "02:00"
                             schedWinStopField.text = "06:00"
@@ -3785,11 +3760,6 @@ Panel {
                         }
                         SolidButton {
                           text: "Overnight 22:00–06:00"
-                          bordered: true
-                          foreground: root.dim
-                          accent: root.dim
-                          fontFamily: root.fontFamily
-                          focusable: true
                           onClicked: {
                             schedWinStartField.text = "22:00"
                             schedWinStopField.text = "06:00"
@@ -3992,29 +3962,14 @@ Panel {
 
                         SolidButton {
                           text: "+1 hour"
-                          bordered: true
-                          foreground: root.dim
-                          accent: root.dim
-                          fontFamily: root.fontFamily
-                          focusable: true
                           onClicked: root.applyPreset(3600)
                         }
                         SolidButton {
                           text: "+3 hours"
-                          bordered: true
-                          foreground: root.dim
-                          accent: root.dim
-                          fontFamily: root.fontFamily
-                          focusable: true
                           onClicked: root.applyPreset(3 * 3600)
                         }
                         SolidButton {
                           text: "Tomorrow 09:00"
-                          bordered: true
-                          foreground: root.dim
-                          accent: root.dim
-                          fontFamily: root.fontFamily
-                          focusable: true
                           onClicked: root.tomorrowMorning()
                         }
                         Item { Layout.fillWidth: true; height: 1 }
@@ -4027,11 +3982,6 @@ Panel {
                         SolidButton {
                           visible: root.schedEditingId !== ""
                           text: "Cancel"
-                          bordered: true
-                          foreground: root.dim
-                          accent: root.dim
-                          fontFamily: root.fontFamily
-                          focusable: true
                           onClicked: {
                             root.clearSchedJob()
                             keyCatcher.release()
@@ -4164,30 +4114,15 @@ Panel {
 
                           SolidButton {
                             text: "Start now"
-                            bordered: true
-                            foreground: root.foreground
-                            accent: root.accent
-                            fontFamily: root.fontFamily
-                            focusable: true
                             onClicked: root.startScheduledNow(model.sid)
                           }
                           SolidButton {
                             text: "Reschedule"
-                            bordered: true
-                            foreground: root.dim
-                            accent: root.dim
-                            fontFamily: root.fontFamily
-                            focusable: true
                             onClicked: root.scheduleEntry(root.rowById(model.sid))
                           }
                           Item { Layout.fillWidth: true; height: 1 }
                           SolidButton {
                             text: "Remove"
-                            bordered: true
-                            foreground: root.dim
-                            accent: root.dim
-                            fontFamily: root.fontFamily
-                            focusable: true
                             onClicked: root.removeEntry(model.sid)
                           }
                         }
