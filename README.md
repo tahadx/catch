@@ -178,8 +178,7 @@ opens settings: the download folder, how many transfers run at once (1–10),
 how many byte-range segments each large download uses (1 disables
 segmented downloading), the bandwidth mode (unlimited, balanced, or low)
 with an optional global limit in KB/s, and a schedule window that parks
-transfers outside the hours you pick (with an optional suspend or shutdown
-once the queue empties).
+transfers outside the hours you pick.
 
 ## Segmented downloads
 

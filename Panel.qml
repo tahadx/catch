@@ -2682,51 +2682,6 @@ Panel {
                           }
                         }
                       }
-
-                      RowLayout {
-                        width: parent.width
-                        spacing: Style.spacing.xl
-
-                        Text {
-                          text: "When out of hours"
-                          color: root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.body
-                        }
-
-                        Item { Layout.fillWidth: true; height: 1 }
-
-                        PanelDropdown {
-                          id: whenDoneDrop
-                          Layout.preferredWidth: Style.space(140)
-                          Layout.preferredHeight: Style.space(30)
-                          Layout.alignment: Qt.AlignVCenter
-                          foreground: root.foreground
-                          accent: root.accent
-                          options: [
-                            { value: "nothing", label: "stay on" },
-                            { value: "suspend", label: "suspend" },
-                            { value: "shutdown", label: "shutdown" }
-                          ]
-                          value: String(root.setting("schedWhenDone", "nothing"))
-                          onPopupToggled: function (isOpen) {
-                            root.noteDropdown("whenDone", isOpen, function () { whenDoneDrop.close() })
-                            if (!isOpen) keyCatcher.release()
-                          }
-                          onPicked: function (v) { root.writeSetting("schedWhenDone", v) }
-                        }
-                      }
-
-                      Text {
-                        id: scheduleHint
-                        width: parent.width
-                        textFormat: Text.PlainText
-                        text: "Suspend sleeps, shutdown powers off once the queue empties."
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        wrapMode: Text.Wrap
-                      }
                     }
                   }
 
