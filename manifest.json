@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.tahadx.catch",
   "name": "Catch",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "author": "Taha Sadough",
   "license": "MIT",
   "description": "Native download manager for Omarchy: bar status, Rust backend, browser handoff.",

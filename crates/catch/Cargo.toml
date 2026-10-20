@@ -1,6 +1,6 @@
 [package]
 name = "catch"
-version = "0.0.1"
+version = "0.1.0"
 authors = ["Taha Sadough <tahasdx@gmail.com>"]
 edition = "2021"
 description = "Native download manager backend for the Omarchy Catch plugin"
