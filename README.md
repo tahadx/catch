@@ -260,7 +260,9 @@ Environment overrides (all optional):
 ## Requirements
 
 Catch ships its own backend as a Linux x86_64 binary in `bin/dist`, so
-there is nothing to compile and no package to install. It calls a few
+there is nothing to compile and no package to install. That binary is built
+from `crates/` in this repository by `bin/refresh-dist`; the release
+workflow rebuilds and verifies it from the tagged sources. It calls a few
 programs already on your machine:
 
 | Program | Needed for | Comes from |
