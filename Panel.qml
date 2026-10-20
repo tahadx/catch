@@ -1619,7 +1619,10 @@ Panel {
               boundsBehavior: Flickable.StopAtBounds
               flickableDirection: Flickable.VerticalFlick
               interactive: contentHeight > height
-              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+              // Hidden on purpose: the bar was drawn over the right-aligned
+              // controls (settings values, Save buttons) at the page edge.
+              // Flicking and the wheel still scroll; there is just no bar.
+              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOff }
 
               Column {
                 id: column
