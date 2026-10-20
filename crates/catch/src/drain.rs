@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::os::unix::process::CommandExt;
 
 use crate::state::{update_state, with_lock, Status};
 
@@ -148,6 +149,11 @@ pub fn drain(max: usize) -> Result<()> {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            // Own process group: Ctrl-C in the terminal that ran `catch
+            // drain` or `catch tick` must not take running transfers down
+            // with it. The systemd pass needs KillMode=process for the same
+            // reason at the cgroup level.
+            .process_group(0)
             .spawn()
             .is_ok();
         if !spawned {

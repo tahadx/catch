@@ -674,6 +674,11 @@ Description=Catch download scheduler pass
 
 [Service]
 Type=oneshot
+# A pass exits as soon as it has spawned workers, and those workers have to
+# outlive it. Under the default control-group kill they share this unit's
+# cgroup and die the moment the pass ends, leaving the row at "downloading"
+# with no process behind it until the reaper requeues it a minute later.
+KillMode=process
 ExecStart=%h/.local/bin/catch tick
 "#;
 
@@ -1203,6 +1208,10 @@ mod tests {
         assert!(log.contains("enable --now catch-schedule.timer"), "{log}");
         assert!(log.contains("is-enabled catch-schedule.timer"), "{log}");
         assert!(log.contains("is-active catch-schedule.timer"), "{log}");
+        // A pass spawns workers and exits; the default control-group kill
+        // took them down with it and stranded the row at "downloading".
+        let unit = std::fs::read_to_string(units.join("catch-schedule.service")).unwrap();
+        assert!(unit.contains("KillMode=process"), "{unit}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
