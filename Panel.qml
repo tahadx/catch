@@ -3778,7 +3778,7 @@ Panel {
                             { value: "in-3h", label: "In 3 hours" },
                             { value: "tonight", label: root.whenTonightLabel },
                             { value: "tomorrow", label: "Tomorrow 09:00" },
-                            { value: "custom", label: "Custom date and time…" }
+                            { value: "custom", label: "Custom…" }
                           ]
                           value: root.schedJobWhen
                           onPopupToggled: function (isOpen) {
