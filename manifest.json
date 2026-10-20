@@ -105,6 +105,21 @@
         "type": "string",
         "label": "Window end (HH:MM)",
         "defaultValue": "06:00"
+      },
+      {
+        "key": "uiPlacement",
+        "type": "enum",
+        "label": "Panel position",
+        "options": [
+          "bar",
+          "top",
+          "center",
+          "left",
+          "right",
+          "bottom"
+        ],
+        "defaultValue": "bar",
+        "description": "Where the panel opens: under the bar icon, top centre, centre of screen, left or right pane, or bottom centre."
       }
     ]
   }

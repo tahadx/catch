@@ -12,6 +12,16 @@ function empty() {
   return { version: 1, downloads: [], saved: {}, asks: [] }
 }
 
+// Where the panel may open. "bar" is the original popup under the bar icon;
+// anything unknown falls back to it, so a stale setting cannot leave the
+// panel without a position.
+var PANEL_PLACEMENTS = ["bar", "top", "center", "left", "right", "bottom"]
+
+function placement(value) {
+  var p = String(value || "")
+  return PANEL_PLACEMENTS.indexOf(p) >= 0 ? p : "bar"
+}
+
 function parse(text) {
   var raw = String(text || "").trim()
   if (raw.length === 0) return empty()

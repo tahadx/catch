@@ -181,8 +181,13 @@ Downloads land in `~/Downloads/catch`. In the panel, the gear icon or `s`
 opens settings: the download folder, how many transfers run at once (1–10),
 how many byte-range segments each large download uses (1 disables
 segmented downloading), the bandwidth mode (unlimited, balanced, or low)
-with an optional global limit in KB/s, and a schedule window that parks
-transfers outside the hours you pick.
+with an optional global limit in KB/s, where the panel opens, and a schedule
+window that parks transfers outside the hours you pick.
+
+**Panel position** (`uiPlacement`) is `bar` (the popup under its bar icon,
+the default), `top`, `center`, `left`, `right`, or `bottom`. The edge
+placements slide in and out through their own screen edge, the centre simply
+appears in place, and the bar popup keeps its short fade.
 
 ## Segmented downloads
 

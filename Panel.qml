@@ -34,6 +34,9 @@ Panel {
   property int cursorIndex: -1
   property var marked: ({})
   property bool showingSettings: false
+  // Where the panel opens: "bar" keeps the original popup under its icon;
+  // top/center/left/right/bottom place it in the screen's available area.
+  readonly property string uiPlacement: Model.placement(root.setting("uiPlacement", "bar"))
   // Row id whose address is being replaced: the URL input switches to
   // "refresh" mode and the pasted link goes through `catch refresh`, which
   // verifies the new address before reusing the partial data.
@@ -1386,15 +1389,21 @@ Panel {
     }
   }
 
-  KeyboardPanel {
+  CatchPanel {
     id: panel
     anchorItem: button
     owner: root
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
+    placement: root.uiPlacement
     contentWidth: panel.fittedContentWidth(Style.space(480))
-    contentHeight: panel.fittedContentHeight(keyCatcher.implicitHeight, Style.space(560))
+    // The edge placements are panes: they use the full available height so
+    // the scroll area has somewhere to go, while the bar and centre
+    // placements stay fitted to their content.
+    contentHeight: (root.uiPlacement === "left" || root.uiPlacement === "right")
+      ? panel.availableCardHeight
+      : panel.fittedContentHeight(keyCatcher.implicitHeight, Style.space(560))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -2767,6 +2776,80 @@ Panel {
                             keyCatcher.release()
                           }
                         }
+                      }
+                    }
+                  }
+
+                  PanelSectionHeader {
+                    width: parent.width
+                    text: "APPEARANCE"
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                  }
+
+                  BorderSurface {
+                    width: parent.width
+                    radius: Style.cornerRadius
+                    color: Style.normalFillFor(root.foreground, root.accent)
+                    borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+                    implicitHeight: positionBody.implicitHeight + Style.spacing.xl * 2
+
+                    Column {
+                      id: positionBody
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.top: parent.top
+                      anchors.margins: Style.spacing.xl
+                      spacing: Style.spacing.lg
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.spacing.md
+
+                        Text {
+                          Layout.fillWidth: true
+                          textFormat: Text.PlainText
+                          text: "Panel position"
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.body
+                          font.bold: true
+                        }
+
+                        PanelDropdown {
+                          id: positionDrop
+                          spaceItem: contentScroll
+                          spaceHeight: contentScroll.height
+                          Layout.preferredWidth: Style.space(190)
+                          Layout.preferredHeight: Style.space(30)
+                          Layout.alignment: Qt.AlignVCenter
+                          foreground: root.foreground
+                          accent: root.accent
+                          options: [
+                            { value: "bar", label: "under the bar icon" },
+                            { value: "top", label: "top center" },
+                            { value: "center", label: "center of screen" },
+                            { value: "left", label: "left pane" },
+                            { value: "right", label: "right pane" },
+                            { value: "bottom", label: "bottom center" }
+                          ]
+                          value: root.uiPlacement
+                          onPopupToggled: function (isOpen) {
+                            root.noteDropdown("position", isOpen, function () { positionDrop.close() })
+                            if (!isOpen) keyCatcher.release()
+                          }
+                          onPicked: function (v) { root.writeSetting("uiPlacement", v) }
+                        }
+                      }
+
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: "Where the panel opens. It slides in from that edge, and the panes take the full height."
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
                       }
                     }
                   }

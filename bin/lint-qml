@@ -21,7 +21,7 @@ if [ -z "$lint" ]; then
   exit 0
 fi
 
-if out="$("$lint" Service.qml Panel.qml 2>&1)"; then
+if out="$("$lint" Service.qml Panel.qml CatchPanel.qml 2>&1)"; then
   rc=0
 else
   rc=$?

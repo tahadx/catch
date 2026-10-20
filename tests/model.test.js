@@ -10,7 +10,7 @@ const path = require("node:path")
 const src = fs
   .readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library\s*$/m, "")
-const Model = new Function(src + "\nreturn { parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath, bulkPausePlan, deleteTargets }")()
+const Model = new Function(src + "\nreturn { placement, parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath, bulkPausePlan, deleteTargets }")()
 
 assert.strictEqual(Model.expandHome("~", "/home/you"), "/home/you")
 assert.strictEqual(Model.expandHome("~/Downloads/catch", "/home/you"), "/home/you/Downloads/catch")
@@ -331,5 +331,16 @@ assert.deepStrictEqual(Model.deleteTargets(rows, {}, -1), [], "no cursor and no 
 assert.deepStrictEqual(Model.deleteTargets([], allMarked, 0), [], "an empty queue has nothing to delete")
 assert.deepStrictEqual(Model.deleteTargets(rows, { zzz: true }, 1), ["b"], "a stale mark falls back to the cursor")
 assert.deepStrictEqual(Model.deleteTargets(rows, { zzz: true }, 99), [], "a stale mark and no cursor deletes nothing")
+
+// Panel placement: known values pass through, anything else is the bar popup.
+assert.strictEqual(Model.placement("top"), "top")
+assert.strictEqual(Model.placement("center"), "center")
+assert.strictEqual(Model.placement("left"), "left")
+assert.strictEqual(Model.placement("right"), "right")
+assert.strictEqual(Model.placement("bottom"), "bottom")
+assert.strictEqual(Model.placement("bar"), "bar")
+assert.strictEqual(Model.placement(""), "bar")
+assert.strictEqual(Model.placement(null), "bar")
+assert.strictEqual(Model.placement("sideways"), "bar")
 
 console.log("model.test.js: ok")
