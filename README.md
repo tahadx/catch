@@ -1,9 +1,5 @@
 # Catch — native download manager for Omarchy
 
-> **Status: 0.1.0.** Catch works and is worth using, but the panel layout,
-> settings, and CLI surface still change between versions. Files already
-> downloaded stay where they were put.
-
 © 2026 Taha Sadough — MIT, see [LICENSE](LICENSE).
 
 Bar widget + Rust backend. Catch links, images, or whole pages from the
