@@ -47,6 +47,10 @@ Panel {
   property string schedJobDate: ""
   property string schedJobTime: ""
   property string schedJobDir: ""
+  // Which "when" pick the draft came from: next-hour / in-1h / in-3h /
+  // tonight / tomorrow / custom. Only "custom" shows the date and time
+  // fields; a rescheduled row lands there with its own stored time.
+  property string schedJobWhen: "next-hour"
   // Non-empty while the form is rescheduling an existing queue row.
   property string schedEditingId: ""
   // Form dates are written through this signal as well as the root props:
@@ -156,6 +160,7 @@ Panel {
       var next = Model.nextHourInputs(Date.now())
       root.schedJobDate = next.date
       root.schedJobTime = next.time
+      root.schedJobWhen = "next-hour"
     }
     if (root.showingScheduler) root.refreshScheduler()
   }
@@ -208,6 +213,9 @@ Panel {
     var at = Number(d.scheduled_at) || 0
     var inputs = at > now ? Model.stampInputs(at) : Model.nextHourInputs(Date.now())
     root.setFormTimes(inputs.date, inputs.time)
+    // The stored time is whatever it is: it does not match a relative pick,
+    // so the form opens on the fields with that time in them.
+    root.schedJobWhen = "custom"
     root.schedDirReady(String(d.dir || ""))
     root.schedNotice = "Rescheduling " + Model.displayName(d)
     root.refreshScheduler()
@@ -225,6 +233,7 @@ Panel {
     root.schedJobUrl = String(text || "").trim()
     root.schedJobDir = ""
     root.schedNotice = ""
+    root.schedJobWhen = "next-hour"
     var next = Model.nextHourInputs(Date.now())
     root.setFormTimes(next.date, next.time)
     root.schedDirReady("")
@@ -237,6 +246,7 @@ Panel {
     root.schedJobUrl = ""
     root.schedJobDir = ""
     root.schedNotice = ""
+    root.schedJobWhen = "next-hour"
     var next = Model.nextHourInputs(Date.now())
     root.setFormTimes(next.date, next.time)
     root.schedDirReady("")
@@ -246,6 +256,40 @@ Panel {
     root.schedJobDate = String(date || "")
     root.schedJobTime = String(time || "")
     root.schedTimesReady(root.schedJobDate, root.schedJobTime)
+  }
+
+  // The one-time form is a pick, not two text fields: the "when" dropdown
+  // resolves a relative choice into the date and time inputs the backend
+  // already validates, and only "custom" reveals the fields themselves.
+  readonly property string whenTonightLabel: (new Date().getHours() < 22) ? "Tonight 22:00" : "Tomorrow 22:00"
+
+  // The pick in words, with the clock time it resolves to. Also the form's
+  // live validation: a stamp of null is a past or malformed time.
+  readonly property string jobWhenText: {
+    var ts = Model.scheduleStamp(root.schedJobDate, root.schedJobTime, root.nowSec())
+    return ts === null
+      ? "Pick a future date and time"
+      : "Starts " + Qt.formatDateTime(new Date(ts * 1000), "ddd d MMM · HH:mm")
+  }
+
+  function applyWhenChoice(choice) {
+    root.schedJobWhen = choice
+    if (choice === "next-hour") {
+      var next = Model.nextHourInputs(Date.now())
+      root.setFormTimes(next.date, next.time)
+    } else if (choice === "in-1h") {
+      root.applyPreset(3600)
+    } else if (choice === "in-3h") {
+      root.applyPreset(3 * 3600)
+    } else if (choice === "tonight") {
+      var tonight = new Date()
+      tonight.setHours(22, 0, 0, 0)
+      if (tonight.getTime() <= Date.now()) tonight.setDate(tonight.getDate() + 1)
+      var inputs = Model.stampInputs(Math.floor(tonight.getTime() / 1000))
+      root.setFormTimes(inputs.date, inputs.time)
+    } else if (choice === "tomorrow") {
+      root.tomorrowMorning()
+    }
   }
 
   function applyPreset(seconds) {
@@ -1683,7 +1727,7 @@ Panel {
   readonly property string headerMeta: root.conflict !== null
     ? "already in your folder · enter chooses · esc cancels"
     : root.showingScheduler
-    ? "scheduler · one-time and daily windows · esc goes back"
+    ? "scheduler · t or esc goes back"
     : root.showingSettings
     ? "settings · super+d toggles · esc goes back"
     : "download manager · " + Model.statusText(root.queue).replace(/^Catch — /, "")
@@ -1753,8 +1797,6 @@ Panel {
       function syncEditing() {
         root.textEditing = linkField.activeFocus
           || dirField.activeFocus
-          || schedStartField.activeFocus
-          || schedStopField.activeFocus
           || schedWinStartField.activeFocus
           || schedWinStopField.activeFocus
           || schedJobUrlField.activeFocus
@@ -1798,8 +1840,10 @@ Panel {
           : schedJobUrlField
         // The URL field is hidden while rescheduling; never park the
         // keyboard in an invisible item (that left `blocked` stuck on).
-        if (which === "job-url" && root.schedEditingId !== "") field = schedJobDateField
-        if (!field.visible || field.height <= 0) field = schedJobDateField
+        // The date and time fields hide too unless the "when" pick is
+        // custom, so the destination field is the safe landing spot.
+        if (which === "job-url" && root.schedEditingId !== "") field = schedJobDirField
+        if (!field.visible || field.height <= 0) field = schedJobDirField
         root.textEditing = true
         field.forceActiveFocus()
         if (typeof field.selectAll === "function") field.selectAll()
@@ -1986,7 +2030,10 @@ Panel {
               boundsBehavior: Flickable.StopAtBounds
               flickableDirection: Flickable.VerticalFlick
               interactive: contentHeight > height
-              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+              // Hidden on purpose: the bar was drawn over the right-aligned
+              // controls (settings values, Save buttons) at the page edge.
+              // Flicking and the wheel still scroll; there is just no bar.
+              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOff }
 
               Column {
                 id: column
@@ -2884,12 +2931,7 @@ Panel {
                     event.accepted = true
                   }
                   onVisibleChanged: {
-                    if (visible) {
-                      // Values come from the saved window, not from stale
-                      // field text left over from an earlier visit.
-                      schedStartField.text = root.schedWindowStart
-                      schedStopField.text = root.schedWindowStop
-                    } else {
+                    if (!visible) {
                       // Focus must never stay trapped in a hidden field, or
                       // every panel shortcut silently stops working. A popup
                       // outlives its hidden parent too, so those go as well.
@@ -3215,161 +3257,6 @@ Panel {
                       anchors.margins: Style.spacing.xl
                       spacing: Style.spacing.lg
 
-                      RowLayout {
-                        width: parent.width
-                        spacing: Style.spacing.md
-
-                        Text {
-                          Layout.fillWidth: true
-                          textFormat: Text.PlainText
-                          text: "Daily window"
-                          color: root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.body
-                          font.bold: true
-                        }
-
-                        PanelDropdown {
-                          id: scheduleDrop
-                          spaceItem: contentScroll
-                          spaceHeight: contentScroll.height
-                          Layout.preferredWidth: Style.space(150)
-                          Layout.preferredHeight: Style.space(30)
-                          Layout.alignment: Qt.AlignVCenter
-                          foreground: root.foreground
-                          accent: root.accent
-                          options: [
-                            { value: "off", label: "anytime" },
-                            { value: "on", label: "scheduled window" }
-                          ]
-                          value: root.schedWindowEnabled ? "on" : "off"
-                          onPopupToggled: function (isOpen) {
-                            root.noteDropdown("schedule", isOpen, function () { scheduleDrop.close() })
-                            if (!isOpen) keyCatcher.release()
-                          }
-                          onPicked: function (v) { root.setWindowEnabled(v === "on") }
-                        }
-                      }
-
-                      Text {
-                        width: parent.width
-                        textFormat: Text.PlainText
-                        text: "Outside the window Catch parks transfers it started and leaves them queued. A transfer you started by hand keeps running. Turning the window off does not remove the timer: one-time schedules still need it."
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        wrapMode: Text.Wrap
-                      }
-
-                      RowLayout {
-                        width: parent.width
-                        spacing: Style.spacing.sm
-
-                        BorderSurface {
-                          Layout.preferredWidth: Style.space(92)
-                          Layout.preferredHeight: Style.space(38)
-                          radius: root.fieldRadius
-                          clip: true
-                          color: schedStartField.activeFocus
-                            ? Style.focusFillFor(root.foreground, root.accent)
-                            : Style.controlFill(false, false, root.foreground, root.accent)
-                          borderSpec: Border.controlSpec(schedStartField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
-
-                          TextField {
-                            id: schedStartField
-                            anchors.fill: parent
-                            anchors.leftMargin: Style.spacing.md + parent.borderLeft
-                            anchors.rightMargin: Style.spacing.md + parent.borderRight
-                            foreground: root.foreground
-                            accent: root.accent
-                            font.family: root.fontFamily
-                            horizontalPadding: 0
-                            verticalPadding: 0
-                            placeholderTextColor: root.dim
-                            placeholderText: "from"
-                            background: Item {}
-                            text: ""
-                            Keys.onEscapePressed: function (event) {
-                              keyCatcher.release()
-                              event.accepted = true
-                            }
-                            Keys.onPressed: function (event) {
-                              if (event.key === Qt.Key_Tab) {
-                                keyCatcher.focusSchedulerField("win-stop")
-                                event.accepted = true
-                                return
-                              }
-                              keyCatcher.fieldKey(schedStartField, event)
-                            }
-                            onActiveFocusChanged: keyCatcher.syncEditing()
-                            onAccepted: {
-                              root.saveWindowSettings(schedStartField.text.trim(), schedStopField.text.trim())
-                              keyCatcher.release()
-                            }
-                          }
-                        }
-
-                        Text {
-                          text: "to"
-                          color: root.dim
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.body
-                        }
-
-                        BorderSurface {
-                          Layout.preferredWidth: Style.space(92)
-                          Layout.preferredHeight: Style.space(38)
-                          radius: root.fieldRadius
-                          clip: true
-                          color: schedStopField.activeFocus
-                            ? Style.focusFillFor(root.foreground, root.accent)
-                            : Style.controlFill(false, false, root.foreground, root.accent)
-                          borderSpec: Border.controlSpec(schedStopField.activeFocus ? "focus" : "normal", root.foreground, root.accent)
-
-                          TextField {
-                            id: schedStopField
-                            anchors.fill: parent
-                            anchors.leftMargin: Style.spacing.md + parent.borderLeft
-                            anchors.rightMargin: Style.spacing.md + parent.borderRight
-                            foreground: root.foreground
-                            accent: root.accent
-                            font.family: root.fontFamily
-                            horizontalPadding: 0
-                            verticalPadding: 0
-                            placeholderTextColor: root.dim
-                            placeholderText: "until"
-                            background: Item {}
-                            text: ""
-                            Keys.onEscapePressed: function (event) {
-                              keyCatcher.release()
-                              event.accepted = true
-                            }
-                            Keys.onPressed: function (event) {
-                              if (event.key === Qt.Key_Tab) {
-                                keyCatcher.focusSchedulerField("win-start")
-                                event.accepted = true
-                                return
-                              }
-                              keyCatcher.fieldKey(schedStopField, event)
-                            }
-                            onActiveFocusChanged: keyCatcher.syncEditing()
-                            onAccepted: {
-                              root.saveWindowSettings(schedStartField.text.trim(), schedStopField.text.trim())
-                              keyCatcher.release()
-                            }
-                          }
-                        }
-
-                        Item { Layout.fillWidth: true; height: 1 }
-
-                        SolidButton {
-                          text: "Save"
-                          onClicked: {
-                            root.saveWindowSettings(schedStartField.text.trim(), schedStopField.text.trim())
-                            keyCatcher.release()
-                          }
-                        }
-                      }
 
                       RowLayout {
                         width: parent.width
@@ -3378,8 +3265,10 @@ Panel {
                         Text {
                           Layout.fillWidth: true
                           textFormat: Text.PlainText
-                          text: Model.windowSummary(root.schedWindowStart, root.schedWindowStop, root.schedWindowEnabled)
-                            + " · equal times mean the whole day"
+                          // Settings only reports the window and points at
+                          // the page that owns it; the fields, presets and
+                          // semantics live there now.
+                          text: "Window: " + Model.windowSummary(root.schedWindowStart, root.schedWindowStop, root.schedWindowEnabled)
                           color: root.dim
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.caption
@@ -3462,13 +3351,10 @@ Panel {
                     }
                   }
 
-                  PanelSectionHeader {
-                    width: parent.width
-                    text: "SCHEDULER"
-                    foreground: root.dim
-                    fontFamily: root.fontFamily
-                  }
-
+                  // No "SCHEDULER" section header: the page title already
+                  // says it, and the status card is unmistakably the state
+                  // of the thing. The height it cost was the difference
+                  // between a page that scrolls and one that does not.
                   BorderSurface {
                     width: parent.width
                     radius: Style.cornerRadius
@@ -3512,7 +3398,11 @@ Panel {
 
                       Text {
                         width: parent.width
-                        visible: String(root.sched("policy", "")) !== ""
+                        // Only when a window is on: with it off the message
+                        // above already says downloads may run any time, and
+                        // "Any time" here repeated it word for word.
+                        visible: root.sched("enabled", false) === true
+                          && String(root.sched("error", "")) === ""
                         textFormat: Text.PlainText
                         text: String(root.sched("policy", ""))
                         color: root.dim
@@ -3550,7 +3440,7 @@ Panel {
                         width: parent.width
                         visible: root.sched("timer_active", false) !== true
                         textFormat: Text.PlainText
-                        text: "Schedules persist, but without the timer they only run while Catch is open. Installing it is per-user and needs no root."
+                        text: "Without it, schedules only run while Catch is open."
                         color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
@@ -3599,25 +3489,29 @@ Panel {
                         Text {
                           Layout.fillWidth: true
                           textFormat: Text.PlainText
-                          text: "Only download inside the window"
-                          color: root.foreground
+                          // The window in words, and nothing while it is
+                          // off: the pick beside it already says "any time".
+                          text: root.schedWindowEnabled
+                            ? Model.windowSummary(root.schedWindowStart, root.schedWindowStop, true)
+                            : ""
+                          color: root.dim
                           font.family: root.fontFamily
-                          font.pixelSize: Style.font.body
-                          font.bold: true
+                          font.pixelSize: Style.font.caption
+                          elide: Text.ElideRight
                         }
 
                         PanelDropdown {
                           id: schedWindowDrop
                           spaceItem: contentScroll
                           spaceHeight: contentScroll.height
-                          Layout.preferredWidth: Style.space(150)
+                          Layout.preferredWidth: Style.space(200)
                           Layout.preferredHeight: Style.space(30)
                           Layout.alignment: Qt.AlignVCenter
                           foreground: root.foreground
                           accent: root.accent
                           options: [
-                            { value: "off", label: "anytime" },
-                            { value: "on", label: "scheduled window" }
+                            { value: "off", label: "any time" },
+                            { value: "on", label: "inside the window" }
                           ]
                           value: root.schedWindowEnabled ? "on" : "off"
                           onPopupToggled: function (isOpen) {
@@ -3626,16 +3520,6 @@ Panel {
                           }
                           onPicked: function (v) { root.setWindowEnabled(v === "on") }
                         }
-                      }
-
-                      Text {
-                        width: parent.width
-                        textFormat: Text.PlainText
-                        text: "Start is inclusive, end is exclusive. Equal times allow the whole day. Overnight windows (for example 22:00 to 06:00) wrap past midnight."
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        wrapMode: Text.Wrap
                       }
 
                       RowLayout {
@@ -3748,14 +3632,13 @@ Panel {
                         }
                       }
 
-                      RowLayout {
+                      // Presets sit in a Flow so a long label wraps to the
+                      // next line instead of running off the card's edge,
+                      // which is what the old fixed button row did.
+                      Flow {
                         width: parent.width
                         spacing: Style.spacing.sm
 
-                        SolidButton {
-                          text: "Any time"
-                          onClicked: root.setWindowEnabled(false)
-                        }
                         SolidButton {
                           text: "Nights 02:00–06:00"
                           onClicked: {
@@ -3772,24 +3655,17 @@ Panel {
                             root.applyWindowPreset("22:00", "06:00")
                           }
                         }
-                        Item { Layout.fillWidth: true; height: 1 }
                       }
 
                       Text {
                         width: parent.width
                         textFormat: Text.PlainText
-                        text: Model.windowSummary(root.schedWindowStart, root.schedWindowStop, root.schedWindowEnabled)
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        wrapMode: Text.Wrap
-                      }
-
-                      Text {
-                        width: parent.width
-                        visible: root.schedWindowNotice !== ""
-                        textFormat: Text.PlainText
-                        text: root.schedWindowNotice
+                        // Never two lines of prose: the last save's result
+                        // when there is one, the window's own semantics
+                        // otherwise.
+                        text: root.schedWindowNotice !== ""
+                          ? root.schedWindowNotice
+                          : "Start inclusive · end exclusive · overnight wraps."
                         color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
@@ -3862,7 +3738,7 @@ Panel {
                           }
                           Keys.onPressed: function (event) {
                             if (event.key === Qt.Key_Tab) {
-                              keyCatcher.focusSchedulerField("job-date")
+                              keyCatcher.focusSchedulerField(root.schedJobWhen === "custom" ? "job-date" : "job-dir")
                               event.accepted = true
                               return
                             }
@@ -3875,7 +3751,50 @@ Panel {
 
                       RowLayout {
                         width: parent.width
+                        spacing: Style.spacing.md
+
+                        Text {
+                          Layout.fillWidth: true
+                          textFormat: Text.PlainText
+                          text: "When"
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.body
+                          font.bold: true
+                        }
+
+                        PanelDropdown {
+                          id: schedWhenDrop
+                          spaceItem: contentScroll
+                          spaceHeight: contentScroll.height
+                          Layout.preferredWidth: Style.space(190)
+                          Layout.preferredHeight: Style.space(30)
+                          Layout.alignment: Qt.AlignVCenter
+                          foreground: root.foreground
+                          accent: root.accent
+                          options: [
+                            { value: "next-hour", label: "Next hour" },
+                            { value: "in-1h", label: "In 1 hour" },
+                            { value: "in-3h", label: "In 3 hours" },
+                            { value: "tonight", label: root.whenTonightLabel },
+                            { value: "tomorrow", label: "Tomorrow 09:00" },
+                            { value: "custom", label: "Custom date and time…" }
+                          ]
+                          value: root.schedJobWhen
+                          onPopupToggled: function (isOpen) {
+                            root.noteDropdown("schedWhen", isOpen, function () { schedWhenDrop.close() })
+                            if (!isOpen) keyCatcher.release()
+                          }
+                          onPicked: function (v) { root.applyWhenChoice(v) }
+                        }
+                      }
+
+                      // Only the custom pick needs the fields; every other
+                      // pick has already resolved into them.
+                      RowLayout {
+                        width: parent.width
                         spacing: Style.spacing.sm
+                        visible: root.schedJobWhen === "custom"
 
                         BorderSurface {
                           Layout.fillWidth: true
@@ -3962,37 +3881,17 @@ Panel {
                         }
                       }
 
-                      RowLayout {
+                      Text {
                         width: parent.width
-                        spacing: Style.spacing.sm
-
-                        SolidButton {
-                          text: "+1 hour"
-                          onClicked: root.applyPreset(3600)
-                        }
-                        SolidButton {
-                          text: "+3 hours"
-                          onClicked: root.applyPreset(3 * 3600)
-                        }
-                        SolidButton {
-                          text: "Tomorrow 09:00"
-                          onClicked: root.tomorrowMorning()
-                        }
-                        Item { Layout.fillWidth: true; height: 1 }
-
-                        SolidButton {
-                          text: root.schedEditingId !== "" ? "Reschedule" : "Schedule"
-                          onClicked: schedulerView.submitJob()
-                        }
-
-                        SolidButton {
-                          visible: root.schedEditingId !== ""
-                          text: "Cancel"
-                          onClicked: {
-                            root.clearSchedJob()
-                            keyCatcher.release()
-                          }
-                        }
+                        textFormat: Text.PlainText
+                        // The pick in words, with the clock time it lands
+                        // on: the sentence the old paragraph spent three
+                        // lines making.
+                        text: root.jobWhenText + " · queued now, inside the window"
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
                       }
 
                       BorderSurface {
@@ -4037,14 +3936,25 @@ Panel {
                         }
                       }
 
-                      Text {
+                      RowLayout {
                         width: parent.width
-                        textFormat: Text.PlainText
-                        text: "A scheduled job is queued now and starts at its time, inside the daily window. Start still obeys the parallel limit and the window; it only skips this entry's own delay."
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        wrapMode: Text.Wrap
+                        spacing: Style.spacing.sm
+
+                        Item { Layout.fillWidth: true; height: 1 }
+
+                        SolidButton {
+                          text: root.schedEditingId !== "" ? "Reschedule" : "Schedule"
+                          onClicked: schedulerView.submitJob()
+                        }
+
+                        SolidButton {
+                          visible: root.schedEditingId !== ""
+                          text: "Cancel"
+                          onClicked: {
+                            root.clearSchedJob()
+                            keyCatcher.release()
+                          }
+                        }
                       }
                     }
                   }
@@ -4059,7 +3969,7 @@ Panel {
                   Label {
                     visible: schedModel.count === 0
                     width: parent.width
-                    text: "Nothing scheduled. One-time jobs keep their queue row and their chosen folder until they run."
+                    text: "Nothing scheduled yet."
                     color: root.dim
                     wrapMode: Text.Wrap
                     font.family: root.fontFamily
