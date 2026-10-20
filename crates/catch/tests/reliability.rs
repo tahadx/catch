@@ -1224,7 +1224,10 @@ fn version_never_runs_self_configure_and_configure_can_suppress_it() {
     let mut cmd = sb.cmd_for(&copied);
     cmd.arg("--version");
     let out = run_ok(cmd, Duration::from_secs(5));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("0.0.1"));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(env!("CARGO_PKG_VERSION")),
+        "--version prints the package version"
+    );
     assert!(
         !marker.exists(),
         "--version must not touch links or host manifests"
