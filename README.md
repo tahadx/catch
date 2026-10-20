@@ -1,6 +1,6 @@
 # Catch — native download manager for Omarchy
 
-> **Status: MVP.** Catch works and is worth using, but the panel layout,
+> **Status: 0.1.0.** Catch works and is worth using, but the panel layout,
 > settings, and CLI surface still change between versions. Files already
 > downloaded stay where they were put.
 
