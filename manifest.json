@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Catch",
-    "description": "Download queue status. Click opens the download folder.",
+    "description": "Download queue status and controls. Click opens Catch; right-click opens the download folder.",
     "category": "Files",
     "allowMultiple": false,
     "defaultSection": "right",
