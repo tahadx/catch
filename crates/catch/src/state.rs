@@ -216,6 +216,91 @@ pub fn state_path() -> PathBuf {
     state_dir().join("state.json")
 }
 
+/// Create the state directory if needed and keep it owner-only.
+///
+/// `state.json` holds the full download URLs (including signed query strings)
+/// and the saved-download history, and the parent (`~/.local/state/omarchy`)
+/// is traversable by other local users. A plain `create_dir_all` under umask
+/// 022 left the directory at 0755 and every file at 0644, so another account
+/// on the machine could read them. Every writer goes through here, and the
+/// permission pass also heals directories and files created by an older build,
+/// including quarantined `state.json.bad-*` copies.
+pub fn ensure_state_dir() -> Result<PathBuf> {
+    let dir = state_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    harden_state_dir(&dir);
+    Ok(dir)
+}
+
+/// Walk the state directory once and remove group/other access.
+///
+/// Skipped when the directory and `state.json` are already private: `catch
+/// status` is polled by the panel, and an already-correct install must not pay
+/// for a directory scan on every read. A directory at 0700 already hides every
+/// file inside it, so the early return is safe even if a stray file is 0644.
+fn harden_state_dir(dir: &Path) {
+    if already_private(dir) {
+        return;
+    }
+    tighten_dir(dir);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            tighten_dir(&entry.path());
+        } else if kind.is_file() {
+            tighten_file(&entry.path());
+        }
+    }
+}
+
+fn already_private(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir_ok = std::fs::metadata(dir)
+        .map(|m| m.permissions().mode() & 0o777 == 0o700)
+        .unwrap_or(false);
+    let state_ok = std::fs::metadata(dir.join("state.json"))
+        .map(|m| m.permissions().mode() & 0o777 == 0o600)
+        .unwrap_or(true);
+    dir_ok && state_ok
+}
+
+fn tighten_dir(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+fn tighten_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+/// Write a state file owner-only **at creation**.
+///
+/// `fs::write` honours the process umask, so a secret-bearing file is readable
+/// for the instant between create and any later chmod. Opening with mode 0600
+/// closes that window; the explicit `set_permissions` also repairs a temp file
+/// that an older build left behind at 0644 before it is renamed into place.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)?;
+    file.sync_data()
+}
+
 pub fn default_download_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR").map(PathBuf::from) {
         dir.join("catch")
@@ -350,6 +435,9 @@ fn shell_download_dir() -> Option<PathBuf> {
 
 pub fn load_state() -> Result<State> {
     let path = state_path();
+    // An install created before the permission fix is healed on any read, not
+    // only on the next write: the panel polls status without ever saving.
+    harden_state_dir(&state_dir());
     if !path.exists() {
         return Ok(State::default());
     }
@@ -370,6 +458,10 @@ pub fn load_state() -> Result<State> {
             // clean: Catch heals itself and says so.
             let quarantine = state_dir().join(format!("state.json.bad-{}", now_secs()));
             let moved = std::fs::rename(&path, &quarantine).is_ok();
+            if moved {
+                // rename keeps the old mode; the copy still names every URL.
+                tighten_file(&quarantine);
+            }
             eprintln!(
                 "catch: state file unreadable ({e}); {}",
                 if moved {
@@ -391,16 +483,15 @@ pub fn load_state() -> Result<State> {
 /// is in flight. The rename itself keeps readers crash-proof: they see the
 /// old file or the new one, never a mixture.
 pub fn save_state(state: &State) -> Result<()> {
-    let dir = state_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let dir = ensure_state_dir()?;
     let path = state_path();
     let tmp = dir.join("state.json.tmp");
     let text = serde_json::to_string_pretty(state)?;
-    std::fs::write(&tmp, &text).with_context(|| format!("write {}", tmp.display()))?;
-    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
-        let _ = f.sync_data();
-    }
+    write_private(&tmp, text.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
+    // Defensive: the private temp already carries 0600, but a hand-created
+    // state.json must not keep its old mode after the rename.
+    tighten_file(&path);
     if let Ok(d) = std::fs::File::open(&dir) {
         let _ = d.sync_all();
     }
@@ -805,8 +896,7 @@ pub fn mark_error(id: &str, msg: &str) -> Result<()> {
 /// remove, and every later command failed with "state is locked" for the
 /// full two minutes of staleness.
 pub fn with_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let dir = state_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let dir = ensure_state_dir()?;
     let lock = dir.join("state.lock");
     let _held = take_state_lock(&lock)?;
     f()
@@ -836,7 +926,21 @@ pub(crate) fn pid_live(pid: u32) -> bool {
 /// Write the holder into a lock directory so a later process can tell a
 /// crashed holder from one that is merely slow.
 fn stamp_lock_owner(lock: &std::path::Path) {
-    let _ = std::fs::write(lock.join("owner"), format!("{}\n", std::process::id()));
+    let _ = write_private(
+        &lock.join("owner"),
+        format!("{}\n", std::process::id()).as_bytes(),
+    );
+}
+
+/// Create the lock directory and keep it owner-only. The pid inside is not a
+/// secret, but a lock directory shared with other accounts is still one more
+/// path into the state tree.
+fn make_lock_dir(lock: &std::path::Path) -> bool {
+    if std::fs::create_dir(lock).is_err() {
+        return false;
+    }
+    tighten_dir(lock);
+    true
 }
 
 /// A state lock is abandoned when its owner process is gone. The mtime is
@@ -871,11 +975,11 @@ fn reclaim_stale_lock(lock: &std::path::Path) -> bool {
         return false;
     }
     let _ = std::fs::remove_dir_all(&graveyard);
-    std::fs::create_dir(lock).is_ok()
+    make_lock_dir(lock)
 }
 
 fn take_state_lock(lock: &std::path::Path) -> Result<LockGuard> {
-    if std::fs::create_dir(lock).is_ok() {
+    if make_lock_dir(lock) {
         stamp_lock_owner(lock);
         return Ok(LockGuard(lock.to_path_buf()));
     }
@@ -886,7 +990,7 @@ fn take_state_lock(lock: &std::path::Path) -> Result<LockGuard> {
     // Brief contention: wait for the holder instead of failing.
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(50));
-        if std::fs::create_dir(lock).is_ok() {
+        if make_lock_dir(lock) {
             stamp_lock_owner(lock);
             return Ok(LockGuard(lock.to_path_buf()));
         }
@@ -1010,13 +1114,17 @@ fn reclaim_drain_marker(marker: &std::path::Path) -> bool {
 /// False when one is already running. A marker whose holder died is reclaimed
 /// immediately; the mtime is only a second opinion for an unstamped marker.
 pub fn claim_drain_slot() -> bool {
-    let dir = state_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Ok(dir) = ensure_state_dir() else {
+        return false;
+    };
     let marker = dir.join("drain.lock");
     let take = || {
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&marker)
             .is_ok()
     };
@@ -1073,8 +1181,7 @@ pub fn spawn_drain() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let dir = state_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = ensure_state_dir();
     // A live drainer already holds the marker, so this wake-up is redundant:
     // that drainer will pick up whatever woke us.
     if drain_marker_held() {
@@ -1223,8 +1330,9 @@ impl Drop for WorkerClaim {
 /// SIGKILL, power loss) or is not a worker for this entry (PID reuse) is
 /// reclaimed. Reclaim goes through a rename so two rivals cannot both win.
 pub fn claim_worker(id: &str) -> Result<Option<WorkerClaim>> {
-    let dir = state_dir().join("workers");
+    let dir = ensure_state_dir()?.join("workers");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    tighten_dir(&dir);
     let path = dir.join(format!("{id}.lock"));
     let own = std::process::id();
     static TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1236,7 +1344,7 @@ pub fn claim_worker(id: &str) -> Result<Option<WorkerClaim>> {
             ".{id}.lock.tmp-{own}-{}",
             TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::write(&tmp, format!("{own}\n"))
+        write_private(&tmp, format!("{own}\n").as_bytes())
             .with_context(|| format!("write {}", tmp.display()))?;
         let linked = std::fs::hard_link(&tmp, &path);
         let _ = std::fs::remove_file(&tmp);

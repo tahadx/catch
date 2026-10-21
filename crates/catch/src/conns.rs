@@ -108,10 +108,11 @@ fn load() -> Registry {
 }
 
 fn save(reg: &Registry) -> Result<()> {
-    let dir = crate::state::state_dir();
+    let dir = crate::state::ensure_state_dir()?;
     let tmp = dir.join("connections.json.tmp");
     let path = registry_path();
-    std::fs::write(&tmp, serde_json::to_string(reg)?)
+    let body = serde_json::to_string(reg)?;
+    crate::state::write_private(&tmp, body.as_bytes())
         .map_err(|e| anyhow::anyhow!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| anyhow::anyhow!("rename {}: {e}", path.display()))?;
     Ok(())

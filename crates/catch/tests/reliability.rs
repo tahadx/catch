@@ -34,6 +34,16 @@ fn run_args(sb: &Sandbox, args: &[&str], limit: Duration) -> std::process::Outpu
     run_ok(cmd, limit)
 }
 
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
 #[test]
 fn header_connection_failure_then_retry_succeeds() {
     let sb = Sandbox::new("header-retry");
@@ -782,6 +792,51 @@ fn malformed_state_is_quarantined_and_the_cli_still_works() {
     );
     assert!(sb.row_for_url("http://127.0.0.1:9/recovered.bin").is_some());
     let _ = std::fs::remove_file(sb.state_path());
+}
+
+/// State carries full download URLs (signed query strings) and the saved
+/// history, and its parent directory is traversable by other local users.
+/// An install built before the fix left the directory at 0755 and every file
+/// at 0644; the next command must heal it, including old quarantine copies,
+/// so no other account can read the links or the browsing history.
+#[test]
+fn state_and_history_files_are_owner_only() {
+    let sb = Sandbox::new("state-perms");
+    let dir = sb.state_path().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, body) in [
+        ("state.json", "{}"),
+        ("state.json.bad-1", "{}"),
+        ("connections.json", "{}"),
+    ] {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        chmod(&path, 0o644);
+    }
+    chmod(&dir, 0o755);
+
+    run_args(
+        &sb,
+        &["enqueue", "http://127.0.0.1:9/private.bin"],
+        Duration::from_secs(10),
+    );
+
+    assert_eq!(mode(&dir), 0o700, "state directory");
+    assert_eq!(mode(&sb.state_path()), 0o600, "state.json");
+    assert_eq!(
+        mode(&dir.join("state.json.bad-1")),
+        0o600,
+        "quarantined copy"
+    );
+    assert_eq!(
+        mode(&dir.join("connections.json")),
+        0o600,
+        "connections registry"
+    );
+    assert!(
+        !dir.join("state.json.tmp").exists(),
+        "the private temp is renamed away, never left behind"
+    );
 }
 
 #[test]
