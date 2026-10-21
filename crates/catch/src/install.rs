@@ -38,9 +38,11 @@ const FIREFOX_DIRS: &[&str] = &[
     ".var/app/io.gitlab.librewolf-community/.librewolf",
 ];
 
+// Chrome-branded builds ignore --load-extension since Chrome 137, so a
+// chrome-flags.conf entry would be dead weight; those users load the
+// unpacked copy once (see README).
 const FLAG_FILES: &[&str] = &[
     "chromium-flags.conf",
-    "chrome-flags.conf",
     "brave-flags.conf",
     "brave-origin-flags.conf",
     "microsoft-edge-flags.conf",

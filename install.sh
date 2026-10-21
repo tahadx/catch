@@ -41,7 +41,8 @@ for spec in \
     echo "  $name ($bin): host manifest installed"
   fi
 done
-echo "  Chromium family: extension autoloads via browser flags (restart the browser once)."
+echo "  Chromium, Brave, Edge: extension autoloads via browser flags (restart the browser once)."
+echo "  Google Chrome (137+): load unpacked once from $HERE/extensions/chromium-catch"
 echo "  Firefox family: load the extension once per browser (temporary add-on):"
 echo "    about:debugging#/runtime/this-firefox -> Load Temporary Add-on"
 echo "    -> pick any file in $HERE/extensions/firefox-catch"

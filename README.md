@@ -71,7 +71,6 @@ a flags file in `~/.config`:
 | Browser | Flags file |
 | --- | --- |
 | Chromium | `chromium-flags.conf` |
-| Chrome stable | `chrome-flags.conf` |
 | Brave stable | `brave-flags.conf` |
 | Brave Origin | `brave-origin-flags.conf` |
 | Edge stable | `microsoft-edge-flags.conf` |
@@ -80,9 +79,10 @@ a flags file in `~/.config`:
 Restart the browser once after installing. Open the extensions page and
 confirm Catch is listed.
 
-Chrome beta, Chrome unstable, Brave beta, and Brave nightly get a host
-file and are not in the flags table, so they do not autoload. Load the
-extension by hand for those. Use the same steps when a flags file was
+Google Chrome ignores `--load-extension` since Chrome 137, so Chrome
+stable, beta, and unstable never autoload. Brave beta and Brave nightly
+are not in the flags table either. Those builds get a host file, but the
+extension is a one-time manual load. Use these steps when a flags file was
 missing and the Catch menu never appears:
 
 1. Open `chrome://extensions`, `brave://extensions`, or `edge://extensions`.
@@ -121,9 +121,10 @@ catch install-extension
 ```
 
 `install-hosts` rewrites every host file in the lists above.
-`install-extension` updates the Chromium flags files that already exist.
-Restart that Chromium-family browser. Firefox-family still needs the
-temporary add-on after every launch.
+`install-extension` updates the Chromium, Brave, and Edge flags files that
+already exist. Restart that browser. Google Chrome ignores the flag, so
+load it unpacked; Firefox-family still needs the temporary add-on after
+every launch.
 
 ### Other browsers
 

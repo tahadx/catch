@@ -2,8 +2,8 @@
 # Self-configure a Catch install: link backend binaries and write browser
 # host manifests. Idempotent and quiet when everything is already in place.
 # Runs automatically from the shell plugin on startup; safe to run by hand.
-# (Browser extensions themselves cannot self-install — vendor rule — so
-# loading them stays a one-time manual step. See README.)
+# (Chromium, Brave, and Edge pick the extension up from their flags files;
+# Chrome and the Firefox family need a one-time manual load. See README.)
 set -euo pipefail
 
 # We are the self-configure step. Children must not ask to self-configure
