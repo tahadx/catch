@@ -199,6 +199,53 @@ enum Command {
     NativeHost {},
 }
 
+/// Read one newline-terminated URL from stdin.
+///
+/// The panel hands over links this way instead of argv: `/proc/PID/cmdline`
+/// is readable by every local user, and a signed URL keeps its token in the
+/// query string. `replace` and `add` stay alive for the whole transfer, so a
+/// token in argv was exposed for minutes. Reading one line (not to EOF) means
+/// the writer never has to close the pipe.
+fn url_from_stdin() -> Result<String> {
+    use std::io::BufRead as _;
+
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("read URL from stdin")?;
+    let url = line.trim().to_string();
+    if url.is_empty() {
+        anyhow::bail!("stdin held no URL");
+    }
+    Ok(url)
+}
+
+/// A URL argument of `-` means "read it from stdin"; anything else is used
+/// as given, so interactive use is unchanged.
+fn url_argument(value: &str) -> Result<String> {
+    if value == "-" {
+        url_from_stdin()
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+/// Batch form for `enqueue`: `-` reads one line of whitespace-separated URLs
+/// (a URL cannot contain whitespace), keeping a whole browser hand-off out of
+/// argv while still queueing it in one call.
+fn url_arguments(values: &[String]) -> Result<Vec<String>> {
+    if values.len() != 1 || values[0] != "-" {
+        return Ok(values.to_vec());
+    }
+    let line = url_from_stdin()?;
+    let urls: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+    if urls.is_empty() {
+        anyhow::bail!("stdin held no URL");
+    }
+    Ok(urls)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse first: `--version` and `--help` must not touch the user's home,
@@ -214,6 +261,7 @@ async fn main() -> Result<()> {
             audio,
             sha256,
         } => {
+            let url = url_argument(&url)?;
             if let Some(hex) = &sha256 {
                 validate_sha256(hex)?;
             }
@@ -235,6 +283,7 @@ async fn main() -> Result<()> {
             again,
             sha256,
         } => {
+            let urls = url_arguments(&urls)?;
             if let Some(hex) = &sha256 {
                 validate_sha256(hex)?;
             }
@@ -319,6 +368,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Copy { url, title } => {
+            let url = url_argument(&url)?;
             // A second copy of a caught link. The title is applied to the
             // *copy* (file name included) once it lands — the caught file
             // and its row are left exactly as they were.
@@ -431,6 +481,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Refresh { id, url, force } => {
+            let url = url_argument(&url)?;
             let outcome = refresh_one(&id, &url, force).await?;
             println!("{outcome}");
             state::spawn_drain();
@@ -510,10 +561,12 @@ async fn main() -> Result<()> {
             println!("queued {fresh} link(s) from clipboard");
         }
         Command::Rename { url, title } => {
+            let url = url_argument(&url)?;
             let raw = title.join(" ");
             println!("{}", rename_link(&url, &raw)?);
         }
         Command::Replace { url } => {
+            let url = url_argument(&url)?;
             // The destructive choice: fetch the link again and let the new
             // bytes take the place of the saved file (the old ones are
             // gone). Keyed by URL, not row id, so it still works after the
@@ -588,6 +641,7 @@ async fn main() -> Result<()> {
             println!("replaced -> {}", dest.display());
         }
         Command::Dismiss { url } => {
+            let url = url_argument(&url)?;
             clear_one_ask(&url)?;
             println!("dismissed");
         }

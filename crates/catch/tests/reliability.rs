@@ -6,6 +6,7 @@ mod support;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -837,6 +838,35 @@ fn state_and_history_files_are_owner_only() {
         !dir.join("state.json.tmp").exists(),
         "the private temp is renamed away, never left behind"
     );
+}
+
+/// A signed link's token must never sit in a child's argv: /proc/<pid>/cmdline
+/// is world-readable, and `replace`/`add` keep that child alive for the whole
+/// transfer. `-` reads the URL from stdin instead, and a batch arrives as one
+/// whitespace-separated line so a browser hand-off is still one enqueue call.
+#[test]
+fn urls_arrive_on_stdin_instead_of_argv() {
+    let sb = Sandbox::new("stdin-urls");
+    let mut cmd = sb.cmd();
+    cmd.args(["enqueue", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"http://127.0.0.1:9/one.bin http://127.0.0.1:9/two.bin\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(sb.row_for_url("http://127.0.0.1:9/one.bin").is_some());
+    assert!(sb.row_for_url("http://127.0.0.1:9/two.bin").is_some());
 }
 
 #[test]

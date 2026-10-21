@@ -121,10 +121,11 @@ Panel {
     // hand-off does; the drainer starts as many as the parallel setting
     // allows and keeps the rest queued.
     root.runCatch(
-      ["enqueue"].concat(links),
+      ["enqueue", "-"],
       links.length === 1
         ? "Could not catch that link."
-        : "Could not queue those " + links.length + " links."
+        : "Could not queue those " + links.length + " links.",
+      links.join(" ")
     )
   }
 
@@ -216,7 +217,7 @@ Panel {
     root.closeConflict()
     // Enqueue a fresh, independent download (nonblocking) instead of the
     // blocking `copy` command, so the panel stays responsive.
-    root.runCatch(["enqueue", url, "--again"], "Could not save another copy.")
+    root.runCatch(["enqueue", "-", "--again"], "Could not save another copy.", url)
   }
 
   // The question is answered without a transfer: open, or cancel.
@@ -224,7 +225,7 @@ Panel {
     var url = root.conflictUrl
     if (url !== "") root.ignoringAsk = url
     root.closeConflict()
-    if (url !== "") root.runCatch(["dismiss", url], "Could not dismiss that question.")
+    if (url !== "") root.runCatch(["dismiss", "-"], "Could not dismiss that question.", url)
   }
 
   // replaceConflict: the only destructive choice. Fetch the link again and
@@ -573,8 +574,12 @@ Panel {
   property var rowQueue: []
   property string rowComplaint: ""
 
-  function runCatch(args, complaint) {
-    root.cmdQueue = root.cmdQueue.concat([{ argv: ["catch"].concat(args), complaint: complaint }])
+  // A URL goes over stdin, never argv: /proc/<pid>/cmdline is readable by
+  // every local user, and a signed link keeps its token in the query string.
+  // The backend reads one line for a single URL and a whitespace-separated
+  // line for a batch, so the pipe never has to be closed.
+  function runCatch(args, complaint, stdinText) {
+    root.cmdQueue = root.cmdQueue.concat([{ argv: ["catch"].concat(args), complaint: complaint, stdin: stdinText || "" }])
     root.nextCmd()
   }
 
@@ -583,12 +588,13 @@ Panel {
     var next = root.cmdQueue[0]
     root.cmdQueue = root.cmdQueue.slice(1)
     root.cmdComplaint = next.complaint
+    cmdRunner.pendingInput = next.stdin
     cmdRunner.command = next.argv
     cmdRunner.running = true
   }
 
-  function runRow(args, complaint) {
-    root.rowQueue = root.rowQueue.concat([{ argv: ["catch"].concat(args), complaint: complaint }])
+  function runRow(args, complaint, stdinText) {
+    root.rowQueue = root.rowQueue.concat([{ argv: ["catch"].concat(args), complaint: complaint, stdin: stdinText || "" }])
     root.nextRow()
   }
 
@@ -597,6 +603,7 @@ Panel {
     var next = root.rowQueue[0]
     root.rowQueue = root.rowQueue.slice(1)
     root.rowComplaint = next.complaint
+    rowRunner.pendingInput = next.stdin
     rowRunner.command = next.argv
     rowRunner.running = true
   }
@@ -638,7 +645,7 @@ Panel {
 
   function refreshEntry(id, url) {
     root.hold()
-    root.runRow(["refresh", id, url], "Could not refresh that address.")
+    root.runRow(["refresh", id, "-"], "Could not refresh that address.", url)
   }
 
   function resumable(d) {
@@ -1027,7 +1034,7 @@ Panel {
     root.ignoringAsk = url
     root.replacePending = ""
     if (url === "") return
-    root.runCatch(["replace", url], "Could not replace that download.")
+    root.runCatch(["replace", "-"], "Could not replace that download.", url)
   }
 
   function cancelReplace() {
@@ -1265,6 +1272,14 @@ Panel {
   Process {
     id: cmdRunner
     running: false
+    stdinEnabled: true
+    property string pendingInput: ""
+    onStarted: {
+      if (pendingInput !== "") {
+        write(pendingInput)
+        pendingInput = ""
+      }
+    }
     onExited: function (code) {
       if (code !== 0) {
         root.actionError = root.cmdComplaint
@@ -1280,6 +1295,14 @@ Panel {
   Process {
     id: rowRunner
     running: false
+    stdinEnabled: true
+    property string pendingInput: ""
+    onStarted: {
+      if (pendingInput !== "") {
+        write(pendingInput)
+        pendingInput = ""
+      }
+    }
     onExited: function (code) {
       if (code !== 0) {
         root.actionError = root.rowComplaint
