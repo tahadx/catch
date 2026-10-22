@@ -5,8 +5,9 @@ changelog, and publishes the release.
 
 **The tag is the only version source.** Nothing carries a hand-kept version:
 `manifest.json` (what Omarchy shows for the plugin), the crate version (what
-`catch --version` and `catch status` report) and the release assets are all
-derived from the tag by `bin/stamp-version`.
+`catch --version` and `catch status` report), the browser extensions' version
+(what `chrome://extensions` and `about:addons` show) and the release assets are
+all derived from the tag by `bin/stamp-version`.
 
 ## Make a release
 
@@ -16,7 +17,7 @@ derived from the tag by `bin/stamp-version`.
    cannot resolve it yet.
 
    ```sh
-   bin/stamp-version 0.1.0    # manifest.json + the crate
+   bin/stamp-version 0.1.0    # manifest.json + the crate + both extensions
    bin/refresh-dist           # the binary now reports that version
    git commit -am "Release 0.1.0"
    ```
@@ -35,11 +36,12 @@ derived from the tag by `bin/stamp-version`.
 
 ## What the workflow does
 
-- Stamps the tag's version into `manifest.json` and the crate, then **fails
-  if the tag did not already carry it**. `omarchy plugin add` installs from
-  git and reads `manifest.json`, so a tag whose files disagree would report
-  the wrong version to everyone who installs it. To fix a tag that trips
-  this, run `bin/stamp-version && bin/refresh-dist`, commit, and move the tag.
+- Stamps the tag's version into `manifest.json`, the crate, and both browser
+  extensions, then **fails if the tag did not already carry it**. `omarchy
+  plugin add` installs from git and reads `manifest.json`, so a tag whose files
+  disagree would report the wrong version to everyone who installs it. To fix a
+  tag that trips this, run `bin/stamp-version && bin/refresh-dist`, commit, and
+  move the tag.
 - Builds `cargo build --release -p catch`. Refuses to publish a missing or
   non-executable binary, or one whose `catch status` reports a version other
   than the tag.

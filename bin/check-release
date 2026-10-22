@@ -53,6 +53,34 @@ crate_version = str(crate.get("package", {}).get("version", ""))
 if crate_version != version:
     fail(f"crate version [{crate_version}] != manifest version [{version}]")
 
+# Both browser extensions must report the release version in the browser's
+# extensions page. Chrome accepts only numeric components (max four), and a
+# `version_name` would override the displayed version, so neither is allowed.
+ext_version = version.split("+", 1)[0]
+for rel in (
+    "extensions/chromium-catch/manifest.json",
+    "extensions/firefox-catch/manifest.json",
+):
+    path = os.path.join(root, rel)
+    try:
+        with open(path, encoding="utf-8") as f:
+            ext = json.load(f)
+    except Exception as exc:  # noqa: BLE001 - report parse failure like the rest
+        fail(f"{rel} is not valid JSON: {exc}")
+        continue
+    got = str(ext.get("version", ""))
+    if got != ext_version:
+        fail(f"{rel} version [{got}] != plugin version [{ext_version}]")
+    if not re.fullmatch(r"[0-9]+(\.[0-9]+){0,3}", got) or any(
+        int(part) > 65535 for part in got.split(".")
+    ):
+        fail(f"{rel} version [{got}] is not a valid Chrome extension version")
+    if ext.get("version_name"):
+        fail(
+            f"{rel} sets version_name [{ext['version_name']}]; "
+            "the browser would show that instead of the real version"
+        )
+
 machine = platform.machine()
 alias = {"amd64": "x86_64", "arm64": "aarch64", "armv7l": "arm"}
 machine = alias.get(machine, machine)

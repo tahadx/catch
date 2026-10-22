@@ -36,6 +36,24 @@ sed -i -E "s/(\"version\": \")[^\"]*(\")/\1$VERSION\2/" manifest.json
 # = "4", .. }`) are never touched.
 sed -i -E "0,/^version = \"[^\"]*\"/s//version = \"$VERSION\"/" crates/catch/Cargo.toml
 
+# Browser extensions show this version in chrome://extensions and about:addons.
+# Chrome only accepts up to four dot-separated integers, so build metadata
+# (0.1.0+4) is dropped. `version_name` overrides what Chrome displays, so a
+# manifest that still carries it is refused instead of silently showing the
+# wrong thing.
+EXT_VERSION="${VERSION%%+*}"
+for ext in extensions/chromium-catch/manifest.json extensions/firefox-catch/manifest.json; do
+  sed -i -E "s/(\"version\": \")[^\"]*(\")/\1$EXT_VERSION\2/" "$ext"
+  if grep -qF '"version_name"' "$ext"; then
+    echo "stamp-version: $ext carries version_name; remove it so the browser shows the real version" >&2
+    exit 1
+  fi
+  if ! grep -qF "\"version\": \"$EXT_VERSION\"" "$ext"; then
+    echo "stamp-version: $ext does not carry [$EXT_VERSION]" >&2
+    exit 1
+  fi
+done
+
 # A sed that quietly matched nothing looks exactly like a file that was
 # already correct, which would let the release check pass on a version that
 # was never stamped. So verify both files actually carry it. Fixed-string
@@ -53,3 +71,5 @@ fi
 echo "stamped version $VERSION"
 grep -m1 '"version"' manifest.json
 grep -m1 '^version = ' crates/catch/Cargo.toml
+grep -m1 '"version"' extensions/chromium-catch/manifest.json
+grep -m1 '"version"' extensions/firefox-catch/manifest.json

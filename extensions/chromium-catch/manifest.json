@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Catch",
-  "version": "0.1.18",
+  "version": "0.1.1",
   "description": "Send downloads to the native Catch download manager.",
   "permissions": [
     "activeTab",
@@ -39,6 +39,5 @@
   "background": {
     "service_worker": "background-3.js"
   },
-  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxsGoTf/SJW1SSewks04pIHuBN17zArYCvFSDcKdOfvFX2pmiXp838kpogRDbrecvWcuCU13SNFBx94Z0EVoryrBb1htE7qOtbabbi0cnDKkqndM4/YVwPQT31tlqF0MiiAEiFXGfO+ai74eycVc3hfa/QGraVZnwCLtQVAmulMnuBu1kpCXG3i2USUZtjUY7U1rA0GoPuDgjq9DSfa/FrtjkNcotmG7+gg/ze2OYh65MMohtGAHpAmdIxeiLdqjrL6T53eshkuyleNfAQkx9jACbVLAayUBugmW4berJrIbF6wWQ/IaaWU+/K9D7KeUnmCVpGnFYUJwyTXSqx1X+yQIDAQAB",
-  "version_name": "dev"
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxsGoTf/SJW1SSewks04pIHuBN17zArYCvFSDcKdOfvFX2pmiXp838kpogRDbrecvWcuCU13SNFBx94Z0EVoryrBb1htE7qOtbabbi0cnDKkqndM4/YVwPQT31tlqF0MiiAEiFXGfO+ai74eycVc3hfa/QGraVZnwCLtQVAmulMnuBu1kpCXG3i2USUZtjUY7U1rA0GoPuDgjq9DSfa/FrtjkNcotmG7+gg/ze2OYh65MMohtGAHpAmdIxeiLdqjrL6T53eshkuyleNfAQkx9jACbVLAayUBugmW4berJrIbF6wWQ/IaaWU+/K9D7KeUnmCVpGnFYUJwyTXSqx1X+yQIDAQAB"
 }
