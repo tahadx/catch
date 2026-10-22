@@ -408,7 +408,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
       }
       break;
     }
-    case "copy-page": copyUrl(pageUrl(tab)); sendUrl(pageUrl(tab), pageTitle(tab)); break;
+    case "copy-page": copyUrl(pageUrl(tab)); break;
   }
 });
 
