@@ -1636,12 +1636,15 @@ fn split_mark_outrun_by_the_last_chunk_still_commits() {
 #[test]
 fn segmented_pause_keeps_the_manifest_and_resume_finishes() {
     let sb = Sandbox::new("seg-pause");
-    let body = patterned(300_000, 77);
+    let body = patterned(4_000_000, 77);
     let served = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&served);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
     let server = Server::start({
         let body = body.clone();
         move |req, _n| {
+            record.lock().unwrap().push(req.clone());
             let n = count.fetch_add(1, Ordering::SeqCst);
             let mut reply = range_reply(&body, &req);
             // The first handful of full-size responses arrive in two halves
@@ -1701,6 +1704,34 @@ fn segmented_pause_keeps_the_manifest_and_resume_finishes() {
         "the part stays preallocated to the full length"
     );
 
+    // The pause must wait for the worker to flush and checkpoint before the
+    // transfer lock disappears. Read the durable manifest after that point.
+    let lock = sb
+        .state_home
+        .join("omarchy/catch/workers")
+        .join(format!("{id}.lock"));
+    wait_until(
+        "the paused worker to finish its checkpoint",
+        Duration::from_secs(10),
+        || !lock.exists(),
+    );
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(&meta).unwrap()).unwrap();
+    let segments = manifest["segments"].as_array().unwrap();
+    let partial: Vec<(u64, u64, u64)> = segments
+        .iter()
+        .filter_map(|s| {
+            let start = s["start"].as_u64()?;
+            let end = s["end"].as_u64()?;
+            let have = s["have"].as_u64().unwrap_or(0);
+            (have > 0).then_some((start, end, have))
+        })
+        .collect();
+    assert!(
+        !partial.is_empty(),
+        "a pause must record the bytes already downloaded: {manifest}"
+    );
+    let resumed_at = seen.lock().unwrap().len();
+
     // Resume: the manifest drives the same segment ranges and the same
     // segment connections, and the output must be byte-for-byte correct even
     // though the first run died mid-segment. `resume` wakes the drainer.
@@ -1716,6 +1747,23 @@ fn segmented_pause_keeps_the_manifest_and_resume_finishes() {
         "the background drainer must finish the segmented resume"
     );
     assert_eq!(std::fs::read(sb.base().join("file.bin")).unwrap(), body);
+
+    // The resume must start at each checkpointed frontier, not at the start
+    // of the segment. This is the regression that made every pause refetch
+    // the whole partial file.
+    let requests = seen.lock().unwrap();
+    let resumed = &requests[resumed_at..];
+    for &(start, _end, have) in &partial {
+        let already_had = start + have;
+        let refetched = resumed.iter().find_map(|r| {
+            let at = r.range_start()?;
+            (at >= start && at < already_had).then_some(at)
+        });
+        assert!(
+            refetched.is_none(),
+            "resume re-fetched bytes before the checkpoint at {already_had}: {refetched:?}\nrequests: {resumed:?}"
+        );
+    }
     assert!(!part.exists() && !meta.exists());
 }
 

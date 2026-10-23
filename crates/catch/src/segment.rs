@@ -33,6 +33,12 @@ pub struct SegmentRange {
     pub end: u64, // inclusive
     #[serde(default)]
     pub done: bool,
+    /// Bytes at the start of this range that are already on disk. For an
+    /// unfinished segment this is the resume point; writes are sequential
+    /// from `start`, so the coverage is always a prefix. Kept separate from
+    /// `done` so a pause does not throw away a partially downloaded range.
+    #[serde(default)]
+    pub have: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +58,17 @@ pub struct SegmentManifest {
 }
 
 pub const MANIFEST_VERSION: u32 = 1;
+
+/// Size of each segment task's userspace write buffer. A checkpoint may only
+/// advance `have` past bytes that reached the file, so an active task's
+/// frontier is held back by at most this much.
+const SEGMENT_WRITE_BUFFER: u64 = 256 * 1024;
+
+/// How often partial segment progress is fsynced and written to the
+/// manifest. This is deliberately slower than the UI progress flush: each
+/// checkpoint must sync the part file before the manifest can name a resume
+/// offset, and doing that four times a second would be wasteful.
+const SEGMENT_CHECKPOINT_EVERY: Duration = Duration::from_secs(5);
 
 pub fn manifest_path(part: &Path) -> PathBuf {
     let mut s = part.as_os_str().to_os_string();
@@ -162,6 +179,9 @@ fn validate_coverage(segs: &[SegmentRange], total: u64) -> bool {
         if s.end < s.start {
             return false;
         }
+        if s.have > s.end - s.start + 1 {
+            return false;
+        }
         if let Some(pe) = prev_end {
             if pe + 1 != s.start {
                 return false;
@@ -270,6 +290,7 @@ pub fn segment_ranges(total: u64, n: usize) -> Vec<SegmentRange> {
             start: pos,
             end,
             done: false,
+            have: 0,
         });
         pos = end + 1;
     }
@@ -358,6 +379,25 @@ fn read_directive(id: &str) -> Directive {
     }
 }
 
+/// Normalize the manifest into the in-memory resume state. A segment whose
+/// prefix covers its whole range is complete even if a crash happened after
+/// the data checkpoint but before the `done` flag was written.
+fn resume_state(manifest: &mut SegmentManifest) -> (Vec<bool>, Vec<u64>) {
+    manifest
+        .segments
+        .iter_mut()
+        .map(|s| {
+            let len = s.end - s.start + 1;
+            let have = if s.done { len } else { s.have.min(len) };
+            if have == len {
+                s.done = true;
+            }
+            s.have = have;
+            (s.done, have)
+        })
+        .unzip()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_segmented(
     id: &str,
@@ -367,17 +407,15 @@ pub async fn run_segmented(
     total: u64,
     etag: String,
     last_modified: String,
-    manifest: SegmentManifest,
+    mut manifest: SegmentManifest,
     share: usize,
     limiter: Option<Arc<crate::throttle::RateLimiter>>,
 ) -> Result<SegmentedResult> {
     let n = manifest.segments.len();
-    let written: Arc<Vec<AtomicU64>> = Arc::new((0..n).map(|_| AtomicU64::new(0)).collect());
-    let done_flags: Arc<Vec<AtomicBool>> = Arc::new(
-        (0..n)
-            .map(|i| AtomicBool::new(manifest.segments[i].done))
-            .collect(),
-    );
+    let (done, have) = resume_state(&mut manifest);
+    let written: Arc<Vec<AtomicU64>> = Arc::new(have.into_iter().map(AtomicU64::new).collect());
+    let done_flags: Arc<Vec<AtomicBool>> =
+        Arc::new(done.into_iter().map(AtomicBool::new).collect());
     // A split instruction per segment: the absolute offset a running task
     // should stop at so its tail becomes fresh work. u64::MAX = no split.
     let split_at: Arc<Vec<AtomicU64>> =
@@ -395,7 +433,7 @@ pub async fn run_segmented(
         .filter(|(i, _)| !done_flags[*i].load(Ordering::Relaxed))
         .map(|(i, s)| Work {
             seg: i,
-            start: s.start,
+            start: s.start + written[i].load(Ordering::Relaxed),
             end: s.end,
         })
         .collect();
@@ -411,6 +449,7 @@ pub async fn run_segmented(
     let mut first_fallback: Option<String> = None;
 
     let mut last_flush = Instant::now();
+    let mut last_checkpoint = Instant::now();
     let mut last_order = Instant::now();
 
     loop {
@@ -567,8 +606,11 @@ pub async fn run_segmented(
 
         // cancel handling
         if cancel.load(Ordering::Relaxed) != 0 {
-            joinset.abort_all();
-            while joinset.join_next().await.is_some() {}
+            // Let tasks notice the cancel and flush their BufWriter before
+            // recording the frontier. Aborting immediately loses the last
+            // buffered bytes while `written` has already counted them.
+            drain_segment_tasks(&mut joinset).await;
+            checkpoint_progress(part, &manifest, &done_flags, &written).await;
             flush_progress(
                 id,
                 total,
@@ -604,6 +646,12 @@ pub async fn run_segmented(
             )
             .await;
         }
+
+        // periodic durable checkpoint
+        if last_checkpoint.elapsed() >= SEGMENT_CHECKPOINT_EVERY {
+            last_checkpoint = Instant::now();
+            checkpoint_progress(part, &manifest, &done_flags, &written).await;
+        }
     }
 
     // all done: verify
@@ -630,6 +678,101 @@ pub async fn run_segmented(
     })
 }
 
+async fn drain_segment_tasks(joinset: &mut tokio::task::JoinSet<Result<TaskEnd, SegError>>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !joinset.is_empty() {
+        match tokio::time::timeout_at(deadline, joinset.join_next()).await {
+            // Tasks that finish while stopping still flush their buffer in
+            // `run_one_segment`; their result is intentionally discarded.
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                joinset.abort_all();
+                while joinset.join_next().await.is_some() {}
+                return;
+            }
+        }
+    }
+}
+
+/// Make the part file durable, then record each segment's resume point in
+/// the manifest. The order matters: a resume point must never name bytes
+/// that are still only in a userspace buffer or in the page cache.
+///
+/// The recorded frontier is held back by one write buffer. A task counts
+/// bytes in `written` as soon as they enter its BufWriter, and a checkpoint
+/// has no way to force that buffer into the file without touching the task
+/// itself. Holding back the last buffer is cheap (at most 256 KiB per
+/// segment per pause) and keeps the manifest from naming bytes that a crash
+/// could still lose.
+async fn checkpoint_progress(
+    part: &Path,
+    manifest: &Arc<Mutex<SegmentManifest>>,
+    done_flags: &Arc<Vec<AtomicBool>>,
+    written: &Arc<Vec<AtomicU64>>,
+) {
+    let n = done_flags.len();
+    let mut frontiers = Vec::with_capacity(n);
+    {
+        let m = manifest.lock().unwrap();
+        for (i, s) in m.segments.iter().enumerate() {
+            let len = s.end - s.start + 1;
+            if done_flags[i].load(Ordering::Relaxed) {
+                frontiers.push(len);
+            } else {
+                let frontier = written[i].load(Ordering::Relaxed).min(len);
+                frontiers.push(frontier.saturating_sub(SEGMENT_WRITE_BUFFER));
+            }
+        }
+    }
+
+    match std::fs::OpenOptions::new().write(true).open(part) {
+        Ok(f) => {
+            if let Err(e) = f.sync_data() {
+                eprintln!("catch: checkpoint {}: {e}", part.display());
+                return;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!("catch: checkpoint {}: {e}", part.display());
+            return;
+        }
+    }
+
+    let mut m = manifest.lock().unwrap();
+    let mut next = m.clone();
+    let mut changed = false;
+    for (i, s) in next.segments.iter_mut().enumerate() {
+        let len = s.end - s.start + 1;
+        if done_flags[i].load(Ordering::Relaxed) {
+            if !s.done {
+                s.done = true;
+                changed = true;
+            }
+            if s.have != len {
+                s.have = len;
+                changed = true;
+            }
+        } else {
+            let frontier = frontiers[i].max(s.have).min(len);
+            if s.have != frontier {
+                s.have = frontier;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        next.updated_at = now_secs();
+        // Publish the new resume points only if the manifest write succeeded;
+        // otherwise keep the old, still-valid frontier in memory.
+        match save_manifest_atomic(part, &next) {
+            Ok(()) => *m = next,
+            Err(e) => eprintln!("catch: checkpoint manifest {}: {e:#}", part.display()),
+        }
+    }
+}
+
 async fn flush_progress(
     id: &str,
     total: u64,
@@ -639,13 +782,14 @@ async fn flush_progress(
     limiter: Option<&crate::throttle::RateLimiter>,
 ) {
     let n = done_flags.len();
+    let m = manifest.lock().unwrap();
     let mut done_bytes: u64 = 0;
     for i in 0..n {
         if done_flags[i].load(Ordering::Relaxed) {
-            let m = manifest.lock().unwrap();
             done_bytes += m.segments[i].end - m.segments[i].start + 1;
         }
     }
+    drop(m);
     let mut live: u64 = 0;
     for i in 0..n {
         if !done_flags[i].load(Ordering::Relaxed) {
@@ -666,7 +810,14 @@ async fn flush_progress(
             .count()
             .max(1);
         if let Some(d) = state.downloads.iter_mut().find(|d| d.id == id) {
-            if d.status == Status::Downloading {
+            // A pause changes the row before the worker gets its final
+            // flush. The worker still owns the row and its size is the
+            // truthful one, so update a paused row too instead of leaving
+            // the last 250 ms of progress (or a whole restarted attempt)
+            // on screen.
+            if d.pid == std::process::id()
+                && matches!(d.status, Status::Downloading | Status::Paused)
+            {
                 d.bytes = bytes;
                 d.total = total;
                 let mut obj = serde_json::Map::new();
@@ -988,7 +1139,8 @@ async fn run_one_segment(
             {
                 return Err(SegError::Fatal(format!("seek {}", part.display())));
             }
-            let mut buf = tokio::io::BufWriter::with_capacity(256 * 1024, &mut file);
+            let mut buf =
+                tokio::io::BufWriter::with_capacity(SEGMENT_WRITE_BUFFER as usize, &mut file);
             let mut stream = resp.bytes_stream();
             let remaining = seg_len - in_seg;
             let body_result = stream_one_segment_body(
@@ -1098,6 +1250,7 @@ async fn run_one_segment(
         let mut m = manifest.lock().unwrap();
         if i < m.segments.len() {
             m.segments[i].done = true;
+            m.segments[i].have = seg.end - seg.start + 1;
         }
         m.updated_at = now_secs();
         if let Err(e) = save_manifest_atomic(&part, &m) {
@@ -1159,7 +1312,8 @@ mod tests {
             SegmentRange {
                 start: 0,
                 end: 3,
-                done: false
+                done: false,
+                have: 0
             }
         );
         assert_eq!(
@@ -1167,7 +1321,8 @@ mod tests {
             SegmentRange {
                 start: 4,
                 end: 6,
-                done: false
+                done: false,
+                have: 0
             }
         );
         assert_eq!(
@@ -1175,7 +1330,8 @@ mod tests {
             SegmentRange {
                 start: 7,
                 end: 9,
-                done: false
+                done: false,
+                have: 0
             }
         );
     }
@@ -1187,11 +1343,13 @@ mod tests {
                 start: 0,
                 end: 4,
                 done: false,
+                have: 0,
             },
             SegmentRange {
                 start: 5,
                 end: 9,
                 done: false,
+                have: 0,
             },
         ];
         assert!(validate_coverage(&good, 10));
@@ -1200,11 +1358,13 @@ mod tests {
                 start: 0,
                 end: 3,
                 done: false,
+                have: 0,
             },
             SegmentRange {
                 start: 5,
                 end: 9,
                 done: false,
+                have: 0,
             },
         ];
         assert!(!validate_coverage(&gap, 10));
@@ -1213,20 +1373,53 @@ mod tests {
                 start: 0,
                 end: 5,
                 done: false,
+                have: 0,
             },
             SegmentRange {
                 start: 5,
                 end: 9,
                 done: false,
+                have: 0,
             },
         ];
         assert!(!validate_coverage(&overlap, 10));
+        let mut oversized = good.clone();
+        oversized[0].have = 6; // range is 5 bytes
+        assert!(!validate_coverage(&oversized, 10));
         let wrong_total = vec![SegmentRange {
             start: 0,
             end: 9,
             done: false,
+            have: 0,
         }];
         assert!(!validate_coverage(&wrong_total, 11));
+    }
+
+    #[test]
+    fn resume_state_keeps_partial_and_completed_prefixes() {
+        let mut m = SegmentManifest {
+            version: MANIFEST_VERSION,
+            url: "https://x.test/f".into(),
+            total: 100,
+            etag: String::new(),
+            last_modified: String::new(),
+            segments: segment_ranges(100, 4),
+            created_at: 1,
+            updated_at: 1,
+        };
+        m.segments[0].have = 10;
+        m.segments[1].done = true;
+        m.segments[2].have = 25; // all bytes durable, commit flag lost
+        let (done, have) = resume_state(&mut m);
+        assert_eq!(have[0], 10);
+        assert!(!done[0]);
+        assert_eq!(have[1], 25);
+        assert!(done[1]);
+        assert_eq!(have[2], 25);
+        assert!(done[2], "a full durable prefix is a complete segment");
+        assert_eq!(have[3], 0);
+        assert!(!done[3]);
+        assert!(m.segments[2].done);
     }
 
     #[test]
@@ -1242,7 +1435,11 @@ mod tests {
             total: 100,
             etag: "\"v1\"".into(),
             last_modified: String::new(),
-            segments: segment_ranges(100, 4),
+            segments: {
+                let mut s = segment_ranges(100, 4);
+                s[1].have = 7;
+                s
+            },
             created_at: 1,
             updated_at: 1,
         };
@@ -1250,6 +1447,7 @@ mod tests {
         let loaded = load_manifest(&part, "https://x.test/f").unwrap().unwrap();
         assert_eq!(loaded.total, 100);
         assert_eq!(loaded.segments.len(), 4);
+        assert_eq!(loaded.segments[1].have, 7);
         assert!(manifest_path(&part).exists());
         // corrupt url → recovered (both deleted)
         std::fs::write(&part, vec![0u8; 100]).unwrap();

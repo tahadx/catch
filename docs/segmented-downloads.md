@@ -42,10 +42,12 @@ Bytes from two different representations are never mixed.
 
 ## Resume and recovery
 
-A sidecar manifest named `<file>.<id>.part.meta` records which ranges are
-durably committed. A range is committed only after its bytes are written and
-synchronized. After an interruption or a restart, completed ranges are reused
-and only the missing ones are fetched again.
+A sidecar manifest named `<file>.<id>.part.meta` records how much of each range
+is durably on disk and which ranges are complete. Progress inside an unfinished
+range is checkpointed every few seconds and again when the transfer is paused
+or stopped. After an interruption or a restart, Catch resumes each range at its
+last committed byte and only fetches what is still missing; pausing does not
+send already-downloaded bytes again.
 
 An existing partial file is never mistaken for a segmented one:
 
