@@ -77,3 +77,9 @@ else
 fi
 
 echo "Done. Left-click the bar icon (or Super+D) to open Catch."
+echo
+echo "To remove Catch later, run this before removing the plugin:"
+echo "  $HERE/bin/uninstall"
+echo "  omarchy plugin remove io.github.tahadx.catch"
+echo "Setup → Remove Plugin deletes a git checkout without running that cleanup."
+echo "If you remove it first, run: ~/.local/bin/catch-uninstall"

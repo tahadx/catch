@@ -58,12 +58,30 @@ DOWNLOAD="$XDG_DOWNLOAD_DIR/catch/user-file.bin"
 printf '%s\n' '{"version":1,"downloads":[],"saved":{},"asks":[]}' >"$STATE"
 printf 'user data' >"$DOWNLOAD"
 
+# Two flags-file shapes: one shared with Omarchy, one containing only Catch.
+# Cleanup must preserve the Omarchy entry and drop the now-empty line.
+CATCH_EXT="$REPO/extensions/chromium-catch"
+OMARCHY_EXT="/usr/share/omarchy/default/chromium/extensions/copy-url"
+BRAVE_FLAGS="$XDG_CONFIG_HOME/brave-flags.conf"
+CHROMIUM_FLAGS="$XDG_CONFIG_HOME/chromium-flags.conf"
+printf '%s\n' "--load-extension=$OMARCHY_EXT" >"$BRAVE_FLAGS"
+printf '%s\n' "--load-extension=$CATCH_EXT" >"$CHROMIUM_FLAGS"
+
 "$REPO/install.sh" --yes >"$TEST_ROOT/install-1.log"
 
 assert_file "$HOME/.local/bin/catch"
 assert_file "$HOME/.local/bin/catch-host"
+assert_file "$HOME/.local/bin/catch-uninstall"
 [[ -L "$HOME/.local/bin/catch" ]] || fail "catch is not a symlink"
 [[ -L "$HOME/.local/bin/catch-host" ]] || fail "catch-host is not a symlink"
+[[ ! -L "$HOME/.local/bin/catch-uninstall" ]] \
+  || fail "cleanup helper is a symlink into the plugin tree"
+cmp -s -- "$REPO/bin/uninstall" "$HOME/.local/bin/catch-uninstall" \
+  || fail "cleanup helper is not an exact copy"
+grep -qF -- "$OMARCHY_EXT" "$BRAVE_FLAGS" \
+  || fail "installer removed the Omarchy extension entry"
+grep -qF -- 'chromium-catch' "$BRAVE_FLAGS" \
+  || fail "installer did not register Catch in the Brave flags file"
 assert_file "$HOME/.config/chromium/NativeMessagingHosts/io.github.tahadx.catch.json"
 assert_file "$HOME/.mozilla/native-messaging-hosts/io.github.tahadx.catch.json"
 grep -qxF -- "$USER_BIND" "$BINDINGS" || fail "installer changed the user binding"
@@ -77,24 +95,39 @@ assert_no_file "$TEST_ROOT/hyprctl.log"
 
 BACKUPS_BEFORE="$(find "$XDG_CONFIG_HOME/hypr" -maxdepth 1 -name 'bindings.lua.bak.*' | wc -l)"
 
+# An old helper must be refreshed even when the binaries and host files are
+# already correct.
+printf 'stale\n' >"$HOME/.local/bin/catch-uninstall"
 "$REPO/install.sh" --yes >"$TEST_ROOT/install-2.log"
 
+cmp -s -- "$REPO/bin/uninstall" "$HOME/.local/bin/catch-uninstall" \
+  || fail "rerun did not refresh the cleanup helper"
 [[ "$(grep -c 'SUPER + D' "$BINDINGS")" -eq 1 ]] || fail "rerun duplicated the binding"
 BACKUPS_AFTER="$(find "$XDG_CONFIG_HOME/hypr" -maxdepth 1 -name 'bindings.lua.bak.*' | wc -l)"
 [[ "$BACKUPS_BEFORE" -eq "$BACKUPS_AFTER" ]] || fail "rerun made another backup"
 grep -q 'already present' "$TEST_ROOT/install-2.log" || fail "rerun is not quiet about the binding"
 assert_no_file "$TEST_ROOT/hyprctl.log"
 
-"$REPO/bin/uninstall"
+# Run the stored copy, not the repo script. This is the path that works
+# after `omarchy plugin remove` has deleted the plugin directory.
+"$HOME/.local/bin/catch-uninstall" >"$TEST_ROOT/uninstall-1.log"
 
 assert_no_file "$HOME/.local/bin/catch"
 assert_no_file "$HOME/.local/bin/catch-host"
+assert_no_file "$HOME/.local/bin/catch-uninstall"
 assert_no_file "$HOME/.config/chromium/NativeMessagingHosts/io.github.tahadx.catch.json"
 assert_no_file "$HOME/.mozilla/native-messaging-hosts/io.github.tahadx.catch.json"
 grep -qxF -- "$USER_BIND" "$BINDINGS" || fail "uninstaller damaged the user binding"
 if grep -qF 'SUPER + D' "$BINDINGS"; then
   fail "uninstaller left the Catch binding"
 fi
+grep -qxF -- "--load-extension=$OMARCHY_EXT" "$BRAVE_FLAGS" \
+  || fail "uninstaller damaged the Omarchy extension entries"
+if grep -qF -- 'chromium-catch' "$BRAVE_FLAGS"; then
+  fail "uninstaller left Catch in the Brave flags file"
+fi
+[[ ! -s "$CHROMIUM_FLAGS" ]] \
+  || fail "uninstaller left an empty --load-extension line"
 cmp -s -- "$STATE" <(printf '%s\n' '{"version":1,"downloads":[],"saved":{},"asks":[]}') \
   || fail "uninstaller changed queue state"
 cmp -s -- "$DOWNLOAD" <(printf 'user data') \
@@ -111,6 +144,7 @@ BACKUPS_BEFORE="$(find "$XDG_CONFIG_HOME/hypr" -maxdepth 1 -name 'bindings.lua.b
 rm -f -- "$BINDINGS"
 "$REPO/install.sh" --yes >"$TEST_ROOT/install-3.log"
 assert_file "$BINDINGS"
+assert_file "$HOME/.local/bin/catch-uninstall"
 grep -qxF -- \
   'o.bind("SUPER + D", "Catch downloads", "omarchy-shell shell toggle io.github.tahadx.catch '\''{}'\''")' \
   "$BINDINGS" || fail "installer did not create a missing bindings file"
@@ -125,5 +159,6 @@ ln -s -- "$TEST_ROOT/my-catch-helper" "$HOME/.local/bin/catch"
 "$REPO/bin/uninstall" >/dev/null
 [[ -L "$HOME/.local/bin/catch" ]] || fail "uninstaller removed an unrelated symlink"
 rm -f -- "$HOME/.local/bin/catch"
+assert_no_file "$HOME/.local/bin/catch-uninstall"
 
 echo "install.test: ok"

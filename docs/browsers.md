@@ -89,6 +89,30 @@ in that browser.
 
 ## Troubleshooting
 
+**After removing Catch, Brave or Chromium reports `Failed to load extension
+from: . Manifest file is missing or unreadable`.** Catch was removed without
+running its cleanup. `Setup → Remove Plugin` deletes a git checkout without
+running plugin code, so the old path stays in `brave-flags.conf` or
+`chromium-flags.conf`. Chromium hides the missing path, which is why the error
+shows only `.`. Run:
+
+```bash
+catch-uninstall
+```
+
+That helper is installed next to `catch` and survives plugin removal. If it is
+missing, recover it from a fresh clone:
+
+```bash
+git clone --depth 1 https://github.com/tahadx/catch
+./catch/bin/uninstall
+```
+
+Restart the browser afterward. See [Remove Catch](../README.md#remove-catch)
+for the normal removal order. If Catch was loaded manually rather than through
+the flags file, remove it once from `brave://extensions` or
+`chrome://extensions`.
+
 **The Catch menu is missing.** The extension is not loaded, or the browser
 started before its flags file was written. Restart the browser, check the
 extensions page, and load the unpacked or temporary extension if needed.

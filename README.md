@@ -104,21 +104,56 @@ Headless overrides: `CATCH_MAX_PARALLEL`, `CATCH_SEGMENTS`, `CATCH_BW_MODE`,
 
 ## Update and uninstall
 
+To update:
+
 ```bash
 omarchy plugin update io.github.tahadx.catch
 ```
 
-Restart the browser to pick up extension changes. To remove Catch, clean up
-first, then remove the plugin:
+Restart the browser to pick up extension changes.
+
+### Remove Catch
+
+Run Catch's cleanup **before** removing the plugin:
 
 ```bash
 ~/.config/omarchy/plugins/io.github.tahadx.catch/bin/uninstall
 omarchy plugin remove io.github.tahadx.catch
 ```
 
-`bin/uninstall` removes the timer, `catch`/`catch-host` links, the `Super+D`
-binding, host files, and flags entries. Downloads and queue records stay. If
-the plugin is gone, run it from a fresh clone and remove the extension in the browser.
+`Setup → Remove Plugin` is not a substitute for the first command. For a git
+checkout Omarchy deletes the plugin directory with `rm -rf` and does not run
+anything inside it, so the cleanup script disappears with it. The leftovers
+are Catch's path in the Chromium/Brave `--load-extension` line, the
+native-messaging host files, the `catch`/`catch-host` links, the `Super+D`
+binding, and the scheduler timer.
+
+`bin/uninstall` removes all of those. Your queue and `~/Downloads/catch` stay.
+
+The same script is installed as `~/.local/bin/catch-uninstall`, so it survives
+Remove Plugin. If the plugin directory is already gone, run:
+
+```bash
+catch-uninstall
+```
+
+If that helper is missing too (older installs), recover it with a fresh clone:
+
+```bash
+git clone --depth 1 https://github.com/tahadx/catch
+./catch/bin/uninstall
+```
+
+Restart Chromium or Brave afterwards. If it still reports
+
+```text
+Failed to load extension from: . Manifest file is missing or unreadable
+```
+
+the cleanup did not run, or another browser process was still open. Close every
+Chromium/Brave window and start the browser again. If Catch was loaded manually
+instead of through the flags file, remove it once from `brave://extensions` or
+`chrome://extensions`.
 
 ## Development
 

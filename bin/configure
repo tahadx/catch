@@ -1,7 +1,8 @@
 #!/bin/bash
-# Self-configure a Catch install: link backend binaries and write browser
-# host manifests. Idempotent and quiet when everything is already in place.
-# Runs automatically from the shell plugin on startup; safe to run by hand.
+# Self-configure a Catch install: link backend binaries, write browser host
+# manifests, and install the cleanup helper. Idempotent and quiet when
+# everything is already in place. Runs automatically from the shell plugin on
+# startup; safe to run by hand.
 # (Chromium, Brave, and Edge pick the extension up from their flags files;
 # Chrome and the Firefox family need a one-time manual load. See README.)
 set -euo pipefail
@@ -13,10 +14,18 @@ export CATCH_NO_SELF_CONFIGURE=1
 PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$PLUGIN_DIR/bin/dist"
 BIN_DIR="$HOME/.local/bin"
+HELPER="$BIN_DIR/catch-uninstall"
 
 need_setup=0
 [[ -x "$BIN_DIR/catch" ]] || need_setup=1
 [[ -x "$BIN_DIR/catch-host" ]] || need_setup=1
+# The helper must be a real copy, not a link into the plugin tree: Omarchy
+# deletes a git checkout on `plugin remove` without running its code, so a
+# link would break before the user could clean up the browser flags.
+[[ -x "$HELPER" && ! -L "$HELPER" ]] || need_setup=1
+if [[ -f "$HELPER" ]] && ! cmp -s -- "$PLUGIN_DIR/bin/uninstall" "$HELPER"; then
+  need_setup=1
+fi
 [[ -f "$HOME/.config/chromium/NativeMessagingHosts/io.github.tahadx.catch.json" ]] || need_setup=1
 [[ -f "$HOME/.mozilla/native-messaging-hosts/io.github.tahadx.catch.json" ]] || need_setup=1
 
@@ -47,8 +56,11 @@ fi
 mkdir -p -- "$BIN_DIR"
 ln -sfn -- "$DIST/catch" "$BIN_DIR/catch"
 ln -sfn -- "$DIST/catch-host" "$BIN_DIR/catch-host"
+# A real copy survives deletion of the plugin directory. The script removes
+# this copy itself when it runs, so cleanup does not leave another leftover.
+install -m 0755 -- "$PLUGIN_DIR/bin/uninstall" "$HELPER"
 
 "$BIN_DIR/catch" install-hosts >/dev/null
 "$BIN_DIR/catch" install-extension >/dev/null || true
 
-echo "catch: configured backend + browser hosts"
+echo "catch: configured backend + browser hosts + cleanup helper"

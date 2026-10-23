@@ -1,8 +1,12 @@
 #!/bin/bash
 # Remove everything Catch installs outside its own plugin directory:
-# backend symlinks, browser host manifests, browser flags entries, and
-# the scheduler timer. Idempotent; safe to re-run.
+# backend symlinks, browser host manifests, browser flags entries, the
+# scheduler timer, and the cleanup helper itself. Idempotent; safe to re-run.
 # Queue records and downloaded files are user data and stay untouched.
+#
+# This file is also installed as ~/.local/bin/catch-uninstall (a real copy,
+# not a symlink), so it still works after Omarchy's Remove Plugin deletes the
+# checkout without running anything inside it.
 # Usage: ./bin/uninstall
 set -euo pipefail
 
@@ -104,6 +108,14 @@ for name in ("chromium-flags.conf", "chrome-flags.conf", "brave-flags.conf",
         changed += 1
 print(f"  flags files cleaned")
 EOF
+
+# 6. The stored helper. Keep this last so a failed cleanup can still be
+# retried with the same copy. Removing a running script is safe on Linux.
+HELPER="$HOME/.local/bin/catch-uninstall"
+if [[ -e "$HELPER" || -L "$HELPER" ]]; then
+  rm -f -- "$HELPER"
+  echo "  removed $HELPER"
+fi
 
 echo "Done. Your queue and ~/Downloads/catch are untouched."
 echo "Finish with: omarchy plugin remove io.github.tahadx.catch"
