@@ -414,21 +414,10 @@ fn shell_download_dir() -> Option<PathBuf> {
     let shell = std::path::PathBuf::from(home).join(".config/omarchy/shell.json");
     let text = std::fs::read_to_string(&shell).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let layout = v.get("bar")?.get("layout")?;
-    for section in ["left", "center", "right"] {
-        let entries = match layout.get(section).and_then(|s| s.as_array()) {
-            Some(e) => e,
-            None => continue,
-        };
-        for e in entries {
-            if e.get("id")?.as_str()? != "io.github.tahadx.catch" {
-                continue;
-            }
-            let dir = e.get("downloadDir")?.as_str()?.trim();
-            if !dir.is_empty() {
-                return Some(expand_home(dir));
-            }
-        }
+    let entry = find_widget_entry(&v)?;
+    let dir = entry.get("downloadDir")?.as_str()?.trim();
+    if !dir.is_empty() {
+        return Some(expand_home(dir));
     }
     None
 }
@@ -1469,21 +1458,10 @@ pub fn max_parallel() -> usize {
 }
 
 fn find_widget_max(v: &serde_json::Value) -> Option<usize> {
-    let layout = v.get("bar")?.get("layout")?;
-    for section in ["left", "center", "right"] {
-        let entries = match layout.get(section).and_then(|s| s.as_array()) {
-            Some(e) => e,
-            None => continue,
-        };
-        for e in entries {
-            if e.get("id")?.as_str()? != "io.github.tahadx.catch" {
-                continue;
-            }
-            let n = e.get("maxParallel")?.as_u64()? as usize;
-            if [1, 3, 5, 10].contains(&n) {
-                return Some(n);
-            }
-        }
+    let entry = find_widget_entry(v)?;
+    let n = entry.get("maxParallel")?.as_u64()? as usize;
+    if [1, 3, 5, 10].contains(&n) {
+        return Some(n);
     }
     None
 }
@@ -1593,37 +1571,49 @@ pub fn cap_slices() -> Option<usize> {
     Some((cap / (64 * 1024)).max(1) as usize)
 }
 
-fn find_widget_value<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
-    let layout = v.get("bar")?.get("layout")?;
-    for section in ["left", "center", "right"] {
-        let entries = layout.get(section)?.as_array()?;
-        for e in entries {
-            if e.get("id")?.as_str()? == "io.github.tahadx.catch" {
-                if let Some(found) = e.get(key) {
-                    return Some(found);
+pub const BAR_SECTIONS: [&str; 6] = [
+    "left",
+    "centerBegin",
+    "center",
+    "centerEnd",
+    "right",
+    "tray",
+];
+
+/// Locate the Catch widget configuration in Omarchy's shell.json, searching
+/// all 6 bar sections as well as the plugins[] array.
+pub fn find_widget_entry(v: &serde_json::Value) -> Option<&serde_json::Value> {
+    if let Some(layout) = v.get("bar").and_then(|b| b.get("layout")) {
+        for section in BAR_SECTIONS {
+            if let Some(entries) = layout.get(section).and_then(|s| s.as_array()) {
+                for e in entries {
+                    if e.get("id").and_then(|id| id.as_str()) == Some("io.github.tahadx.catch") {
+                        return Some(e);
+                    }
                 }
+            }
+        }
+    }
+    if let Some(plugins) = v.get("plugins").and_then(|p| p.as_array()) {
+        for e in plugins {
+            if e.get("id").and_then(|id| id.as_str()) == Some("io.github.tahadx.catch") {
+                return Some(e);
             }
         }
     }
     None
 }
 
+fn find_widget_value<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    let entry = find_widget_entry(v)?;
+    entry.get(key)
+}
+
 fn find_widget_segments(v: &serde_json::Value) -> Option<usize> {
-    let layout = v.get("bar")?.get("layout")?;
-    for section in ["left", "center", "right"] {
-        let entries = match layout.get(section).and_then(|s| s.as_array()) {
-            Some(e) => e,
-            None => continue,
-        };
-        for e in entries {
-            if e.get("id")?.as_str()? != "io.github.tahadx.catch" {
-                continue;
-            }
-            let n = e.get("segments")?.as_u64()? as usize;
-            if [1, 2, 4, 8].contains(&n) {
-                return Some(n);
-            }
-        }
+    let entry = find_widget_entry(v)?;
+    let n = entry.get("segments")?.as_u64()? as usize;
+    if [1, 2, 4, 8].contains(&n) {
+        return Some(n);
     }
     None
 }
@@ -2350,5 +2340,52 @@ mod rename_tests {
         let long = rename_plan("x.zip", &"y".repeat(200)).unwrap();
         assert_eq!(long.0.chars().count(), 120);
         assert!(long.1.ends_with(".zip"));
+    }
+
+    #[test]
+    fn find_widget_entry_locates_catch_in_all_sections_and_plugins() {
+        for section in super::BAR_SECTIONS {
+            let json = serde_json::json!({
+                "bar": {
+                    "layout": {
+                        section: [
+                            { "id": "other.widget" },
+                            { "id": "io.github.tahadx.catch", "maxParallel": 5, "segments": 8, "bwMode": "low" }
+                        ]
+                    }
+                }
+            });
+            let entry = super::find_widget_entry(&json).expect(section);
+            assert_eq!(
+                entry.get("id").unwrap().as_str().unwrap(),
+                "io.github.tahadx.catch"
+            );
+            assert_eq!(super::find_widget_max(&json), Some(5));
+            assert_eq!(super::find_widget_segments(&json), Some(8));
+            assert_eq!(
+                super::find_widget_value(&json, "bwMode")
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                "low"
+            );
+        }
+
+        let plugins_json = serde_json::json!({
+            "plugins": [
+                { "id": "io.github.tahadx.catch", "maxParallel": 10 }
+            ]
+        });
+        assert!(super::find_widget_entry(&plugins_json).is_some());
+        assert_eq!(super::find_widget_max(&plugins_json), Some(10));
+
+        let missing_json = serde_json::json!({
+            "bar": {
+                "layout": {
+                    "right": [{ "id": "other.widget" }]
+                }
+            }
+        });
+        assert!(super::find_widget_entry(&missing_json).is_none());
     }
 }

@@ -20,15 +20,7 @@ fn widget_settings() -> Option<serde_json::Value> {
     let shell = std::path::PathBuf::from(home).join(".config/omarchy/shell.json");
     let text = std::fs::read_to_string(&shell).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let layout = v.get("bar")?.get("layout")?;
-    for section in ["left", "center", "right"] {
-        for e in layout.get(section)?.as_array()? {
-            if e.get("id")?.as_str()? == "io.github.tahadx.catch" {
-                return Some(e.clone());
-            }
-        }
-    }
-    None
+    crate::state::find_widget_entry(&v).cloned()
 }
 
 fn parse_hhmm(s: &str) -> Option<u16> {

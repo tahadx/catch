@@ -23,7 +23,14 @@
     "defaults": {
       "catchCommand": "catch",
       "downloadDir": "",
-      "maxParallel": 3
+      "maxParallel": 3,
+      "segments": 4,
+      "bwMode": "unlimited",
+      "bwCapKb": 0,
+      "schedEnabled": "off",
+      "schedStart": "02:00",
+      "schedStop": "06:00",
+      "uiPlacement": "bar"
     },
     "schema": [
       {
@@ -111,15 +118,10 @@
         "type": "enum",
         "label": "Panel position",
         "options": [
-          "bar",
-          "top",
-          "center",
-          "left",
-          "right",
-          "bottom"
+          "bar"
         ],
         "defaultValue": "bar",
-        "description": "Where the panel opens: under the bar icon, top centre, centre of screen, left or right pane, or bottom centre."
+        "description": "Where the panel opens: under the bar icon. Other placements (top, center, left, right, bottom) are configurable in Catch Settings."
       }
     ]
   }
