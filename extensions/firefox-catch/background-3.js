@@ -292,6 +292,27 @@ function pageTitle(tab) {
 // Catch; if the native host is missing or refuses, leave the browser
 // download running so nothing is ever swallowed.
 //
+// Account-bound Google downloads. The browser's request carries the session
+// cookies that Catch (a native process) does not have, so taking one of these
+// over cancels the only request that can succeed and leaves Catch with a
+// sign-in redirect. Let the browser keep them.
+const AUTH_GATED_HOSTS = [
+  "contribution.usercontent.google.com",
+  "drive.usercontent.google.com",
+  "docs.google.com",
+  "drive.google.com",
+  "mail.google.com",
+];
+
+function authGated(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return AUTH_GATED_HOSTS.some((h) => host === h || host.endsWith("." + h));
+  } catch (e) {
+    return false;
+  }
+}
+
 // Canceling a download a click started makes Chromium re-navigate to the
 // URL and fetch the file again, which is why a click can look like it is
 // "not working" and then take a while. Catch still has the row and the file
@@ -301,6 +322,7 @@ function pageTitle(tab) {
 function intercept(item) {
   const url = httpUrl(item && item.url);
   if (!url) return; // blob:, data:, chrome: stay in the browser
+  if (authGated(url)) return; // the browser has the account session
   if (item.state && item.state !== "in_progress") return; // too late, browser won
   if (bypassed(url)) return;
   const msg = { url, title: "", filenameHint: item.filename || "" };

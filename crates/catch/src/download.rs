@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use crate::segment;
 use crate::state::{
-    dir_for, load_state, mark_error, resolve_download_dir, sanitize_filename, unique_destination,
-    update_state, worker_holds, Status,
+    dir_for, load_state, mark_error, query_param, resolve_download_dir, sanitize_filename,
+    unique_destination, update_state, worker_holds, Status,
 };
 
 /// Give up on a connection with no body data this long, then reconnect.
@@ -102,20 +102,62 @@ pub(crate) enum Verdict {
     Fatal(String),
 }
 
-/// True when the URL path ends with a file extension that is not itself
-/// a page (used to refuse HTML answers to file links).
+/// The file extension of a name, when it is a file rather than a page.
+fn file_extension(name: &str) -> Option<String> {
+    let i = name.rfind('.')?;
+    let ext = name[i + 1..].to_lowercase();
+    if ext.is_empty()
+        || ext.len() > 5
+        || ["html", "htm", "xhtml", "php", "asp", "aspx", "jsp"].contains(&ext.as_str())
+    {
+        None
+    } else {
+        Some(ext)
+    }
+}
+
+/// True when the URL names a file, either in its path or in a `filename=`
+/// query parameter. Download endpoints often hide the name in the query
+/// (`/download?filename=report.docx`); treating those as "not a file" let a
+/// sign-in page's 400 through as a generic status.
 fn looks_like_file_url(url: &str) -> bool {
     let path = url.split(['?', '#']).next().unwrap_or("");
     let tail = path.rsplit('/').next().unwrap_or("");
-    match tail.rfind('.') {
-        Some(i) => {
-            let ext = tail[i + 1..].to_lowercase();
-            !(ext.is_empty()
-                || ext.len() > 5
-                || ["html", "htm", "xhtml", "php", "asp", "aspx", "jsp"].contains(&ext.as_str()))
-        }
-        None => false,
+    if file_extension(tail).is_some() {
+        return true;
     }
+    query_param(url, "filename")
+        .map(|name| file_extension(&name).is_some())
+        .unwrap_or(false)
+}
+
+/// A redirect that ends at a sign-in host means the link is tied to the
+/// browser's account session. Catch has no cookies, so no retry can work.
+fn is_signin_url(url: &reqwest::Url) -> bool {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    host == "accounts.google.com" || host.ends_with(".accounts.google.com")
+}
+
+const SIGNIN_WALL: &str = "sign-in required — this link needs the browser's account session, which Catch cannot use; download it with the browser";
+const PAGE_NOT_FILE: &str = "server returned a page, not the file (login wall or expired link? refresh the address with `catch refresh`)";
+
+/// What an HTTP answer says when it is not the file we asked for. A
+/// sign-in redirect is named as such instead of being reported as a bare
+/// `400 Bad Request`, and a `filename=` query is enough to know an HTML
+/// answer is a page rather than the download.
+fn response_wall(
+    status: reqwest::StatusCode,
+    content_type: &str,
+    final_url: &reqwest::Url,
+    original_url: &str,
+) -> Option<&'static str> {
+    if !status.is_success() && is_signin_url(final_url) {
+        return Some(SIGNIN_WALL);
+    }
+    if content_type.starts_with("text/html") && looks_like_file_url(original_url) {
+        return Some(PAGE_NOT_FILE);
+    }
+    None
 }
 
 /// "bytes 200-1000/67589" -> (200, 1000, Some(67589)). A malformed or
@@ -717,14 +759,17 @@ pub async fn download_entry(
         // 200-on-resume path restarts from zero, and the partial bytes must
         // survive until we know the server is not about to hand us a login
         // page instead of the file. Either way, nothing is deleted here.
+        //
+        // A redirect to a sign-in host is the same wall even when the URL
+        // does not end in a file extension; naming it as a sign-in wall keeps
+        // a bare `400 Bad Request` from looking like a retryable transfer.
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        if content_type.starts_with("text/html") && looks_like_file_url(&url) {
-            let msg = "server returned a page, not the file (login wall or expired link? refresh the address with `catch refresh`)";
+        if let Some(msg) = response_wall(status, &content_type, resp.url(), &url) {
             let _ = mark_error(id, msg);
             anyhow::bail!("{url}: {msg}");
         }
@@ -1856,6 +1901,14 @@ pub(crate) async fn probe_remote(url: &str) -> Result<RemoteInfo> {
         })?
         .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(msg) = response_wall(status, content_type, resp.url(), url) {
+        anyhow::bail!("{url}: {msg}");
+    }
     if !status.is_success() && status != reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
         let msg = match status.as_u16() {
             401 | 403 => format!("{status} — the link is expired or requires sign-in"),
@@ -1890,14 +1943,6 @@ pub(crate) async fn probe_remote(url: &str) -> Result<RemoteInfo> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if content_type.starts_with("text/html") && looks_like_file_url(url) {
-        anyhow::bail!("{url}: that address serves a web page, not a file (login wall?)");
-    }
     Ok(RemoteInfo {
         total,
         etag,
@@ -1908,6 +1953,50 @@ pub(crate) async fn probe_remote(url: &str) -> Result<RemoteInfo> {
 #[cfg(test)]
 mod range_tests {
     use super::*;
+
+    #[test]
+    fn filename_query_counts_as_a_file_url() {
+        // The path is `/download`; the name is only in the query. A 400
+        // HTML answer to this must be treated as a page, not a bare status.
+        assert!(looks_like_file_url(
+            "https://contribution.usercontent.google.com/download?filename=report.docx"
+        ));
+        assert!(looks_like_file_url(
+            "https://example.com/download?filename=archive.tar.gz"
+        ));
+        // A page in the query stays a page.
+        assert!(!looks_like_file_url(
+            "https://example.com/download?filename=page.html"
+        ));
+        assert!(!looks_like_file_url("https://example.com/app"));
+        assert!(looks_like_file_url("https://example.com/file.bin"));
+    }
+
+    #[test]
+    fn signin_redirect_is_named_not_reported_as_400() {
+        let final_url =
+            reqwest::Url::parse("https://accounts.google.com/ServiceLogin?continue=x").unwrap();
+        let msg = response_wall(
+            reqwest::StatusCode::BAD_REQUEST,
+            "text/html; charset=utf-8",
+            &final_url,
+            "https://contribution.usercontent.google.com/download?filename=report.docx",
+        );
+        assert_eq!(msg, Some(SIGNIN_WALL));
+        assert!(SIGNIN_WALL.contains("browser"));
+
+        // A normal host with an HTML body on a file link is the page wall.
+        let local = reqwest::Url::parse("http://127.0.0.1:1/login").unwrap();
+        assert_eq!(
+            response_wall(
+                reqwest::StatusCode::BAD_REQUEST,
+                "text/html",
+                &local,
+                "http://127.0.0.1:1/download?filename=report.docx",
+            ),
+            Some(PAGE_NOT_FILE)
+        );
+    }
 
     #[test]
     fn content_range_parses_well_formed_headers() {

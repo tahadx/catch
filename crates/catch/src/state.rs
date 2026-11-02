@@ -556,6 +556,11 @@ pub fn sanitize_filename(raw: &str) -> String {
 }
 
 /// Derive a safe filename from a URL. Falls back to `download-<id>`.
+///
+/// Download endpoints often keep the real name in a query parameter while
+/// the path is just `/download` (Gemini and Google Drive do this). Prefer
+/// that name when the path itself has no extension, so the row does not
+/// read `download` and the saved file keeps its `.docx`/`.zip` suffix.
 pub fn filename_for_url(url: &str, id: &str) -> String {
     let tail = url
         .split(['?', '#'])
@@ -565,14 +570,35 @@ pub fn filename_for_url(url: &str, id: &str) -> String {
         .next()
         .unwrap_or("")
         .trim();
-    // Percent-decode minimally: '+' and %XX for the common cases.
+    // Percent-decode minimally: %XX for the common cases.
     let decoded = percent_decode(tail);
-    let name = sanitize_filename(&decoded);
+    let mut name = sanitize_filename(&decoded);
+    if name.is_empty() || !name.contains('.') {
+        if let Some(hinted) = query_param(url, "filename") {
+            let hinted = sanitize_filename(&hinted);
+            if !hinted.is_empty() {
+                name = hinted;
+            }
+        }
+    }
     if name.is_empty() {
         format!("download-{}", id)
     } else {
         name
     }
+}
+
+/// The first value of `name` in the URL's query string, percent-decoded.
+/// `+` is a space in query values; path tails keep their literal `+`.
+pub(crate) fn query_param(url: &str, name: &str) -> Option<String> {
+    let query = url.split_once('?')?.1.split('#').next()?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != name {
+            return None;
+        }
+        Some(percent_decode(&value.replace('+', " ")))
+    })
 }
 
 fn percent_decode(s: &str) -> String {
@@ -1673,6 +1699,31 @@ mod tests {
             title: String::new(),
             extra: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn filename_for_url_prefers_a_query_filename() {
+        let id = "id";
+        // Gemini/Drive hide the real name in the query; the path is
+        // `/download`, so the row used to read just `download`.
+        assert_eq!(
+            filename_for_url(
+                "https://contribution.usercontent.google.com/download?filename=%D8%B1%D8%B2%D9%88%D9%85%D9%87-v2.docx",
+                id
+            ),
+            "رزومه-v2.docx"
+        );
+        assert_eq!(
+            filename_for_url("https://example.com/download?filename=report+final.pdf", id),
+            "report final.pdf"
+        );
+        // A real path name wins over the query hint.
+        assert_eq!(
+            filename_for_url("https://example.com/file.bin?filename=other.zip", id),
+            "file.bin"
+        );
+        // No hint, no path name: the historical fallback.
+        assert_eq!(filename_for_url("https://example.com/", id), "download-id");
     }
 
     /// A queued row carries no pid and has no worker behind it yet, so

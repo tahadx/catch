@@ -1460,7 +1460,9 @@ fn why_one(id: &str) -> Result<String> {
         }
         Status::Error => {
             let e = d.error.to_lowercase();
-            if e.contains("page, not the file")
+            if e.contains("sign-in") || e.contains("browser session") {
+                "the link needs the browser's account session — download it with the browser; Catch cannot use those cookies".to_string()
+            } else if e.contains("page, not the file")
                 || e.contains("expired")
                 || e.contains(" 401")
                 || e.contains(" 403")
