@@ -482,6 +482,7 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         206 => "Partial Content",
+        302 => "Found",
         400 => "Bad Request",
         404 => "Not Found",
         416 => "Range Not Satisfiable",

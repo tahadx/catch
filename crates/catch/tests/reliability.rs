@@ -76,6 +76,46 @@ fn header_connection_failure_then_retry_succeeds() {
 }
 
 #[test]
+fn login_wall_on_a_query_named_download_is_named_not_400() {
+    let sb = Sandbox::new("login-wall");
+    let server = Server::start(|req, _n| {
+        if req.target.starts_with("/download") {
+            Reply::new(302).header("Location", "/login")
+        } else {
+            Reply::new(400).header("Content-Type", "text/html; charset=utf-8")
+        }
+    });
+    let url = server.url("/download?filename=test.docx");
+    let out = add(&sb, &url);
+    assert!(
+        !out.status.success(),
+        "a login wall must fail, not save a page"
+    );
+
+    let row = sb.row_for_url(&url).expect("row");
+    assert_eq!(row["status"], "error");
+    assert_eq!(
+        row["filename"], "test.docx",
+        "the filename= query must name the row, not the /download path"
+    );
+    let error = row["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("page, not the file"),
+        "the 400 must be explained as a page/login wall, got {error:?}"
+    );
+
+    // `why` must not tell the user to resume a transfer that can never
+    // authenticate; it should point at the login wall instead.
+    let id = row["id"].as_str().unwrap();
+    let why = run_args(&sb, &["why", id], Duration::from_secs(10));
+    let text = String::from_utf8_lossy(&why.stdout);
+    assert!(
+        text.contains("login wall") || text.contains("browser session"),
+        "why did not explain the wall: {text}"
+    );
+}
+
+#[test]
 fn stalled_body_times_out_and_resumes_with_range() {
     let sb = Sandbox::new("stall");
     let body = patterned(5000, 7);
