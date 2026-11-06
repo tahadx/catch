@@ -4,6 +4,18 @@ Catch is a native download manager for Omarchy: a bar widget shows the queue,
 a Rust backend owns the transfers, and browser extensions hand downloads over
 from the Chromium and Firefox families.
 
+## Documentation
+
+| Guide | What it covers |
+| --- | --- |
+| [Design](docs/design.md) | Tokens, panel anatomy, motion, copy, interaction |
+| [Reference](docs/reference.md) | CLI, settings, state files, troubleshooting, uninstall |
+| [Development](docs/development.md) | Build, test, shipped binaries, release tooling |
+| [Browser support](docs/browsers.md) | Native hosts and loading each extension |
+| [Segmented downloads](docs/segmented-downloads.md) | Range support, resume, work stealing |
+| [Bindings](docs/bindings.md) | The optional Super+D shortcut |
+| [Release](docs/release.md) | Tags, version stamping, CI release flow |
+
 ## Features
 
 - **Browser hand-off** — left-click a download in a connected browser, or
@@ -14,6 +26,19 @@ from the Chromium and Firefox families.
   keeps partial data. Re-sending a saved link asks before a second copy.
 - **Segmented downloads** — large files use parallel ranges when supported,
   with a plain fallback. See [segmented downloads](docs/segmented-downloads.md).
+- **Panel placements** — under the bar icon, top center, screen center, left or
+  right pane, or bottom center.
+- **Scheduled transfers** — keep downloads inside a window; the panel installs
+  the systemd timer.
+
+## How it works
+
+Catch runs inside `omarchy-shell` as the plugin `io.github.tahadx.catch`.
+`Panel.qml` is the bar widget and panel, `CatchPanel.qml` is the layer-shell
+host, and `Service.qml` watches the queue state and wakes the drainer. The
+`catch` backend owns the queue, transfers, and `state.json`. Browser extensions
+send links to `catch-host` over native messaging. QML never writes the state
+file; it reads it and asks the CLI to act.
 
 ## Requirements
 
@@ -102,6 +127,9 @@ Headless overrides: `CATCH_MAX_PARALLEL`, `CATCH_SEGMENTS`, `CATCH_BW_MODE`,
 [segmented downloads](docs/segmented-downloads.md#environment-overrides).
 `CATCH_CATEGORIES=on` sorts files into type folders.
 
+The full CLI, state files, paths, and troubleshooting are in
+[reference](docs/reference.md).
+
 ## Update and uninstall
 
 To update:
@@ -157,17 +185,25 @@ instead of through the flags file, remove it once from `brave://extensions` or
 
 ## Development
 
-The panel and service are `Panel.qml`, `Service.qml`, and `Model.js`; the
-backend, extensions, and tooling live in `crates/catch`, `extensions/`, and `bin/`.
+The panel, host, and service are `Panel.qml`, `CatchPanel.qml`, `Service.qml`,
+and `Model.js`; the backend, extensions, and tooling live in `crates/catch`,
+`extensions/`, and `bin/`.
 
 ```bash
-bin/refresh-dist          # rebuild bin/dist from source
-cargo test -p catch       # backend tests
-node tests/model.test.js  # panel model tests
+cargo fmt --check -p catch
+cargo clippy -p catch --all-targets -- -D warnings
+cargo test -p catch
+node tests/model.test.js
+bin/lint-qml
+bash tests/install.test.sh
+bin/refresh-dist          # rebuild bin/dist after crates/ changes
 bin/check-release         # version and shipped-binary consistency
 ```
 
-Release steps: [release](docs/release.md).
+Enable the pre-push gate once: `git config core.hooksPath .githooks`.
+
+Full layout, hooks, shipped-binary rules, and CI details are in
+[development](docs/development.md). Release steps: [release](docs/release.md).
 
 ## License
 

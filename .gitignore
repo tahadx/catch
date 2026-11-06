@@ -1,5 +1,17 @@
+# Local scratch
 /target/
 build/
+*.part.*
+*.bak.*
 *.log
+
+# Editors
 .DS_Store
+*.swp
+
+# Local-only plans (never push)
 plan.md
+plan/
+
+# Local agent/editor state
+.freebuff/
