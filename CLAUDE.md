@@ -173,7 +173,11 @@ assets/, preview.jpg     marketplace assets (preview.jpg shows the panel only)
     checkout and run `./install.sh`.
 11. **Git & push discipline.** Keep diffs small. Never push, force-push, or
     rewrite git history unless the user explicitly asks.
-12. **Sync docs in the same commit.** Update `docs/design.md` for panel/UI
+12. **Opening Catch shows the queue.** A pending duplicate question is a
+    non-modal banner, never the first screen. Only a question that arrives while
+    the panel is already open may open the choice view. Do not make `open()`
+    replay `state.asks`.
+13. **Sync docs in the same commit.** Update `docs/design.md` for panel/UI
     changes, `docs/reference.md` + `README.md` for CLI, config, or user-facing
     behavior changes, `docs/browsers.md` for extension/host changes, and
     `docs/segmented-downloads.md` for range/resume changes. If docs and code

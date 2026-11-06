@@ -70,8 +70,14 @@ the rest queued.
 
 Catch keeps a `saved` index that outlives queue rows. Sending a link whose file
 is already in the download folder records a question in `state.asks`; the panel
-asks whether to open, save another copy, or replace it. The question survives a
-panel reload and is announced once on the desktop.
+asks whether to open, save another copy, or replace it. The question is announced
+once on the desktop and survives a panel reload.
+
+A question that arrives while Catch is open opens the choice view. A question
+left from an earlier hand-off is shown as a **pending question banner** in the
+queue; opening Catch never lands on the question itself. Choose **Review** to
+answer it. Closing the panel without answering keeps the question for the next
+open instead of dropping it.
 
 The explicit answers are:
 

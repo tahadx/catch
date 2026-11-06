@@ -29,6 +29,9 @@ Panel {
   readonly property int activeCount: Model.activeCount(root.queue)
   readonly property bool busy: Model.hasActive(root.queue)
   readonly property real progress: Model.overallFraction(root.queue)
+  // Pending "already saved / still downloading" questions. They are shown as
+  // a banner in the queue, never as the first screen when Catch opens.
+  readonly property int pendingAskCount: root.queue && root.queue.asks ? root.queue.asks.length : 0
 
   property string actionError: ""
   property int cursorIndex: -1
@@ -144,33 +147,43 @@ Panel {
   }
 
   // A question arrived in the state file. The first read of a session only
-  // remembers it (noteArrival arms `primed` after this). Later arrivals
-  // open the panel.
+  // remembers it (noteArrival arms `primed` after this). Later arrivals are
+  // shown only while Catch is already open; opening the panel always lands on
+  // the queue, never on a stale question.
   function syncAsks() {
+    var scan = Model.freshAsk(root.queue, root.knownAsks)
+    var current = scan.known
+    var fresh = scan.ask
+    root.knownAsks = current
     if (!root.primed) return
-    var ask = root.firstAsk()
-    if (ask && root.ignoringAsk === ask.url) return
-    if (!ask) {
-      root.ignoringAsk = ""
-      if (root.conflictFromAsk && root.replacePending === "") {
-        root.conflict = null
-        root.conflictUrl = ""
-        root.conflictFromAsk = false
-      }
+    // The first state read after open() only learns the questions; it never
+    // shows one. The timer is the fallback for a reload that never fires.
+    if (root.opening) {
+      root.opening = false
       return
     }
-    if (root.replacePending !== "") return
-    // Open whenever the question is not already on screen. Keying this on the
-    // url being "new" meant only the first click on a link Catch already had
-    // opened the panel: showAsk stored that url as announced, so every later
-    // click had arrived=false and returned here without ever opening. Catch
-    // raised the question and the user saw nothing at all.
-    var showing = root.conflict !== null && root.conflict.url === ask.url
-    root.showAsk(ask)
-    if (showing || root.opened) return
-    root.open()
+    if (root.ignoringAsk !== "" && !current[root.ignoringAsk]) root.ignoringAsk = ""
+    // The question on screen was answered elsewhere or cleared by the
+    // backend: close the card instead of leaving a dead one behind.
+    if (root.conflictFromAsk && root.replacePending === ""
+        && root.conflict !== null && !current[root.conflict.url]) {
+      root.conflict = null
+      root.conflictUrl = ""
+      root.conflictFromAsk = false
+      return
+    }
+    if (!fresh || root.replacePending !== "") return
+    if (root.ignoringAsk === fresh.url) return
+    // Do not steal the panel for a question, do not replace one the user is
+    // already reading, and do not interrupt a form or a destructive confirm.
+    // A waiting question is surfaced by the queue banner.
+    if (!root.opened || root.opening || root.conflict !== null
+        || root.showingSettings || root.textEditing || root.deletePending) return
+    root.showAsk(fresh)
   }
 
+  // Restore the question after the user cancels the destructive replace
+  // confirmation. This is the only caller: open() must never show a question.
   function applyPendingAsk() {
     if (root.replacePending !== "") return
     var ask = root.firstAsk()
@@ -332,7 +345,14 @@ Panel {
   // Rows Catch has seen, so a first read learns the queue instead of treating
   // everything as newly arrived.
   property var knownIds: ({})
+  // Question URLs already read from the state file. Only a URL that was not
+  // here on the previous read is "fresh"; a question that survived a panel
+  // close is not allowed to pop back up on the next open.
+  property var knownAsks: ({})
   property bool primed: false
+  // True while open() is settling its first state read. A question that
+  // arrives in that window is remembered but not shown.
+  property bool opening: false
   property bool autoOpened: false
   property bool userHolding: false
 
@@ -455,6 +475,10 @@ Panel {
   }
 
   function open() {
+    // Suppress ask display for this open's first state read. Opening Catch
+    // must show the queue even when a question is waiting in state.json.
+    root.opening = true
+    openAskTimer.restart()
     root.refresh()
     root.cursorIndex = root.queue.downloads.length > 0 ? 0 : -1
     root.autoOpened = false
@@ -462,7 +486,6 @@ Panel {
     root.textEditing = false
     root.focusZone = "list"
     autoClose.stop()
-    root.applyPendingAsk()
     root.controller.show()
     // Belt and suspenders next to the shell's own focus prime: land
     // keyboard focus in our catcher even if the prime fired before the
@@ -498,6 +521,8 @@ Panel {
     root.textEditing = false
     root.focusZone = "list"
     autoClose.stop()
+    openAskTimer.stop()
+    root.opening = false
     root.closedAt = Date.now()
     root.controller.hide()
   }
@@ -508,6 +533,14 @@ Panel {
     onTriggered: {
       if (root.opened && root.autoOpened && !root.userHolding) root.close()
     }
+  }
+
+  // open() starts this; the first state read it triggers is allowed to learn
+  // pending questions without showing one. A later arrival is still shown.
+  Timer {
+    id: openAskTimer
+    interval: 2000
+    onTriggered: root.opening = false
   }
 
   function switchPanel(direction) {
@@ -1846,6 +1879,57 @@ Panel {
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
+                  }
+                }
+
+                // A question left over from an earlier hand-off. It stays a
+                // banner, not a dialog: the queue is always the first screen,
+                // and the question opens only when the user asks for it.
+                BorderSurface {
+                  width: parent.width
+                  radius: Style.cornerRadius
+                  visible: !root.showingSettings && root.conflict === null && root.pendingAskCount > 0
+                  color: Style.normalFillFor(root.foreground, root.accent)
+                  borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+                  implicitHeight: askBanner.implicitHeight + Style.spacing.xl * 2
+
+                  RowLayout {
+                    id: askBanner
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Style.spacing.xl
+                    spacing: Style.spacing.md
+
+                    Text {
+                      Layout.fillWidth: true
+                      Layout.minimumWidth: 0
+                      Layout.alignment: Qt.AlignVCenter
+                      textFormat: Text.PlainText
+                      text: root.pendingAskCount === 1
+                        ? "1 link needs an answer"
+                        : root.pendingAskCount + " links need an answer"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      elide: Text.ElideRight
+                    }
+
+                    Button {
+                      Layout.alignment: Qt.AlignVCenter
+                      text: "Review"
+                      radius: root.fieldButtonRadius
+                      bordered: true
+                      foreground: root.foreground
+                      accent: root.accent
+                      fontFamily: root.fontFamily
+                      focusable: true
+                      onClicked: {
+                        root.hold()
+                        var ask = root.firstAsk()
+                        if (ask) root.showAsk(ask)
+                      }
+                    }
                   }
                 }
 

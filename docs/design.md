@@ -257,6 +257,14 @@ uses `dim`. Empty state is one quiet line:
 
 > Nothing yet — send a download from the browser (Alt+Shift+C).
 
+### Pending question banner
+
+A question that survived an earlier hand-off is a compact `BorderSurface` under
+the section head, not a dialog. It reads `1 link needs an answer` (or `N links
+need an answer`) with a bordered **Review** button. The queue stays visible and
+first; the conflict view opens only when Review is chosen. The banner disappears
+while the conflict view is up and when the last question is answered.
+
 ### Row card
 
 A `BorderSurface` with `Style.cornerRadius`, `Style.spacing.xl` padding, and
@@ -305,9 +313,11 @@ instead of the queue:
   (focused), **Replace** (only when a file exists, destructive confirmation),
   **Cancel**.
 
-Focus lands on **Download again**, never on Open. The panel may open by itself
-for a question, and Enter is the first thing pressed. The question is also
-mirrored in `state.asks`, so it survives a panel reload.
+Focus lands on **Download again**, never on Open. A question that arrives while
+Catch is already open replaces the queue, so the hand-off is answered where it
+happened. A question left from an earlier hand-off appears as a queue banner and
+opens only when **Review** is chosen; opening Catch always lands on the queue.
+The question is also mirrored in `state.asks`, so it survives a panel reload.
 
 ### Settings
 

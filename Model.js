@@ -124,6 +124,24 @@ function parseAsks(data) {
   return out
 }
 
+// Which pending question is new since the last read, plus the new known set.
+// A question that survived a panel close is not new, so opening Catch cannot
+// show it as an unsolicited dialog. The first URL in state order wins.
+function freshAsk(state, known) {
+  var asks = (state && state.asks) || []
+  var seen = known || {}
+  var current = {}
+  var fresh = null
+  for (var i = 0; i < asks.length; i++) {
+    var a = asks[i]
+    if (!a || !a.url) continue
+    var url = String(a.url)
+    current[url] = true
+    if (!seen[url] && fresh === null) fresh = a
+  }
+  return { ask: fresh, known: current }
+}
+
 function activeDownloads(state) {
   var out = []
   var list = state ? state.downloads : []

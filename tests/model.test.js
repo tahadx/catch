@@ -10,7 +10,7 @@ const path = require("node:path")
 const src = fs
   .readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
   .replace(/^\.pragma library\s*$/m, "")
-const Model = new Function(src + "\nreturn { placement, parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath, bulkPausePlan, deleteTargets }")()
+const Model = new Function(src + "\nreturn { placement, parse, displayName, statusText, doneFor, savedFor, empty, clipboardLink, clipboardLinks, statusLabel, statusLabelFor, kindLabel, rowMeta, itemWord, shortPath, expandHome, scheduleSignature, safeRelativePath, bulkPausePlan, deleteTargets, freshAsk }")()
 
 assert.strictEqual(Model.expandHome("~", "/home/you"), "/home/you")
 assert.strictEqual(Model.expandHome("~/Downloads/catch", "/home/you"), "/home/you/Downloads/catch")
@@ -51,6 +51,45 @@ const traversal = Model.parse(JSON.stringify({
 }))
 assert.strictEqual(traversal.asks.length, 1, "only the real path survives")
 assert.strictEqual(traversal.asks[0].path, "a..b/c.zip")
+
+// A question that was already in the file is not "fresh": opening the panel
+// must not treat a surviving question as a new arrival and show it.
+const askState = Model.parse(JSON.stringify({
+  version: 1,
+  downloads: [],
+  asks: [
+    { url: "https://x.test/new", title: "New", path: "new.zip" },
+    { url: "https://x.test/old", title: "Old", path: "old.zip" },
+  ],
+}))
+const firstScan = Model.freshAsk(askState, {})
+assert.strictEqual(firstScan.ask.url, "https://x.test/new", "first read learns the newest question")
+assert.deepStrictEqual(firstScan.known, {
+  "https://x.test/new": true,
+  "https://x.test/old": true,
+})
+const secondScan = Model.freshAsk(askState, firstScan.known)
+assert.strictEqual(secondScan.ask, null, "the same questions are not fresh twice")
+assert.deepStrictEqual(secondScan.known, firstScan.known)
+
+const oneNew = Model.parse(JSON.stringify({
+  version: 1,
+  downloads: [],
+  asks: [
+    { url: "https://x.test/newest", title: "Newest", path: "newest.zip" },
+    { url: "https://x.test/new", title: "New", path: "new.zip" },
+  ],
+}))
+const thirdScan = Model.freshAsk(oneNew, secondScan.known)
+assert.strictEqual(thirdScan.ask.url, "https://x.test/newest", "only the added question is fresh")
+const emptyScan = Model.freshAsk(Model.empty(), thirdScan.known)
+assert.strictEqual(emptyScan.ask, null)
+assert.deepStrictEqual(emptyScan.known, {})
+assert.strictEqual(
+  Model.freshAsk(oneNew, emptyScan.known).ask.url,
+  "https://x.test/newest",
+  "a question that was cleared is fresh again when it comes back",
+)
 
 function state(download) {
   return Model.parse(JSON.stringify({ version: 1, downloads: [download] }))
