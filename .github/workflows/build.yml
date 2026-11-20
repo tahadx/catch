@@ -8,6 +8,10 @@ on:
 
 permissions:
   contents: read
+  # rustsec/audit-check publishes its result as a check run; without this the
+  # audit fails with "Resource not accessible by integration" as soon as the
+  # advisory database has an informational warning to report.
+  checks: write
 
 concurrency:
   group: build-${{ github.ref }}
