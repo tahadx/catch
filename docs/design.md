@@ -450,6 +450,13 @@ so the scroll area has somewhere to go. The panel width is fitted to
 `Style.space(480)` and the screen's available rectangle. Unknown values fall back
 to `bar`, so a stale setting cannot leave the panel without a position.
 
+Some bar surfaces replace the panel's `anchorItem` with a zero-size point item
+when a popout opens; the Station bar centres that point for widgets parked in
+its tray section. `CatchPanel.qml` keeps the widget's own icon as `anchorHint`
+and, when the host anchor is such a point, uses the icon for the `bar`
+placement so it still opens under the icon rather than in the middle of the
+screen.
+
 `CatchPanel.qml` is adapted from Omarchy's `qs.Ui KeyboardPanel` (MIT). Keep the
 window mechanics — focus prime, outside-click dismissal, bar click-through mask,
 other-output dismissal, single-popout coordination — in sync with the shell file

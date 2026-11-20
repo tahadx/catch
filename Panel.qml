@@ -1448,6 +1448,9 @@ Panel {
   CatchPanel {
     id: panel
     anchorItem: button
+    // The host bar may replace `anchorItem` with its own point item; this stays
+    // the real icon so "under the bar icon" keeps working.
+    anchorHint: button
     owner: root
     bar: root.bar
     open: root.opened

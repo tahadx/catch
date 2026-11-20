@@ -20,6 +20,19 @@ PanelWindow {
   id: root
 
   required property Item anchorItem
+  // Some bar surfaces replace `anchorItem` with a zero-size point item when a
+  // panel opens; the Station bar centres that point for widgets parked in its
+  // tray section. Keep the widget's own icon as a hint so the "bar" placement
+  // still lands under it instead of in the middle of the screen.
+  property Item anchorHint: null
+  readonly property Item anchorTarget: {
+    var point = anchorItem
+    var hint = anchorHint
+    if (!hint || !hint.visible || hint.width <= 0) return point
+    if (point && point.width > 0) return point
+    if (point && hint.QsWindow.window !== point.QsWindow.window) return point
+    return hint
+  }
   required property QtObject bar
   property var owner: null
   property int margin: Style.gapsOut
@@ -76,7 +89,7 @@ PanelWindow {
   }
 
   readonly property var coordinatorKey: owner || root
-  readonly property var anchorWindow: anchorItem ? anchorItem.QsWindow.window : null
+  readonly property var anchorWindow: anchorTarget ? anchorTarget.QsWindow.window : null
   readonly property string barPos: bar ? bar.position : "top"
 
   function close() {
@@ -142,7 +155,7 @@ PanelWindow {
   TransformWatcher {
     id: anchorWatcher
     a: anchorWindow ? anchorWindow.contentItem : null
-    b: anchorItem
+    b: root.anchorTarget
   }
 
   // Anchor item's position within the bar's content surface. For a
@@ -152,11 +165,11 @@ PanelWindow {
   // below uses `barThickness` for the perpendicular axis instead of this y.
   readonly property point anchorScreenPos: {
     anchorWatcher.transform  // reactive dependency
-    if (!anchorItem || !anchorWindow) return Qt.point(0, 0)
-    return anchorItem.mapToItem(anchorWindow.contentItem, 0, 0)
+    if (!anchorTarget || !anchorWindow) return Qt.point(0, 0)
+    return anchorTarget.mapToItem(anchorWindow.contentItem, 0, 0)
   }
-  readonly property real anchorW: anchorItem ? anchorItem.width : 0
-  readonly property real anchorH: anchorItem ? anchorItem.height : 0
+  readonly property real anchorW: anchorTarget ? anchorTarget.width : 0
+  readonly property real anchorH: anchorTarget ? anchorTarget.height : 0
   readonly property real screenW: screen ? screen.width : 0
   readonly property real screenH: screen ? screen.height : 0
   readonly property real availableCardWidth: screenW > 0
@@ -261,7 +274,7 @@ PanelWindow {
   readonly property real barW: anchorWindow ? anchorWindow.width : screenW
   readonly property real barH: anchorWindow ? anchorWindow.height : 0
   readonly property point cardOrigin: {
-    if (!anchorItem && effectivePlacement === "bar") return Qt.point(margin, margin)
+    if (!anchorTarget && effectivePlacement === "bar") return Qt.point(margin, margin)
     var area = root.availableRect
     var x = 0, y = 0
     if (effectivePlacement === "center") {
