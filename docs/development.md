@@ -164,5 +164,5 @@ release notes.
 model test, extension checks, shellcheck, the installer test, QML syntax,
 release consistency, the plugin contract, and a dependency audit. The audit
 publishes a check run, so the workflow grants `checks: write`. Keep local
-checks aligned with it; if CI changes, update this file and
-`CLAUDE.md` in the same commit.
+checks aligned with it; if CI changes, update this file and any local agent
+notes in the same commit.
